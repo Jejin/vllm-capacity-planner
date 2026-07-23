@@ -8,3 +8,5 @@ data/
 server/data/
 *.sqlite
 *.sqlite-*
+.vercel
+.env*
