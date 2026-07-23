@@ -1,0 +1,76 @@
+# vLLM Capacity Planner — generic Kubernetes example.
+# Build & push the image (deploy/Dockerfile) to your registry, set it below, then `kubectl apply -f`.
+# Adjust the Ingress host + TLS to your environment (e.g. cert-manager).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm-planner
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-planner-data
+  namespace: vllm-planner
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-planner
+  namespace: vllm-planner
+  labels: { app: vllm-planner }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vllm-planner }
+  template:
+    metadata:
+      labels: { app: vllm-planner }
+    spec:
+      containers:
+        - name: app
+          image: YOUR_REGISTRY/vllm-capacity-planner:latest   # <-- build from deploy/Dockerfile
+          env:
+            - { name: PORT, value: "8080" }
+            - { name: DATA_FILE, value: /data/catalog.json }
+          ports:
+            - containerPort: 8080
+          readinessProbe: { httpGet: { path: /readyz, port: 8080 }, initialDelaySeconds: 5, periodSeconds: 10 }
+          livenessProbe:  { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 15, periodSeconds: 20 }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: vllm-planner-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-planner
+  namespace: vllm-planner
+spec:
+  selector: { app: vllm-planner }
+  ports:
+    - { port: 80, targetPort: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vllm-planner
+  namespace: vllm-planner
+spec:
+  rules:
+    - host: vllm-planner.example.com   # <-- your host
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-planner
+                port: { number: 80 }
