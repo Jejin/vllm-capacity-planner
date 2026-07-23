@@ -3,11 +3,18 @@
   "private": true,
   "version": "0.1.0",
   "description": "vLLM Capacity Planner — monorepo (domain / server / web)",
-  "workspaces": ["domain", "server", "web"],
-  "engines": { "node": ">=20" },
+  "workspaces": [
+    "domain",
+    "server",
+    "web"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "npm run test -w domain && npm run test -w server",
     "build": "npm run build -w domain && npm run build -w server && npm run build -w web",
-    "test:domain": "npm run test -w domain"
+    "test:domain": "npm run test -w domain",
+    "vercel-build": "npm run build -w web"
   }
 }
