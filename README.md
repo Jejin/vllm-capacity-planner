@@ -4,6 +4,8 @@ A self-hostable web tool for **sizing LLM inference deployments on GPUs** — ho
 
 The sizing math is a deterministic memory-bandwidth model (the same roofline vLLM-style serving is bound by). See the in-app **Methodology** tab or [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md).
 
+![vLLM Capacity Planner — sizing view](docs/screenshot.png)
+
 ## Features
 
 - **Deployment sizing** — pick a model, quantisation, KV dtype, context, concurrency and GPU SKU → TP size, weights/KV memory, concurrency-per-pod, pods, GPUs, nodes, TTFT, and throughput.
@@ -70,6 +72,18 @@ docker run -p 8080:8080 -v $PWD/data:/data vllm-capacity-planner
 ```
 
 For Kubernetes, `deploy/k8s.yaml` is a generic example (set your image + Ingress host).
+
+### Static demo (sizing-only)
+
+The sizing engine runs entirely client-side and falls back to the built-in seed catalog when no API is reachable, so you can host just the built SPA (`web/dist`) on any static host (GitHub Pages, Netlify, S3, …) for a working **sizing + methodology** demo. Catalog editing, saved configurations, Hugging Face import, and cost persistence require the API (run the server).
+
+```bash
+npm run build -w web      # outputs web/dist — deploy this folder statically
+```
+
+## Contributing
+
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The sizing engine is a pure, tested module; every math change ships with an acceptance vector.
 
 ## Accuracy & caveats
 
