@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "vLLM Capacity Planner — monorepo (domain / server / web)",
   "workspaces": ["domain", "server", "web"],
-  "engines": { "node": ">=24" },
+  "engines": { "node": ">=20" },
   "scripts": {
     "test": "npm run test -w domain && npm run test -w server",
     "build": "npm run build -w domain && npm run build -w server && npm run build -w web",

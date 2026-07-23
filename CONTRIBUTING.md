@@ -4,7 +4,7 @@ Thanks for your interest in improving **vLLM Capacity Planner**! Contributions o
 
 ## Getting started
 
-Requires **Node.js 24+**.
+Requires **Node.js 20+**.
 
 ```bash
 git clone https://github.com/YOUR_USER/vllm-capacity-planner.git

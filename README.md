@@ -4,6 +4,8 @@ A self-hostable web tool for **sizing LLM inference deployments on GPUs** — ho
 
 The sizing math is a deterministic memory-bandwidth model (the same roofline vLLM-style serving is bound by). See the in-app **Methodology** tab or [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md).
 
+**▶ [Live demo](https://llm-sizing.vercel.app/)** — runs in your browser, no sign-up. Sizing, fleet, cluster, cost and methodology all work client-side; catalog editing / saved configs / Hugging Face import need the API (run the server).
+
 ![vLLM Capacity Planner — sizing view](docs/screenshot.png)
 
 ## Features
@@ -19,7 +21,7 @@ The sizing math is a deterministic memory-bandwidth model (the same roofline vLL
 
 ## Quick start (local)
 
-Requires **Node.js 24+**.
+Requires **Node.js 20+**.
 
 ```bash
 git clone https://github.com/YOUR_USER/vllm-capacity-planner.git
@@ -73,9 +75,11 @@ docker run -p 8080:8080 -v $PWD/data:/data vllm-capacity-planner
 
 For Kubernetes, `deploy/k8s.yaml` is a generic example (set your image + Ingress host).
 
-### Static demo (sizing-only)
+### Static demo (Vercel / Netlify / GitHub Pages)
 
-The sizing engine runs entirely client-side and falls back to the built-in seed catalog when no API is reachable, so you can host just the built SPA (`web/dist`) on any static host (GitHub Pages, Netlify, S3, …) for a working **sizing + methodology** demo. Catalog editing, saved configurations, Hugging Face import, and cost persistence require the API (run the server).
+The sizing engine runs entirely client-side and falls back to the built-in seed catalog when no API is reachable, so you can host just the built SPA (`web/dist`) on any static host for a working **sizing + methodology** demo. Catalog editing, saved configurations, Hugging Face import, and cost persistence require the API (run the server).
+
+This repo includes a **`vercel.json`** for a one-click static deploy on Vercel (it runs `npm run build -w web` and serves `web/dist`) — that's what powers the [live demo](https://llm-sizing.vercel.app/). For any other static host:
 
 ```bash
 npm run build -w web      # outputs web/dist — deploy this folder statically
