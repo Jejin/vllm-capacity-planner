@@ -16,12 +16,12 @@ describe('Epic 1 — Access & seeded catalog', () => {
     const r = await app.inject({ method: 'GET', url: '/api/v1/catalog' });
     expect(r.statusCode).toBe(401);
   });
-  it('lists the 13 seeded models + 7 GPUs (FR-1/7/5/8)', async () => {
+  it('lists the 13 seeded models + 8 GPUs (FR-1/7/5/8)', async () => {
     const r = await app.inject({ method: 'GET', url: '/api/v1/catalog', headers: user });
     expect(r.statusCode).toBe(200);
     const body = r.json();
     expect(body.models).toHaveLength(13);
-    expect(body.gpus).toHaveLength(7);
+    expect(body.gpus).toHaveLength(8);
   });
   it('healthz/readyz respond', async () => {
     expect((await app.inject({ url: '/healthz' })).statusCode).toBe(200);
@@ -66,7 +66,7 @@ describe('Epic 3 — Catalog curation + RBAC (FR-2/3/4/29)', () => {
     const exported = (await app.inject({ url: '/api/v1/catalog/export', headers: user })).json();
     expect((await app.inject({ method: 'POST', url: '/api/v1/catalog/import', headers: user, payload: exported })).statusCode).toBe(403);
     const imp = await app.inject({ method: 'POST', url: '/api/v1/catalog/import', headers: admin, payload: exported });
-    expect(imp.json()).toEqual({ models: 13, gpus: 7 });
+    expect(imp.json()).toEqual({ models: 13, gpus: 8 });
   });
 });
 
