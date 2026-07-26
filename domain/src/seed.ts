@@ -30,6 +30,7 @@ export const SEED_GPUS: GpuSku[] = [
   { id: 'h100n', name: 'H100 NVL 94 GB', mem_gb: 94, bw_tbs: 3.9, price_per_gpu_hour: 3.2 },
   { id: 'h200', name: 'H200 141 GB (SXM/NVL)', mem_gb: 141, bw_tbs: 4.8, price_per_gpu_hour: 4.5 },
   { id: 'b200', name: 'B200 180 GB SXM', mem_gb: 180, bw_tbs: 8.0, price_per_gpu_hour: 6.5 },
+  { id: 'b300', name: 'B300 288 GB (Blackwell Ultra)', mem_gb: 288, bw_tbs: 8.0, price_per_gpu_hour: 8.5 },
 ];
 
 export function seedCatalog(): { models: Model[]; gpus: GpuSku[] } {
