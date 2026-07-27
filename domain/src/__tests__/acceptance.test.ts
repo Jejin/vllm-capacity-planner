@@ -5,7 +5,7 @@
 // and GpuSku.mem_gb. Vectors were re-pinned when the engine stopped mixing 1e9-byte GB (weights)
 // with 2^30-byte GiB (KV, capacity), which had inflated weights ~7.4% against GPU capacity.
 import { describe, it, expect } from 'vitest';
-import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, GIB, QB, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB } from '../engine.js';
+import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, GIB, QB, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB } from '../engine.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema, gpuSkuSchema } from '../schema.js';
 import { reconcile, headroomCheck } from '../reconcile.js';
@@ -186,21 +186,30 @@ describe('§C unit consistency (GiB throughout)', () => {
 
 // "Tight" = it fits, but with <10% of pod HBM free once weights + one request of KV are placed.
 describe('§C tight-fit band (fits / tight / infeasible)', () => {
-  it('AC-12 — GPT-OSS 120B MXFP4 on ONE H100 at 128K is feasible but tight', () => {
-    const r = computeSizing(model('gptoss-120b'), gpu('h100'), {
-      quant: 'MXFP4', kv_dtype_bytes: 2, selected_ctx: 131072, avg_context_utilisation: 0.6,
-      target_concurrency: 1, mem_util_fraction: 0.9, gpus_per_node: 8,
+  it('AC-12 — Qwen3-32B Q4_K_M on ONE RTX 4090 at 4K is feasible but tight', () => {
+    const r = computeSizing(model('qwen3-32b'), gpu('rtx4090'), {
+      quant: 'Q4_K_M', kv_dtype_bytes: 1, selected_ctx: 4096, avg_context_utilisation: 0.6,
+      target_concurrency: 1, mem_util_fraction: 0.9, gpus_per_node: 1,
     }) as FeasibleSizing;
     expect(r.ok).toBe(true);
     expect(r.tp).toBe(1);
     expect(r.tight).toBe(true);
-    expect(near(r.headroom_fraction, 0.067, 0.1)).toBe(true); // ~59.5 GiB weights in 69.5 GiB usable
+    expect(near(r.headroom_fraction, 0.009, 0.3)).toBe(true); // 18.6 GiB weights in 19.1 GiB usable
     expect(r.headroom_fraction).toBeLessThan(TIGHT_HEADROOM);
     expect(r.headroom_fraction).toBeGreaterThan(0); // still fits — not infeasible
     expect(r.concurrency_per_pod).toBe(1); // no room to batch a second request
   });
 
-  it('AC-13 — the same model on an H200 has real headroom and is not tight', () => {
+  it('AC-12b — the same model at 8K jumps to TP2 and stops being tight', () => {
+    const r = computeSizing(model('qwen3-32b'), gpu('rtx4090'), {
+      quant: 'Q4_K_M', kv_dtype_bytes: 1, selected_ctx: 8192, avg_context_utilisation: 0.6,
+      target_concurrency: 1, mem_util_fraction: 0.9, gpus_per_node: 1,
+    }) as FeasibleSizing;
+    expect(r.tp).toBe(2);
+    expect(r.tight).toBe(false);
+  });
+
+  it('AC-13 — GPT-OSS 120B on an H200 has real headroom and is not tight', () => {
     const r = computeSizing(model('gptoss-120b'), gpu('h200'), {
       quant: 'MXFP4', kv_dtype_bytes: 2, selected_ctx: 131072, avg_context_utilisation: 0.6,
       target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
@@ -218,6 +227,109 @@ describe('§C tight-fit band (fits / tight / infeasible)', () => {
     const pod = r.tp * r.usable_gb;
     expect(r.headroom_fraction).toBeCloseTo((pod - r.weights_gb - r.kv_per_request_gb) / pod, 9);
     expect(r.tight).toBe(false);
+  });
+});
+
+// Local/global attention. Sliding-window layers stop accumulating KV at the window, so
+// long-context KV is far below the all-full-attention figure. Getting this wrong inflates KV
+// several-fold and can manufacture a false "tight" verdict.
+describe('§C sliding-window KV', () => {
+  it('AC-18 — GPT-OSS 120B: 18 of 36 layers banded at 128 tokens halves 128K KV', () => {
+    const m = model('gptoss-120b');
+    expect(m.sliding_window).toBe(128);
+    expect(m.full_attention_layers).toBe(18);
+    const activeTokens = 131072 * 0.6;
+    const windowed = kvPerRequestBytes(m, 2, activeTokens) / GIB;
+    const allFull = (kvPerTokenBytes(m, 2) * activeTokens) / GIB;
+    expect(near(windowed, 2.704, 0.02)).toBe(true);
+    expect(near(allFull, 5.4, 0.02)).toBe(true);
+    expect(windowed / allFull).toBeCloseTo(0.5, 2); // exactly half the layers grow
+  });
+
+  it('AC-19 — modelling the window flips the verdict on one H100 from tight to comfortable', () => {
+    const input = {
+      quant: 'MXFP4' as const, kv_dtype_bytes: 2, selected_ctx: 131072, avg_context_utilisation: 0.6,
+      target_concurrency: 1, mem_util_fraction: 0.9, gpus_per_node: 8,
+    };
+    const r = computeSizing(model('gptoss-120b'), gpu('h100'), input) as FeasibleSizing;
+    expect(r.kv_windowed).toBe(true);
+    expect(r.tight).toBe(false); // was tight at 6.7% when all 36 layers were treated as full
+    expect(r.headroom_fraction).toBeGreaterThan(TIGHT_HEADROOM);
+    expect(r.concurrency_per_pod).toBe(3); // was 1
+
+    // same model with the window stripped — the old, wrong answer
+    const naive = { ...model('gptoss-120b'), sliding_window: undefined, full_attention_layers: undefined };
+    const rn = computeSizing(naive, gpu('h100'), input) as FeasibleSizing;
+    expect(rn.kv_windowed).toBe(false);
+    expect(rn.tight).toBe(true);
+    expect(rn.kv_per_request_gb / r.kv_per_request_gb).toBeCloseTo(2, 1);
+  });
+
+  it('AC-20 — the window only binds past its length; short contexts are unaffected', () => {
+    const m = model('gptoss-120b');
+    // 100 active tokens < the 128-token window, so every layer is still accumulating
+    expect(kvPerRequestBytes(m, 2, 100)).toBe(kvPerTokenBytes(m, 2) * 100);
+    // well past it, only the full-attention layers keep growing
+    expect(kvPerRequestBytes(m, 2, 100_000)).toBeLessThan(kvPerTokenBytes(m, 2) * 100_000);
+  });
+
+  it('AC-21 — reported kv_per_token reconciles with kv_per_request under windowing', () => {
+    const r = computeSizing(model('gptoss-120b'), gpu('h200'), {
+      quant: 'MXFP4', kv_dtype_bytes: 2, selected_ctx: 131072, avg_context_utilisation: 0.6,
+      target_concurrency: 8, mem_util_fraction: 0.9, gpus_per_node: 8,
+    }) as FeasibleSizing;
+    expect(r.kv_per_token_gb * (131072 * 0.6)).toBeCloseTo(r.kv_per_request_gb, 9);
+    expect(r.kv_per_token_gb).toBeLessThan(kvPerTokenBytes(model('gptoss-120b'), 2) / GIB);
+  });
+
+  it('AC-22 — a model with no window declared is unchanged (every layer full-context)', () => {
+    const m = model('llama33-70b');
+    expect(m.sliding_window).toBeUndefined();
+    expect(kvPerRequestBytes(m, 1, 78643.2)).toBeCloseTo(kvPerTokenBytes(m, 1) * 78643.2, 6);
+  });
+});
+
+// GGUF k-quants advertise a bit-width they do not deliver. These pin the published
+// effective figures, cross-checked against real checkpoint sizes.
+describe('§C GGUF whole-file quants', () => {
+  it('AC-23 — Q4_K_M is 4.9 effective bits, not 4.0', () => {
+    expect(QB.Q4_K_M).toBeCloseTo(0.61, 3);
+    expect(QB.Q4_K_M / 0.5).toBeGreaterThan(1.2); // >20% above the nominal 4-bit assumption
+    expect(QB.Q8_0).toBeGreaterThan(1); // 8.5 bits, not 8.0
+    expect(QB.IQ4_XS).toBeCloseTo(4.25 / 8, 6);
+  });
+
+  it('AC-24 — Llama 3.3 70B Q4_K_M = 43.1 GB, matching the published checkpoint', () => {
+    const gib = weightsGb(model('llama33-70b'), 'Q4_K_M');
+    expect(near((gib * GIB) / 1e9, 43.1, 0.02)).toBe(true);
+    // assuming a flat 0.5 B/param would undercount by ~8 GB — the documented GGUF trap
+    const naive = (paramBytesToGib(70.6, 0.5) * GIB) / 1e9;
+    expect((gib * GIB) / 1e9 - naive).toBeGreaterThan(7);
+  });
+
+  it('AC-25 — Llama 3.1 8B Q4_K_M = 4.9 GB', () => {
+    const gib = weightsGb(model('llama31-8b'), 'Q4_K_M');
+    expect(near((gib * GIB) / 1e9, 4.91, 0.02)).toBe(true);
+  });
+
+  it('AC-26 — GGUF figures are whole-file: no fp16 embedding tail added on top', () => {
+    const m = model('llama33-70b');
+    // whole-file quants ignore the tail entirely — total x bytes/param, nothing else
+    expect(weightsGb(m, 'Q4_K_M')).toBeCloseTo(paramBytesToGib(m.total_params_b, QB.Q4_K_M), 9);
+    // and a model with NO embedding geometry gives the identical answer (no fallback factor)
+    const bare = { ...m, hidden_size: undefined, vocab_size: undefined };
+    expect(weightsGb(bare, 'Q4_K_M')).toBeCloseTo(weightsGb(m, 'Q4_K_M'), 9);
+    // ...unlike INT4, where the tail matters
+    expect(weightsGb(bare, 'INT4')).not.toBeCloseTo(weightsGb(m, 'INT4'), 3);
+  });
+
+  it('AC-27 — GGUF sizing is never flagged as an estimate (the figure is measured)', () => {
+    const r = computeSizing(model('llama33-70b'), gpu('rtx4090'), {
+      quant: 'Q4_K_M', kv_dtype_bytes: 1, selected_ctx: 8192, avg_context_utilisation: 0.6,
+      target_concurrency: 1, mem_util_fraction: 0.9, gpus_per_node: 1,
+    }) as FeasibleSizing;
+    expect(r.ok).toBe(true);
+    expect(r.weights_estimated).toBe(false);
   });
 });
 

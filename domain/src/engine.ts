@@ -55,13 +55,59 @@ export const QB: Record<Quant, number> = {
   INT4: 0.52,
   MXFP4: 0.53125,
   NVFP4: 0.5625,
+  // GGUF k-quants: the advertised bit-width is not what you get. Q4_K_M mixes Q4_K and Q6_K
+  // per tensor and lands at ~4.9 effective bits; assuming 4.0 undercounts a 70B by ~8 GB.
+  Q8_0: 1.06, // 8.5 bits
+  Q4_K_M: 0.61, // 4.9 bits
+  IQ4_XS: 0.53125, // 4.25 bits
 };
 
-/** KV cache bytes per token — GQA vs MLA (addendum §A). */
-export function kvPerTokenBytes(model: Model, kvDtypeBytes: number): number {
+/**
+ * Quants whose bytes/param is a whole-FILE average, measured across the finished checkpoint.
+ * GGUF quantises the embedding layers too (typically to Q6_K/Q8_0) and the published figure
+ * already absorbs that, so these must NOT also pay the un-quantised-tail term — doing both
+ * double-counts the embeddings.
+ */
+export const WHOLE_FILE_QUANTS: ReadonlySet<Quant> = new Set<Quant>(['Q8_0', 'Q4_K_M', 'IQ4_XS']);
+
+/** KV bytes per token for ONE layer — GQA vs MLA (addendum §A). */
+export function kvPerLayerPerTokenBytes(model: Model, kvDtypeBytes: number): number {
   return model.mla
-    ? model.layers * MLA_ELEMS_PER_LAYER * kvDtypeBytes
-    : 2 * model.layers * model.kv_heads * model.head_dim * kvDtypeBytes;
+    ? MLA_ELEMS_PER_LAYER * kvDtypeBytes
+    : 2 * model.kv_heads * model.head_dim * kvDtypeBytes;
+}
+
+/** Nominal KV bytes per token across all layers, as if every layer were full-context. */
+export function kvPerTokenBytes(model: Model, kvDtypeBytes: number): number {
+  return model.layers * kvPerLayerPerTokenBytes(model, kvDtypeBytes);
+}
+
+/** True when the model declares a usable sliding-window layer split. */
+export function hasWindowedLayers(model: Model): boolean {
+  return (
+    !!model.sliding_window &&
+    model.full_attention_layers != null &&
+    model.full_attention_layers < model.layers
+  );
+}
+
+/**
+ * KV bytes for ONE request holding `activeTokens` of context.
+ *
+ * Full-context layers grow with the sequence; sliding-window layers stop at the window:
+ *   full × perLayer × tokens + windowed × perLayer × min(tokens, window)
+ *
+ * This is not a refinement — for GPT-OSS-120B at 128K it halves the KV, because 18 of its 36
+ * layers are locally banded at 128 tokens. Treating those as full-context roughly doubles the
+ * cache and can turn a comfortable plan into a false "tight" verdict.
+ */
+export function kvPerRequestBytes(model: Model, kvDtypeBytes: number, activeTokens: number): number {
+  const perLayer = kvPerLayerPerTokenBytes(model, kvDtypeBytes);
+  if (!hasWindowedLayers(model)) return model.layers * perLayer * activeTokens;
+  const full = model.full_attention_layers!;
+  const windowed = model.layers - full;
+  const windowTokens = Math.min(activeTokens, model.sliding_window!);
+  return perLayer * (full * activeTokens + windowed * windowTokens);
 }
 
 /**
@@ -92,6 +138,9 @@ function outputHeadParamsB(model: Model): number {
  * far more than the 2% a flat factor allows for.
  */
 export function weightsGb(model: Model, quant: Quant): number {
+  // GGUF figures already include the (quantised) embedding layers — applying the fp16 tail
+  // on top would count the embeddings twice.
+  if (WHOLE_FILE_QUANTS.has(quant)) return paramBytesToGib(model.total_params_b, QB[quant]);
   const tail = unquantisedParamsB(model);
   if (tail === null) return paramBytesToGib(model.total_params_b * WEIGHT_OVERHEAD, QB[quant]);
   const body = Math.max(0, model.total_params_b - tail);
@@ -100,6 +149,7 @@ export function weightsGb(model: Model, quant: Quant): number {
 
 /** GiB streamed from HBM per decode step: active body at `quant` + the 16-bit output head. */
 export function activeWeightsGb(model: Model, quant: Quant): number {
+  if (WHOLE_FILE_QUANTS.has(quant)) return paramBytesToGib(model.active_params_b, QB[quant]);
   const head = outputHeadParamsB(model);
   if (head === 0) return paramBytesToGib(model.active_params_b * WEIGHT_OVERHEAD, QB[quant]);
   const body = Math.max(0, model.active_params_b - head);
@@ -122,8 +172,12 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   } = input;
 
   const weights_gb = weightsGb(model, quant);
-  const kv_per_token_gb = kvPerTokenBytes(model, kv_dtype_bytes) / GIB;
-  const kv_per_request_gb = kv_per_token_gb * selected_ctx * avg_context_utilisation;
+  const active_tokens = selected_ctx * avg_context_utilisation;
+  const kv_per_request_gb = kvPerRequestBytes(model, kv_dtype_bytes, active_tokens) / GIB;
+  // Reported per-token rate is the EFFECTIVE average, so kv_per_token × active_tokens always
+  // reconciles with kv_per_request. For an all-full-attention model it equals the nominal rate;
+  // with windowed layers it is lower, because most layers stopped growing at the window.
+  const kv_per_token_gb = active_tokens > 0 ? kv_per_request_gb / active_tokens : 0;
   const usable_gb = gpu.mem_gb * mem_util_fraction - RUNTIME_GB;
 
   // TP selection: smallest tp such that tp*usable - weights >= kv_per_request (FR-13 if none).
@@ -198,7 +252,8 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     multi_node,
     headroom_fraction,
     tight,
-    weights_estimated: unquantisedParamsB(model) === null,
+    weights_estimated: !WHOLE_FILE_QUANTS.has(quant) && unquantisedParamsB(model) === null,
+    kv_windowed: hasWindowedLayers(model),
     throughput_tokens_per_sec,
     decode_tps_per_request,
     ttft_ms,

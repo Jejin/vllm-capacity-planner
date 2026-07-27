@@ -54,6 +54,44 @@ describe('HF config.json → §F mapping (AD-11)', () => {
     expect(mapped.tied_embeddings).toBe(true);
   });
 
+  it('maps sliding-window layers from layer_types (GPT-OSS style)', () => {
+    const layer_types = Array.from({ length: 36 }, (_, i) => (i % 2 === 0 ? 'sliding_attention' : 'full_attention'));
+    const { mapped } = hfConfigToModel('openai/gpt-oss-120b', {
+      num_hidden_layers: 36, num_attention_heads: 64, num_key_value_heads: 8, head_dim: 64,
+      hidden_size: 2880, vocab_size: 201088, sliding_window: 128, layer_types,
+      max_position_embeddings: 131072,
+    });
+    expect(mapped.sliding_window).toBe(128);
+    expect(mapped.full_attention_layers).toBe(18);
+  });
+
+  it('maps sliding_window_pattern (Gemma style: one global every N)', () => {
+    const { mapped } = hfConfigToModel('google/gemma-2-27b', {
+      num_hidden_layers: 46, num_attention_heads: 32, num_key_value_heads: 16, head_dim: 128,
+      hidden_size: 4608, vocab_size: 256000, sliding_window: 4096, sliding_window_pattern: 2,
+      max_position_embeddings: 8192,
+    });
+    expect(mapped.sliding_window).toBe(4096);
+    expect(mapped.full_attention_layers).toBe(23); // 46 / 2
+  });
+
+  it('a bare sliding_window with no pattern windows every layer (Mistral v0.1 style)', () => {
+    const { mapped } = hfConfigToModel('mistralai/Mistral-7B-v0.1', {
+      num_hidden_layers: 32, num_attention_heads: 32, num_key_value_heads: 8, head_dim: 128,
+      hidden_size: 4096, vocab_size: 32000, sliding_window: 4096, max_position_embeddings: 32768,
+    });
+    expect(mapped.full_attention_layers).toBe(0);
+  });
+
+  it('leaves window fields unset when the config declares no window', () => {
+    const { mapped } = hfConfigToModel('meta-llama/Llama-3.3-70B-Instruct', {
+      num_hidden_layers: 80, num_attention_heads: 64, num_key_value_heads: 8, head_dim: 128,
+      hidden_size: 8192, vocab_size: 128256, max_position_embeddings: 131072,
+    });
+    expect(mapped.sliding_window).toBeUndefined();
+    expect(mapped.full_attention_layers).toBeUndefined();
+  });
+
   it('a completed mapping passes §F validation', () => {
     const { mapped } = hfConfigToModel('Qwen/Qwen2.5-72B', { num_hidden_layers: 80, num_attention_heads: 64, num_key_value_heads: 8, head_dim: 128, max_position_embeddings: 131072 });
     const completed = { ...mapped, total_params_b: 72.7, active_params_b: 72.7, tp_options: [2, 4, 8], quants: ['FP16', 'FP8'] };
@@ -78,11 +116,25 @@ describe('concurrency rubric sweep', () => {
   it('carries the tight verdict per row', () => {
     const { models, gpus } = seedCatalog();
     const rows = concurrencySweep(
-      models.find((x) => x.id === 'gptoss-120b')!,
-      gpus.find((x) => x.id === 'h100')!,
-      { quant: 'MXFP4' as const, kv_dtype_bytes: 2, selected_ctx: 131072, avg_context_utilisation: 0.6, mem_util_fraction: 0.9, gpus_per_node: 8 },
+      models.find((x) => x.id === 'qwen3-32b')!,
+      gpus.find((x) => x.id === 'rtx4090')!,
+      { quant: 'Q4_K_M' as const, kv_dtype_bytes: 1, selected_ctx: 4096, avg_context_utilisation: 0.6, mem_util_fraction: 0.9, gpus_per_node: 1 },
       [1, 4],
     );
-    expect(rows.every((r) => r.feasible && r.tight)).toBe(true); // TP1 at 128K leaves ~7% headroom
+    // 18.6 GiB of weights in 19.1 GiB usable. TP is picked for ONE request, so raising
+    // concurrency adds pods rather than TP size — every row stays TP1 and stays tight.
+    expect(rows.every((r) => r.feasible && r.tight)).toBe(true);
+    expect(rows.every((r) => r.tp === 1)).toBe(true);
+    expect(rows[1].pods).toBeGreaterThan(rows[0].pods);
+
+    // the flag does vary with context: at 8K the same model needs TP2, which is roomy
+    const wider = concurrencySweep(
+      models.find((x) => x.id === 'qwen3-32b')!,
+      gpus.find((x) => x.id === 'rtx4090')!,
+      { quant: 'Q4_K_M' as const, kv_dtype_bytes: 1, selected_ctx: 8192, avg_context_utilisation: 0.6, mem_util_fraction: 0.9, gpus_per_node: 1 },
+      [1],
+    );
+    expect(wider[0].tp).toBe(2);
+    expect(wider[0].tight).toBe(false);
   });
 });

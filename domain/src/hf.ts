@@ -18,7 +18,27 @@ export interface HfConfig {
   vocab_size?: number;
   tie_word_embeddings?: boolean;
   max_position_embeddings?: number;
+  sliding_window?: number | null;
+  /** Per-layer attention kinds, newer transformers configs: 'full_attention' | 'sliding_attention'. */
+  layer_types?: string[];
+  /** Gemma-style: one global layer every N (so N-1 of every N are windowed). */
+  sliding_window_pattern?: number;
   [k: string]: unknown;
+}
+
+/**
+ * Resolve how many layers keep full context, across the three ways configs express it.
+ * Returns null when the model has no usable sliding-window declaration.
+ */
+export function fullAttentionLayers(cfg: HfConfig, layers: number | undefined): number | null {
+  if (Array.isArray(cfg.layer_types) && cfg.layer_types.length > 0) {
+    return cfg.layer_types.filter((t) => t === 'full_attention').length;
+  }
+  if (!cfg.sliding_window) return null; // no window at all => every layer is full-context
+  if (cfg.sliding_window_pattern && cfg.sliding_window_pattern > 0 && layers) {
+    return Math.ceil(layers / cfg.sliding_window_pattern); // 1 global every N
+  }
+  return 0; // Mistral-v0.1 style: a window with no pattern means every layer is windowed
 }
 
 export interface HfMapResult {
@@ -55,6 +75,13 @@ export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
     vocab_size: cfg.vocab_size,
     tied_embeddings: cfg.tie_word_embeddings ?? false,
   };
+  // local/global attention — only set when the config actually declares a window, since
+  // an unset pair means "treat every layer as full-context"
+  const fullAttn = fullAttentionLayers(cfg, cfg.num_hidden_layers);
+  if (cfg.sliding_window && fullAttn !== null) {
+    mapped.sliding_window = cfg.sliding_window;
+    mapped.full_attention_layers = fullAttn;
+  }
   // params + tp + quants are never in config.json — admin-supplied
   const missing: (keyof Model)[] = ['total_params_b', 'active_params_b', 'tp_options', 'quants'];
   if (!mla && (!kv_heads || !head_dim)) missing.push('kv_heads', 'head_dim');

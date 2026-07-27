@@ -1,6 +1,9 @@
 // Canonical domain types — addendum §F field names (AD-13). No framework imports (AD-1).
 
-export const QUANTS = ['FP16', 'FP8', 'INT8', 'INT4', 'MXFP4', 'NVFP4'] as const;
+// GPU-served formats first, then the GGUF family (llama.cpp / Ollama; vLLM's GGUF support is
+// experimental). GGUF bytes/param are whole-FILE averages that already include the embedding
+// layers, so they skip the un-quantised-tail term — see WHOLE_FILE_QUANTS in engine.ts.
+export const QUANTS = ['FP16', 'FP8', 'INT8', 'INT4', 'MXFP4', 'NVFP4', 'Q8_0', 'Q4_K_M', 'IQ4_XS'] as const;
 export type Quant = (typeof QUANTS)[number];
 
 /** A servable model, by sizing-relevant geometry (addendum §F.1). */
@@ -25,6 +28,13 @@ export interface Model {
   hidden_size?: number;
   vocab_size?: number;
   tied_embeddings?: boolean; // true => one shared table, false/undefined => embedding + lm_head
+  // --- local/global attention (optional; caps KV on the windowed layers) ---
+  // Many models (GPT-OSS, Gemma, Mistral-v0.1) run most layers over a fixed sliding window
+  // instead of the full context. Those layers' KV stops growing at the window, cutting
+  // long-context KV several-fold. Absent => every layer treated as full-context.
+  // From config.json: `sliding_window` + `layer_types` / `sliding_window_pattern`.
+  sliding_window?: number; // window length in tokens
+  full_attention_layers?: number; // layers using full context; the rest use the window
 }
 
 /** A GPU type (addendum §F.2). */
@@ -66,6 +76,8 @@ export interface FeasibleSizing {
   tight: boolean;
   /** True when the weight estimate used the legacy flat overhead (no embedding geometry on the model). */
   weights_estimated: boolean;
+  /** True when some layers are sliding-window, so KV is below the all-full-attention figure. */
+  kv_windowed: boolean;
   throughput_tokens_per_sec: number; // aggregate decode throughput across the deployment, ±40%
   decode_tps_per_request: number; // per-request decode tokens/sec (1 / step time), ±40%
   ttft_ms: number; // indicative time-to-first-token (prefill, bandwidth floor), ±50%
