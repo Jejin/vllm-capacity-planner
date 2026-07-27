@@ -7,9 +7,13 @@ import type { Model, GpuSku } from './types.js';
 // hidden_size / vocab_size / tied_embeddings come from each model's HF config.json and size the
 // 16-bit embedding + lm_head tail that survives quantisation (engine.weightsGb). [VERIFY] the
 // glm52 pair — that entry's geometry was already flagged approximate upstream.
-// sliding_window/full_attention_layers: GPT-OSS alternates dense and locally-banded (128-token)
-// attention, so half its layers stop growing at 128 tokens. [VERIFY] the split against config.json
-// `layer_types` before relying on it for procurement.
+// sliding_window/full_attention_layers: VERIFIED 2026-07-28 against the published
+// config.json for both GPT-OSS checkpoints — `layer_types` strictly alternates
+// sliding_attention/full_attention with `sliding_window: 128`:
+//   gpt-oss-120b: 36 layers = 18 full + 18 sliding
+//   gpt-oss-20b : 24 layers = 12 full + 12 sliding
+// Their head/embedding geometry was confirmed in the same pass (kv_heads 8, head_dim 64,
+// hidden_size 2880, vocab_size 201088, tie_word_embeddings false).
 export const SEED_MODELS: Model[] = [
   { id: 'llama31-8b', name: 'Llama 3.1 8B Instruct', total_params_b: 8.03, active_params_b: 8.03, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2], quants: ['FP16', 'FP8', 'INT4', 'Q8_0', 'Q4_K_M'], hidden_size: 4096, vocab_size: 128256, tied_embeddings: false },
   { id: 'gptoss-20b', name: 'GPT-OSS 20B (MoE 3.6B act)', total_params_b: 21, active_params_b: 3.6, layers: 24, kv_heads: 8, head_dim: 64, mla: false, max_ctx: 131072, tp_options: [1, 2], quants: ['MXFP4'], hidden_size: 2880, vocab_size: 201088, tied_embeddings: false, sliding_window: 128, full_attention_layers: 12 },
