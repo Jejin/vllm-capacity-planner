@@ -20,7 +20,21 @@ import type {
   FeasibleSizing,
 } from './types.js';
 
-export const RUNTIME_GB = 2.5; // per-GPU runtime reserve, GiB (CUDA graphs, activation buffers)
+/**
+ * Per-GPU runtime reserve, GiB. Retained as the FLOOR of the reserve so that default-configured
+ * plans size exactly as they did before activations were modelled.
+ */
+export const RUNTIME_GB = 2.5;
+/** CUDA context + kernels + NCCL buffers, replicated on every card and independent of batch. */
+export const CUDA_CONTEXT_GB = 1.5;
+/** vLLM's default --max-num-batched-tokens; the prefill chunk when the caller does not say. */
+export const DEFAULT_BATCHED_TOKENS = 2048;
+/**
+ * Bytes of live activation per token per hidden unit during prefill. A chunk of T tokens
+ * materialises qkv, the MLP up/gate projections and residual copies concurrently; this folds
+ * those into one multiple over `hidden_size` at 2-byte activations. Order-of-magnitude, not exact.
+ */
+export const ACT_BYTES_PER_TOKEN_HIDDEN = 12;
 /** Legacy flat overhead factor — used ONLY when a model carries no embedding geometry. */
 export const WEIGHT_OVERHEAD = 1.02;
 export const MBU = 0.55; // model bandwidth utilisation (decode roofline)
@@ -69,6 +83,25 @@ export const QB: Record<Quant, number> = {
  * double-counts the embeddings.
  */
 export const WHOLE_FILE_QUANTS: ReadonlySet<Quant> = new Set<Quant>(['Q8_0', 'Q4_K_M', 'IQ4_XS']);
+
+/**
+ * Per-GPU runtime reserve, split into the part that is fixed and the part that is not.
+ *
+ * A flat reserve is fine at default settings and wrong as soon as `--max-num-batched-tokens` is
+ * raised: prefill materialises activations for the whole chunk at once, so the peak scales with
+ * chunk x hidden_size. Sizing a long-prefill, large-chunk deployment against a flat 2.5 GiB
+ * silently under-reserves and the server OOMs during warmup rather than under load.
+ *
+ * The floor is kept at RUNTIME_GB so nothing re-sizes for callers who never touch the chunk.
+ */
+export function runtimeReserveGib(model: Model, batchedTokens?: number): { total: number; activations: number } {
+  const chunk = batchedTokens && batchedTokens > 0 ? batchedTokens : DEFAULT_BATCHED_TOKENS;
+  const hidden = model.hidden_size;
+  // Without hidden_size we cannot scale anything; fall back to the flat historical reserve.
+  if (!hidden) return { total: RUNTIME_GB, activations: 0 };
+  const activations = (chunk * hidden * ACT_BYTES_PER_TOKEN_HIDDEN) / GIB;
+  return { total: Math.max(RUNTIME_GB, CUDA_CONTEXT_GB + activations), activations };
+}
 
 /** KV bytes per token for ONE layer — GQA vs MLA (addendum §A). */
 export function kvPerLayerPerTokenBytes(model: Model, kvDtypeBytes: number): number {
@@ -158,6 +191,20 @@ export function weightsGb(model: Model, quant: Quant): number {
   if (WHOLE_FILE_QUANTS.has(quant)) return paramBytesToGib(model.total_params_b, QB[quant]);
   const tail = unquantisedParamsB(model);
   if (tail === null) return paramBytesToGib(model.total_params_b * WEIGHT_OVERHEAD, QB[quant]);
+
+  // Mixed-precision checkpoint: only part of the body is at `quant`, the declared dense
+  // remainder stays at a higher precision. Three buckets instead of two.
+  const denseQuant = model.mixed_precision?.[quant];
+  const dense = model.dense_params_b ?? 0;
+  if (denseQuant && dense > 0) {
+    const quantised = Math.max(0, model.total_params_b - tail - dense);
+    return (
+      paramBytesToGib(quantised, QB[quant]) +
+      paramBytesToGib(dense, QB[denseQuant]) +
+      paramBytesToGib(tail, FP16_BYTES)
+    );
+  }
+
   const body = Math.max(0, model.total_params_b - tail);
   return paramBytesToGib(body, QB[quant]) + paramBytesToGib(tail, FP16_BYTES);
 }
@@ -193,7 +240,8 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   // reconciles with kv_per_request. For an all-full-attention model it equals the nominal rate;
   // with windowed layers it is lower, because most layers stopped growing at the window.
   const kv_per_token_gb = active_tokens > 0 ? kv_per_request_gb / active_tokens : 0;
-  const usable_gb = gpu.mem_gb * mem_util_fraction - RUNTIME_GB;
+  const reserve = runtimeReserveGib(model, input.max_num_batched_tokens);
+  const usable_gb = gpu.mem_gb * mem_util_fraction - reserve.total;
 
   // TP selection: the TP size that needs the FEWEST TOTAL GPUs for the target concurrency.
   //
@@ -281,6 +329,8 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     tight,
     weights_estimated: !WHOLE_FILE_QUANTS.has(quant) && unquantisedParamsB(model) === null,
     kv_windowed: hasWindowedLayers(model),
+    runtime_reserve_gb: reserve.total,
+    activation_gb: reserve.activations,
     throughput_tokens_per_sec,
     decode_tps_per_request,
     ttft_ms,

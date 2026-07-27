@@ -71,9 +71,31 @@ Cross-checks against published checkpoints: Llama-3.3-70B Q4_K_M → **43.1 GB**
 
 GGUF is llama.cpp / Ollama territory; vLLM's support for it is experimental. The GGUF quants exist here because the catalog now includes consumer cards, where they are the dominant format — but note that this tool's overhead model (a 2.5 GiB reserve plus a ~10% paged-server utilisation cap) is tuned for vLLM. llama.cpp runs leaner, so single-card GGUF plans will read more pessimistically here than they behave in practice.
 
+### Mixed-precision checkpoints
+
+Frontier low-bit releases are rarely uniform. NVIDIA ModelOpt's GLM-5.2 NVFP4 card says *"only MoE expert linears are quantized"*; DeepSeek-V4 ships *"MoE experts FP4, remaining params FP8"*; Mistral's FP8 keeps *"vision tower / projector / lm_head in BF16"*. Of the 425 recipe variants surveyed, **32 explicitly name which tensors are quantised.**
+
+A single bytes/param cannot express that, so a model may declare a **dense remainder** — attention, shared experts, router and dense MLP, excluding the embedding tail — and which precision that remainder keeps under a given quant:
+
+```
+weights = quantised_body × effective_bytes(quant)
+        + dense_params  × effective_bytes(dense_quant)
+        + tail          × 2
+```
+
+GLM-5.2's dense block is 16.5 B parameters. Sizing its NVFP4 checkpoint as uniform reads 0.75 of the published VRAM floor; keeping the dense block at 16-bit reads **0.80**, inside the healthy band. Quants with no declaration stay uniform — GLM-5.2's MXFP4 is deliberately left alone, because AMD's card says only "MoE weights quantized", which is not specific enough to model differently.
+
 ### Prefill activations
 
-The 2.5 GiB runtime reserve covers the CUDA context (~1–2 GiB) plus activation buffers at default settings. It is a **flat** figure: raising `--max-num-batched-tokens` for chunked prefill grows the activation peak beyond what this model accounts for. Treat long-prefill, large-batch configurations as under-reserved.
+The runtime reserve is **not a constant.** A prefill chunk materialises activations for every token in it simultaneously, so the peak scales with `chunk × hidden_size`:
+
+```
+reserve = max( 2.5 GiB , 1.5 GiB CUDA context + chunk × hidden_size × 12 bytes )
+```
+
+At vLLM's default `--max-num-batched-tokens` of 2048 this floors at the historical 2.5 GiB, so default-configured plans size exactly as before. Raise the chunk and it bites: Llama-3.3-70B (hidden 8192) needs 3.0 GiB at 16K, 4.5 GiB at 32K, 7.5 GiB at 64K — memory that is no longer available for KV cache. It scales with `hidden_size` too, so a narrow model like GPT-OSS-120B (hidden 2880) stays floor-bound at the same chunk.
+
+The 12-bytes-per-token-per-hidden-unit figure folds qkv, the MLP up/gate projections and residual copies into one multiple at 2-byte activations. It is an order-of-magnitude model, not a kernel-accurate one — but it moves in the right direction, which a flat reserve does not. Models with no `hidden_size` fall back to the flat figure.
 
 ## 3. KV cache & concurrency
 

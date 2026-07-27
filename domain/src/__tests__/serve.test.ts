@@ -78,6 +78,20 @@ describe('vllm serve command generation', () => {
     expect(d.argv).toEqual(serveCommand(m, base, s).argv); // argv is the source of truth
   });
 
+  it('emits --max-num-batched-tokens only when it differs from the default', () => {
+    const m = M('llama33-70b');
+    const plain = computeSizing(m, G('h200'), base) as FeasibleSizing;
+    expect(serveCommand(m, base, plain).argv).not.toContain('--max-num-batched-tokens');
+
+    const input = { ...base, max_num_batched_tokens: 32768 };
+    const big = computeSizing(m, G('h200'), input) as FeasibleSizing;
+    const cmd = serveCommand(m, input, big);
+    expect(cmd.argv[cmd.argv.indexOf('--max-num-batched-tokens') + 1]).toBe('32768');
+    // the plan was sized against the larger reserve, so the flag is load-bearing
+    expect(cmd.notes.join(' ')).toMatch(/optimistic/i);
+    expect(big.activation_gb).toBeGreaterThan(plain.activation_gb);
+  });
+
   it('falls back to the catalogue name when no hf id is supplied', () => {
     const m = M('llama33-70b');
     const s = computeSizing(m, G('h200'), base) as FeasibleSizing;

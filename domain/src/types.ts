@@ -42,6 +42,16 @@ export interface Model {
   // Layer split is: full_attention_layers + linear_attention_layers + windowed = layers.
   linear_attention_layers?: number;
   linear_state_bytes_per_layer?: number; // fixed state per layer per request, in bytes
+  // --- mixed-precision checkpoints (optional) ---
+  // Frontier low-bit checkpoints are rarely uniform. NVIDIA ModelOpt's GLM-5.2 NVFP4 quantises
+  // "only MoE expert linears"; DeepSeek-V4 ships "MoE experts FP4, remaining params FP8". A
+  // single bytes/param cannot express that, so a model may declare how much of it is NOT in the
+  // quantisable block, and which precision that remainder sits at for a given quant.
+  //   dense_params_b: attention + shared experts + router + dense MLP, EXCLUDING the embedding
+  //                   tail (that is already handled by hidden_size/vocab_size).
+  //   mixed_precision: quant -> precision the dense remainder keeps under that quant.
+  dense_params_b?: number;
+  mixed_precision?: Partial<Record<Quant, Quant>>;
 }
 
 /** A GPU type (addendum §F.2). */
@@ -62,6 +72,8 @@ export interface SizingInput {
   target_concurrency: number;
   mem_util_fraction: number; // 0 < v <= 1
   gpus_per_node: number;
+  /** vLLM --max-num-batched-tokens: the prefill chunk. Drives the activation reserve. */
+  max_num_batched_tokens?: number;
 }
 
 export interface FeasibleSizing {
@@ -85,6 +97,10 @@ export interface FeasibleSizing {
   weights_estimated: boolean;
   /** True when some layers are sliding-window, so KV is below the all-full-attention figure. */
   kv_windowed: boolean;
+  /** Per-GPU runtime reserve actually applied (GiB): CUDA context floor + prefill activations. */
+  runtime_reserve_gb: number;
+  /** Prefill activation component of that reserve (GiB) — scales with the batched-token chunk. */
+  activation_gb: number;
   throughput_tokens_per_sec: number; // aggregate decode throughput across the deployment, ±40%
   decode_tps_per_request: number; // per-request decode tokens/sec (1 / step time), ±40%
   ttft_ms: number; // indicative time-to-first-token (prefill, bandwidth floor), ±50%

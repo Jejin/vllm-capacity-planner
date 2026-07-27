@@ -20,6 +20,12 @@ import type { Model, GpuSku } from './types.js';
 //   and the BF16 + AMD Quark MXFP4 checkpoints added.
 //   kimi-k2 / kimi-k3: VERIFIED 2026-07-28. K2 was already correct (61 layers, hidden 7168,
 //   vocab 163840, MLA 576/layer). K3 is new — see the note on its entry below.
+//   dense_params_b (attention + shared experts + router + dense MLP, excluding the embedding
+//   tail) is computed from each config and reconciles with the published totals to within 0.03%
+//   for GLM-5.2 and Kimi-K2. It only changes sizing for quants listed in mixed_precision.
+//   glm52 declares NVFP4 mixed because NVIDIA's ModelOpt card says "only MoE expert linears are
+//   quantized to NVFP4; shared experts, attention ..." stay higher. MXFP4 is left uniform: AMD's
+//   card says only "MoE weights quantized", which is not specific enough to model differently.
 //   NOTE: `index_topk: 2048` (DSA sparse attention) selects which tokens each query attends to.
 //   It reduces attention COMPUTE, not cache residency — the KV cache still holds every token —
 //   so it is deliberately NOT modelled as a memory saving.
@@ -44,16 +50,16 @@ export const SEED_MODELS: Model[] = [
   { id: 'qwen25-72b', name: 'Qwen2.5-72B Instruct', total_params_b: 72.7, active_params_b: 72.7, layers: 80, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 8192, vocab_size: 152064, tied_embeddings: false },
   { id: 'gptoss-120b', name: 'GPT-OSS 120B (MoE 5.1B act)', total_params_b: 117, active_params_b: 5.1, layers: 36, kv_heads: 8, head_dim: 64, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8], quants: ['MXFP4'], hidden_size: 2880, vocab_size: 201088, tied_embeddings: false, sliding_window: 128, full_attention_layers: 18 },
   { id: 'qwen3-235b', name: 'Qwen3-235B-A22B (MoE)', total_params_b: 235, active_params_b: 22, layers: 94, kv_heads: 4, head_dim: 128, mla: false, max_ctx: 262144, tp_options: [1, 2, 4, 8, 16], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 4096, vocab_size: 151936, tied_embeddings: false },
-  { id: 'glm45', name: 'GLM-4.5 355B-A32B (MoE)', total_params_b: 355, active_params_b: 32, layers: 92, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8, 16], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 5120, vocab_size: 151552, tied_embeddings: false },
-  { id: 'glm52', name: 'GLM-5.2 743B-A39B (MoE·MLA·DSA)', total_params_b: 743, active_params_b: 39, layers: 78, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 1048576, tp_options: [2, 4, 8, 16], quants: ['FP16', 'FP8', 'MXFP4', 'NVFP4'], hidden_size: 6144, vocab_size: 154880, tied_embeddings: false },
+  { id: 'glm45', name: 'GLM-4.5 355B-A32B (MoE)', total_params_b: 355, active_params_b: 32, layers: 92, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8, 16], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 5120, vocab_size: 151552, tied_embeddings: false, dense_params_b: 15.3 },
+  { id: 'glm52', name: 'GLM-5.2 743B-A39B (MoE·MLA·DSA)', total_params_b: 743, active_params_b: 39, layers: 78, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 1048576, tp_options: [2, 4, 8, 16], quants: ['FP16', 'FP8', 'MXFP4', 'NVFP4'], hidden_size: 6144, vocab_size: 154880, tied_embeddings: false, dense_params_b: 16.5, mixed_precision: { NVFP4: 'FP16' } },
   { id: 'dsv3', name: 'DeepSeek-V3 / R1 671B (MLA)', total_params_b: 671, active_params_b: 37, layers: 61, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 131072, tp_options: [2, 4, 8, 16], quants: ['FP8', 'INT4'], hidden_size: 7168, vocab_size: 129280, tied_embeddings: false },
-  { id: 'kimi-k2', name: 'Kimi K2 1T-A32B (MLA)', total_params_b: 1026, active_params_b: 32.5, layers: 61, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 131072, tp_options: [4, 8, 16], quants: ['FP8', 'INT4'], hidden_size: 7168, vocab_size: 163840, tied_embeddings: false },
+  { id: 'kimi-k2', name: 'Kimi K2 1T-A32B (MLA)', total_params_b: 1026, active_params_b: 32.5, layers: 61, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 131072, tp_options: [4, 8, 16], quants: ['FP8', 'INT4'], hidden_size: 7168, vocab_size: 163840, tied_embeddings: false, dense_params_b: 9.4 },
   // Kimi K3 — hybrid attention. Only 24 of 93 layers keep a token-indexed cache (full MLA);
   // the other 69 are KDA (Kimi Delta Attention), a recurrent form whose state is CONSTANT in
   // sequence length. linear_state_bytes_per_layer = num_heads 96 x head_dim 128 x 128 x 4 B
   // (fp32 recurrent state) = 6.29 MB/layer, so 69 layers cost a flat ~434 MB per request
   // regardless of context. Sizing all 93 layers as MLA would overstate KV ~3.9x at 1M.
-  { id: 'kimi-k3', name: 'Kimi K3 2.8T-A60B (MoE·MLA+KDA)', total_params_b: 2800, active_params_b: 60, layers: 93, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 1048576, tp_options: [8, 16], quants: ['MXFP4'], hidden_size: 7168, vocab_size: 163840, tied_embeddings: false, full_attention_layers: 24, linear_attention_layers: 69, linear_state_bytes_per_layer: 6291456 },
+  { id: 'kimi-k3', name: 'Kimi K3 2.8T-A60B (MoE·MLA+KDA)', total_params_b: 2800, active_params_b: 60, layers: 93, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 1048576, tp_options: [8, 16], quants: ['MXFP4'], hidden_size: 7168, vocab_size: 163840, tied_embeddings: false, full_attention_layers: 24, linear_attention_layers: 69, linear_state_bytes_per_layer: 6291456, dense_params_b: 20.8 },
 ];
 
 // price_per_gpu_hour: INDICATIVE market rental rates ($/GPU-hour) — [VERIFY] against your

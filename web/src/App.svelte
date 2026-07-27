@@ -39,6 +39,7 @@
     }
   });
 
+  let batchTokens = $state(2048); // vLLM --max-num-batched-tokens; drives the activation reserve
   const model = $derived<Model>(catalog.models.find((m: Model) => m.id === modelId) ?? catalog.models[0]);
   const gpu = $derived<GpuSku>(catalog.gpus.find((g: GpuSku) => g.id === gpuId) ?? catalog.gpus[0]);
   const ctxChoices = $derived(CTXS.filter((c) => c <= (model?.max_ctx ?? 0)));
@@ -49,6 +50,7 @@
   const sizingInput = $derived({
     quant: effQuant, kv_dtype_bytes: kvBytes, selected_ctx: Math.min(ctx, model?.max_ctx ?? ctx),
     avg_context_utilisation: util, target_concurrency: conc, mem_util_fraction: memUtil, gpus_per_node: perNode,
+    max_num_batched_tokens: batchTokens,
   });
   const result = $derived(computeSizing(model, gpu, sizingInput));
   const R = $derived(result.ok ? (result as FeasibleSizing) : null);
@@ -367,6 +369,8 @@
         <label>GPU SKU<select bind:value={gpuId}>{#each catalog.gpus as g}<option value={g.id}>{g.name}</option>{/each}</select></label></div>
       <div class="row"><label>GPU mem-util<input type="number" min="0.1" max="1" step="0.05" bind:value={memUtil} /></label>
         <label>GPUs / node<input type="number" bind:value={perNode} /></label></div>
+      <div class="row"><label>Prefill chunk<small> (--max-num-batched-tokens)</small><input type="number" min="256" step="256" bind:value={batchTokens} /></label>
+        <label>Runtime reserve<small> (derived)</small><input type="text" value={R ? `${R.runtime_reserve_gb.toFixed(2)} GiB` : '—'} disabled /></label></div>
       {#if R}<button class="btn primary full" onclick={addToPlan}>+ Add to cluster plan</button>{/if}
     </section>
 
@@ -426,6 +430,7 @@
           <div class="li"><span>KV per request ({ctx / 1024}K × {Math.round(util * 100)}%)</span><b>{fmt(R.kv_per_request_gb)} GiB</b></div>
           <div class="li"><span>Concurrency per pod</span><b>{R.concurrency_per_pod} req</b></div>
           <div class="li"><span>Pods → GPUs → nodes ({perNode}/node)</span><b>{R.pods} → {R.gpus} → {R.nodes}</b></div>
+          <div class="li"><span>Runtime reserve / GPU <small>(context {R.runtime_reserve_gb > 2.5 ? '+ prefill activations' : ''})</small></span><b>{fmt(R.runtime_reserve_gb, 2)} GiB{#if R.activation_gb > 0.05}<small> · {fmt(R.activation_gb, 2)} act</small>{/if}</b></div>
           <div class="li"><span>Usable HBM per GPU ({memUtil})</span><b>{fmt(R.usable_gb)} GiB</b></div>
           <div class="li"><span>Pod headroom <small>(free after weights + 1 request)</small></span><b class:tightv={R.tight}>{(R.headroom_fraction * 100).toFixed(1)}%</b></div>
           <div class="li"><span>Time to first token <small>(indicative, prefill)</small></span><b>~{R.ttft_ms} ms <small>±50%</small></b></div>
@@ -473,6 +478,7 @@
         {#if R.tight}<div class="state warn"><b>Tight fit — {(R.headroom_fraction * 100).toFixed(1)}% headroom.</b> Weights + one request of KV leave under 10% of the pod's HBM free, so this plan has no margin for the ±5% weight estimate, fragmentation, or a longer prompt than modelled. It will likely OOM on a real vLLM launch. Drop context, quantise the KV cache, or move to the next TP size.</div>{/if}
         {#if R.kv_windowed && model?.linear_attention_layers}<div class="state ok"><b>Hybrid attention applied.</b> Only {model.full_attention_layers} of {model.layers} layers keep a token-indexed cache; the other {model.linear_attention_layers} are linear/recurrent and hold a constant {fmt((model.linear_attention_layers * (model.linear_state_bytes_per_layer ?? 0)) / 2 ** 30)} GiB regardless of context. KV per request is <b>{fmt(R.kv_per_request_gb)} GiB</b> instead of the {fmt(kvNominalGb)} GiB all-{model.layers}-layer sizing would claim — a {(kvNominalGb / R.kv_per_request_gb).toFixed(1)}× difference.</div>
         {:else if R.kv_windowed}<div class="state ok"><b>Local/global attention applied.</b> {model.full_attention_layers} of {model.layers} layers keep full context; the other {model.layers - (model.full_attention_layers ?? 0)} stop growing at {model.sliding_window} tokens. KV per request is <b>{fmt(R.kv_per_request_gb)} GiB</b> instead of the {fmt(kvNominalGb)} GiB an all-full-attention model of this shape would need — a {(kvNominalGb / R.kv_per_request_gb).toFixed(1)}× saving at this context.</div>{/if}
+        {#if R.activation_gb > 2}<div class="state warn"><b>Prefill activations are {fmt(R.activation_gb, 1)} GiB per GPU.</b> A chunk of {batchTokens.toLocaleString()} tokens materialises activations for every token at once, so the runtime reserve has grown to {fmt(R.runtime_reserve_gb, 1)} GiB — memory that is no longer available for KV cache. Lower <code>--max-num-batched-tokens</code> if you would rather spend it on concurrency.</div>{/if}
         {#if R.weights_estimated}<div class="state warn"><b>Weight estimate is approximate.</b> This model carries no embedding geometry, so the weights fall back to a flat overhead factor — optimistic by ~5–15% at INT4/MXFP4, where the 16-bit embedding and lm_head are a large share of the checkpoint. Add <code>hidden_size</code> and <code>vocab_size</code> in the model catalog to sharpen it.</div>{/if}
         {#if R.multi_node}<div class="state warn"><b>TP {R.tp} &gt; {perNode} GPUs/node:</b> this replica spans nodes — needs NVLink/IB fabric; latency &amp; MBU degrade vs single-node TP.</div>{/if}
         {#if util >= 1}<div class="state warn">Sizing at 100% context utilisation buys worst-case memory that mostly sits idle. Size KV at P95 of observed sequence length.</div>{/if}
@@ -590,6 +596,7 @@
             <div><span>TP options</span><b>{m.tp_options.join(', ')}</b></div>
             <div><span>Quants</span><b>{m.quants.join(', ')}</b></div>
             <div><span>Embedding</span><b>{m.vocab_size && m.hidden_size ? `${m.vocab_size.toLocaleString()} × ${m.hidden_size}${m.tied_embeddings ? ' tied' : ''}` : '— (est.)'}</b></div>
+            <div><span>Mixed precision</span><b>{m.mixed_precision && Object.keys(m.mixed_precision).length ? Object.entries(m.mixed_precision).map(([q, d]) => `${q}: dense @ ${d}`).join(', ') : '— uniform'}</b></div>
             <div><span>Attention</span><b>{m.linear_attention_layers ? `${m.full_attention_layers}/${m.layers} cached · ${m.linear_attention_layers} linear` : m.sliding_window && m.full_attention_layers != null ? `${m.full_attention_layers}/${m.layers} full · ${m.sliding_window}-tok window` : 'all full-context'}</b></div>
           </div>
           {#if ident.role === 'admin'}<div class="mcard-f"><button class="btn ghost" onclick={() => editModel(m)}>edit</button> <button class="btn ghost danger" onclick={() => deleteModelUi(m.id)}>delete</button></div>{/if}
@@ -739,6 +746,17 @@
     </tbody></table>
     <p class="note"><b>The GGUF trap.</b> Q4_K_M is not 4 bits. It mixes Q4_K and Q6_K tensor by tensor and lands near <b>4.9 effective bits</b>; assuming 4.0 undercounts a 70B model by about 8 GB. The three GGUF figures are whole-<em>file</em> averages measured across a finished checkpoint — GGUF quantises the embedding layers too, so those quants skip the 16-bit tail term below rather than paying it twice. GGUF is llama.cpp / Ollama territory; vLLM's support for it is experimental.</p>
     <p class="note">Models in the catalog without <code>hidden_size</code>/<code>vocab_size</code> fall back to the legacy <code>total × bytes × 1.02</code> estimate, and the sizing view labels the result approximate. Hugging Face import fills all three fields from <code>config.json</code>.</p>
+
+    <h3 class="dh3">Mixed-precision checkpoints</h3>
+    <p>Frontier low-bit releases are rarely uniform. NVIDIA ModelOpt's GLM-5.2 NVFP4 card says <em>"only MoE expert linears are quantized"</em>; DeepSeek-V4 ships <em>"MoE experts FP4, remaining params FP8"</em>. Of 425 published recipe variants, <b>32 explicitly name which tensors are quantised</b>. A model can therefore declare a <b>dense remainder</b> — attention, shared experts, router, dense MLP — and the precision it keeps:</p>
+    <div class="formula">weights = quantised × bytes(quant) + dense × bytes(dense_quant) + tail × 2</div>
+    <p class="note">GLM-5.2's dense block is 16.5 B parameters. Sized uniform, its NVFP4 checkpoint reads 0.75 of the published VRAM floor; keeping the dense block at 16-bit reads <b>0.80</b>. Quants with no declaration stay uniform.</p>
+
+    <h3 class="dh3">Prefill activations</h3>
+    <p>The runtime reserve is <b>not a constant</b>. A prefill chunk materialises activations for every token in it at once, so the peak scales with <code>chunk × hidden_size</code>:</p>
+    <div class="formula">reserve = max( 2.5 GiB , 1.5 GiB context + chunk × hidden_size × 12 bytes )</div>
+    <p>At vLLM's default chunk of 2048 this floors at the historical 2.5 GiB, so default plans size exactly as before. Raise it and it bites: Llama-3.3-70B (hidden 8192) needs 3.0 GiB at 16K, 4.5 GiB at 32K, <b>7.5 GiB at 64K</b> — memory no longer available for KV cache. A narrow model like GPT-OSS-120B (hidden 2880) stays floor-bound at the same chunk.</p>
+    <p class="note">The 12-bytes figure folds qkv, MLP up/gate and residual copies into one multiple at 2-byte activations. Order-of-magnitude, not kernel-accurate — but it moves in the right direction, which a flat reserve does not.</p>
 
     <h2 class="dh">3 · KV cache &amp; concurrency</h2>
     <p>KV cache grows linearly with both sequence length and batch size — the real limiter for long-context, high-concurrency serving. Per-token size depends on the attention geometry:</p>

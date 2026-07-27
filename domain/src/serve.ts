@@ -5,6 +5,7 @@
 // the loop from "how many GPUs" to "how do I start it", and makes the plan checkable: if the
 // command OOMs, the sizing was wrong.
 
+import { DEFAULT_BATCHED_TOKENS } from './engine.js';
 import type { FeasibleSizing, Model, SizingInput } from './types.js';
 
 export interface ServeCommandOptions {
@@ -62,6 +63,17 @@ export function serveCommand(
   if (kv) {
     argv.push('--kv-cache-dtype', kv);
     notes.push('FP8 KV cache halves cache size against FP16 for a small quality cost — the plan assumes it.');
+  }
+
+  // Only emit the chunk when it differs from vLLM's default — an explicit flag that repeats the
+  // default is noise, but a plan sized against a raised chunk MUST pass it or the reserve lies.
+  if (input.max_num_batched_tokens && input.max_num_batched_tokens !== DEFAULT_BATCHED_TOKENS) {
+    argv.push('--max-num-batched-tokens', String(input.max_num_batched_tokens));
+    notes.push(
+      `Prefill chunk raised to ${input.max_num_batched_tokens.toLocaleString()} tokens, which is why ` +
+        `${sizing.activation_gb.toFixed(1)} GiB of the ${sizing.runtime_reserve_gb.toFixed(1)} GiB per-GPU ` +
+        `reserve is activations. Launching without this flag makes the plan optimistic.`,
+    );
   }
 
   // Cap the scheduler at what the memory budget actually supports. Left unset, vLLM will admit

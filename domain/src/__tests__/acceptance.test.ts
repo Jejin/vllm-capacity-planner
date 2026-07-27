@@ -5,7 +5,8 @@
 // and GpuSku.mem_gb. Vectors were re-pinned when the engine stopped mixing 1e9-byte GB (weights)
 // with 2^30-byte GiB (KV, capacity), which had inflated weights ~7.4% against GPU capacity.
 import { describe, it, expect } from 'vitest';
-import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, GIB, QB, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB } from '../engine.js';
+import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
+import { crossCheckVram } from '../recipes.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema, gpuSkuSchema } from '../schema.js';
 import { reconcile, headroomCheck } from '../reconcile.js';
@@ -215,6 +216,110 @@ describe('§C low-bit weight vectors (un-quantised embedding/lm_head tail)', () 
     }) as FeasibleSizing;
     expect(r.ok).toBe(true);
     expect(r.weights_estimated).toBe(true); // surfaced to the UI as a caveat
+  });
+});
+
+// Mixed-precision checkpoints. Frontier low-bit releases rarely quantise everything: NVIDIA's
+// ModelOpt GLM-5.2 card says "only MoE expert linears are quantized to NVFP4". A single
+// bytes/param cannot express that, so a model may declare its dense remainder.
+describe('§C mixed-precision checkpoints', () => {
+  it('AC-42 — GLM-5.2 NVFP4 keeps its dense block at 16-bit', () => {
+    const m = model('glm52');
+    expect(m.dense_params_b).toBe(16.5);
+    expect(m.mixed_precision?.NVFP4).toBe('FP16');
+    const mixed = weightsGb(m, 'NVFP4');
+    // same model sized as if NVFP4 covered the whole body
+    const uniform = weightsGb({ ...m, mixed_precision: undefined }, 'NVFP4');
+    expect(mixed).toBeGreaterThan(uniform);
+    // the delta is exactly the dense block moving from NVFP4 to fp16
+    expect(mixed - uniform).toBeCloseTo(paramBytesToGib(16.5, FP16_BYTES - QB.NVFP4), 6);
+  });
+
+  it('AC-43 — it moves GLM-5.2 NVFP4 closer to the published floor', () => {
+    const m = model('glm52');
+    const mixed = crossCheckVram(weightsGb(m, 'NVFP4'), 558);
+    const uniform = crossCheckVram(weightsGb({ ...m, mixed_precision: undefined }, 'NVFP4'), 558);
+    expect(uniform.ratio).toBeLessThan(mixed.ratio); // was under-counting
+    expect(near(mixed.ratio, 0.8, 0.05)).toBe(true);
+    expect(mixed.verdict).toBe('plausible');
+  });
+
+  it('AC-44 — quants not listed as mixed are untouched', () => {
+    const m = model('glm52');
+    // MXFP4 is deliberately left uniform — AMD's card is not specific enough to model
+    expect(m.mixed_precision?.MXFP4).toBeUndefined();
+    expect(weightsGb(m, 'MXFP4')).toBeCloseTo(
+      weightsGb({ ...m, mixed_precision: undefined }, 'MXFP4'), 9);
+  });
+
+  it('AC-45 — three buckets always sum to the whole model', () => {
+    const m = model('glm52');
+    const tail = unquantisedParamsB(m)!;
+    const dense = m.dense_params_b!;
+    const quantised = m.total_params_b - tail - dense;
+    expect(quantised).toBeGreaterThan(0);
+    expect(weightsGb(m, 'NVFP4')).toBeCloseTo(
+      paramBytesToGib(quantised, QB.NVFP4) + paramBytesToGib(dense, QB.FP16) + paramBytesToGib(tail, FP16_BYTES), 9);
+  });
+
+  it('AC-46 — validation rejects mixed_precision with no dense split to apply it to', () => {
+    const m = model('glm52');
+    expect(modelSchema.safeParse({ ...m, dense_params_b: undefined }).success).toBe(false);
+    expect(modelSchema.safeParse({ ...m, dense_params_b: 9999 }).success).toBe(false);
+    expect(modelSchema.safeParse({ ...m, mixed_precision: { NOPE: 'FP16' } }).success).toBe(false);
+    expect(modelSchema.safeParse(m).success).toBe(true);
+  });
+});
+
+// Prefill activations. The runtime reserve is not a constant: a prefill chunk materialises
+// activations for every token in it at once, so the peak scales with chunk x hidden_size.
+describe('§C prefill activation reserve', () => {
+  it('AC-47 — default settings reserve exactly what they always did', () => {
+    const m = model('llama33-70b');
+    expect(runtimeReserveGib(m).total).toBe(RUNTIME_GB);
+    expect(runtimeReserveGib(m, DEFAULT_BATCHED_TOKENS).total).toBe(RUNTIME_GB);
+    // and a plan built without the field is byte-identical to one passing the default
+    const base = {
+      quant: 'FP8' as const, kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
+      target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
+    };
+    const a = computeSizing(m, gpu('h200'), base) as FeasibleSizing;
+    const b = computeSizing(m, gpu('h200'), { ...base, max_num_batched_tokens: DEFAULT_BATCHED_TOKENS }) as FeasibleSizing;
+    expect(a.usable_gb).toBe(b.usable_gb);
+  });
+
+  it('AC-48 — a large prefill chunk raises the reserve, monotonically', () => {
+    const m = model('llama33-70b');
+    const r = [2048, 8192, 16384, 32768, 65536].map((c) => runtimeReserveGib(m, c).total);
+    for (let i = 1; i < r.length; i++) expect(r[i]).toBeGreaterThanOrEqual(r[i - 1]);
+    expect(near(runtimeReserveGib(m, 32768).total, 4.5, 0.02)).toBe(true);
+    expect(runtimeReserveGib(m, 65536).total).toBeGreaterThan(RUNTIME_GB * 2);
+  });
+
+  it('AC-49 — it scales with hidden_size, so small models barely move', () => {
+    const wide = runtimeReserveGib(model('llama33-70b'), 32768).total; // hidden 8192
+    const narrow = runtimeReserveGib(model('gptoss-120b'), 32768).total; // hidden 2880
+    expect(wide).toBeGreaterThan(narrow);
+    expect(narrow).toBeCloseTo(RUNTIME_GB, 0); // still floor-bound
+  });
+
+  it('AC-50 — the bigger reserve really does cost usable HBM and concurrency', () => {
+    const m = model('llama33-70b');
+    const base = {
+      quant: 'FP8' as const, kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
+      target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
+    };
+    const small = computeSizing(m, gpu('h200'), base) as FeasibleSizing;
+    const big = computeSizing(m, gpu('h200'), { ...base, max_num_batched_tokens: 65536 }) as FeasibleSizing;
+    expect(big.usable_gb).toBeLessThan(small.usable_gb);
+    expect(big.concurrency_per_pod).toBeLessThanOrEqual(small.concurrency_per_pod);
+    expect(big.activation_gb).toBeGreaterThan(small.activation_gb);
+    expect(big.runtime_reserve_gb).toBeGreaterThan(small.runtime_reserve_gb);
+  });
+
+  it('AC-51 — a model with no hidden_size falls back to the flat reserve', () => {
+    const bare = { ...model('llama33-70b'), hidden_size: undefined, vocab_size: undefined };
+    expect(runtimeReserveGib(bare, 65536)).toEqual({ total: RUNTIME_GB, activations: 0 });
   });
 });
 
