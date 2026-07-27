@@ -19,6 +19,8 @@ The sizing math is a deterministic memory-bandwidth model (the same roofline vLL
 - **Visuals** — per-GPU HBM allocation (weights / KV / reserve), tensor-parallel topology across GPUs & nodes, infeasibility & multi-node signals.
 - **Concurrency rubric** — sweep target concurrency and read off GPUs, per-request and aggregate tokens/sec.
 - **Fleet + Cluster** — define a mixed-SKU GPU fleet, add sized models, see **utilisation vs free space** per SKU, and get hard-blocked from over-committing the hardware.
+- **Launch command** — every plan emits a runnable `vllm serve` (or `docker run`) command built from its own numbers: TP size, `--max-model-len`, `--gpu-memory-utilization`, `--kv-cache-dtype`, and `--max-num-seqs` capped at the pod's actual KV budget. Notes call out multi-node replicas, tight headroom, and that the command is one replica of N.
+- **Import from Hugging Face + vLLM recipes** — `config.json` supplies the geometry (layers, heads, embedding sizes, attention regime); [recipes.vllm.ai](https://recipes.vllm.ai) supplies the four fields it never carries (parameter counts, context length, shipped quantisations, TP sizes). Together they import a model with no hand-typing, and the recipe's stated VRAM floor is shown beside our own estimate as a cross-check.
 - **Saved configurations** — save a fleet + plan as a named, reloadable scenario.
 - **Model catalog** — a browsable model-card catalog with admin CRUD, plus **import model geometry from Hugging Face** (fetches `config.json`, maps it to the model schema for review + commit).
 - **Cost estimation** — set a $/GPU-hour per SKU and get cluster run-rate ($/hr·mo·yr), per-SKU line items, and **cost per million tokens**; export the estimate as CSV or JSON.
