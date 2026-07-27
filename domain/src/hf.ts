@@ -15,6 +15,8 @@ export interface HfConfig {
   num_key_value_heads?: number;
   head_dim?: number;
   hidden_size?: number;
+  vocab_size?: number;
+  tie_word_embeddings?: boolean;
   max_position_embeddings?: number;
   [k: string]: unknown;
 }
@@ -47,6 +49,11 @@ export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
     kv_heads: mla ? 0 : kv_heads,
     head_dim: mla ? 0 : head_dim,
     max_ctx: cfg.max_position_embeddings,
+    // embedding geometry — config.json carries all three, so low-bit weight estimates
+    // get the 16-bit embedding/lm_head tail for free on import
+    hidden_size: cfg.hidden_size,
+    vocab_size: cfg.vocab_size,
+    tied_embeddings: cfg.tie_word_embeddings ?? false,
   };
   // params + tp + quants are never in config.json — admin-supplied
   const missing: (keyof Model)[] = ['total_params_b', 'active_params_b', 'tp_options', 'quants'];
@@ -60,6 +67,7 @@ export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
 export interface SweepRow {
   concurrency: number;
   feasible: boolean;
+  tight: boolean; // feasible, but <10% pod headroom — see engine.TIGHT_HEADROOM
   gpus: number;
   pods: number;
   tp: number;
@@ -75,9 +83,9 @@ export function concurrencySweep(
 ): SweepRow[] {
   return concurrencies.map((c) => {
     const r: Sizing = computeSizing(model, gpu, { ...input, target_concurrency: c });
-    if (!r.ok) return { concurrency: c, feasible: false, gpus: 0, pods: 0, tp: 0, decode_tps_per_request: 0, throughput_tokens_per_sec: 0, ttft_ms: 0 };
+    if (!r.ok) return { concurrency: c, feasible: false, tight: false, gpus: 0, pods: 0, tp: 0, decode_tps_per_request: 0, throughput_tokens_per_sec: 0, ttft_ms: 0 };
     return {
-      concurrency: c, feasible: true, gpus: r.gpus, pods: r.pods, tp: r.tp,
+      concurrency: c, feasible: true, tight: r.tight, gpus: r.gpus, pods: r.pods, tp: r.tp,
       decode_tps_per_request: r.decode_tps_per_request, throughput_tokens_per_sec: r.throughput_tokens_per_sec, ttft_ms: r.ttft_ms,
     };
   });

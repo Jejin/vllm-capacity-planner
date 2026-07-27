@@ -175,16 +175,21 @@
   // ── Admin catalog forms (FR-2/3/4/6/7/8, validated via the shared §F schema) ──
   const QUANTS = ['FP16', 'FP8', 'INT8', 'INT4', 'MXFP4', 'NVFP4'];
   type Err = { path: string; message: string };
-  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[] });
+  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false });
   let mf = $state(blankModel());
   let mfEditing = $state(false);
   let mfErrors = $state<Err[]>([]);
   const errFor = (errs: Err[], p: string) => errs.find((e) => e.path === p)?.message;
-  function editModel(m: Model) { mf = { ...m, tp_options: m.tp_options.join(','), quants: [...m.quants] } as any; mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
+  function editModel(m: Model) { mf = { ...m, tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings } as any; mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
   function newModelForm() { mf = blankModel(); mfEditing = false; mfErrors = []; }
   function toggleQuant(q: string) { mf.quants = mf.quants.includes(q) ? mf.quants.filter((x) => x !== q) : [...mf.quants, q]; }
   async function saveModel() {
-    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants };
+    // hidden_size/vocab_size are optional — send them only when both are filled in, so a blank
+    // pair stays undefined (engine falls back) rather than becoming 0 and failing validation.
+    const emb = mf.hidden_size !== '' && mf.vocab_size !== ''
+      ? { hidden_size: +mf.hidden_size, vocab_size: +mf.vocab_size, tied_embeddings: !!mf.tied_embeddings }
+      : {};
+    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb };
     const r = await fetch(mfEditing ? `/api/v1/models/${mf.id}` : '/api/v1/models', { method: mfEditing ? 'PUT' : 'POST', headers: authH, body: JSON.stringify(body) });
     if (r.ok) { newModelForm(); loadCatalog(); notice = 'Model saved.'; }
     else { const e = await r.json(); mfErrors = e.error?.fields ?? [{ path: '', message: e.error?.message ?? 'Save failed.' }]; }
@@ -218,7 +223,7 @@
       const d = await r.json();
       hfCard = d; hfMissing = d.missing ?? [];
       const m = d.mapped ?? {};
-      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [] };
+      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings };
       mfEditing = false; mfErrors = [];
       notice = `Fetched ${d.model_id}. Review below, complete params / TP / quants (highlighted), then Create model.`;
       document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' });
@@ -269,7 +274,7 @@
     </div>
   {:else}
     <div class="fleetctx active">
-      <span>Sizing against <b>{activeConfig ?? 'a manually-defined fleet'}</b> — {fleetTotals().gpus} GPUs · {(fleetTotals().hbm / 1024).toFixed(1)} TB HBM</span>
+      <span>Sizing against <b>{activeConfig ?? 'a manually-defined fleet'}</b> — {fleetTotals().gpus} GPUs · {(fleetTotals().hbm / 1024).toFixed(1)} TiB HBM</span>
       <div class="ctxactions">
         {#if configs.length}<select onchange={(e) => { const id = (e.currentTarget as HTMLSelectElement).value; if (id) loadConfig(id, false); (e.currentTarget as HTMLSelectElement).value = ''; }}><option value="">Switch configuration…</option>{#each configs as c}<option value={c.id}>{c.name}</option>{/each}</select>{/if}
         <button class="btn ghost" onclick={() => (tab = 'fleet')}>Edit fleet</button>
@@ -280,7 +285,7 @@
     <section class="panel">
       <h2>Deployment inputs</h2>
       <label>Model<select bind:value={modelId}>{#each catalog.models as m}<option value={m.id}>{m.name}</option>{/each}</select></label>
-      <div class="meta">total {model?.total_params_b} B · active {model?.active_params_b} B · layers {model?.layers} · {model?.mla ? 'MLA (latent 576/layer)' : `GQA ${model?.kv_heads} KV-heads × ${model?.head_dim}`} · max ctx {((model?.max_ctx ?? 0) / 1024)}K · TP {`{${model?.tp_options.join(',')}}`}</div>
+      <div class="meta">total {model?.total_params_b} B · active {model?.active_params_b} B · layers {model?.layers} · {model?.mla ? 'MLA (latent 576/layer)' : `GQA ${model?.kv_heads} KV-heads × ${model?.head_dim}`} · max ctx {((model?.max_ctx ?? 0) / 1024)}K · TP {`{${model?.tp_options.join(',')}}`}{#if model?.vocab_size && model?.hidden_size} · emb {model.vocab_size.toLocaleString()}×{model.hidden_size}{model.tied_embeddings ? ' (tied)' : ''}{/if}</div>
       <div class="row"><label>Quantisation<select bind:value={quant}>{#each (model?.quants ?? []) as q}<option value={q}>{q}</option>{/each}</select></label>
         <label>KV dtype<select bind:value={kvBytes}><option value={1}>FP8 (1B)</option><option value={2}>FP16 (2B)</option></select></label></div>
       <div class="row"><label>Max context<select bind:value={ctx}>{#each ctxChoices as c}<option value={c}>{c / 1024}K</option>{/each}</select></label>
@@ -295,9 +300,9 @@
     <section>
       {#if R}
         <div class="kpis">
-          <div class="kpi"><div class="v">{R.gpus}</div><div class="l">GPUs</div></div>
+          <div class="kpi" class:tight={R.tight}><div class="v">{R.gpus}</div><div class="l">GPUs</div><div class="verdict" class:t={R.tight}>{R.tight ? `Tight · ${(R.headroom_fraction * 100).toFixed(1)}% free` : `Fits · ${(R.headroom_fraction * 100).toFixed(0)}% free`}</div></div>
           <div class="kpi p"><div class="v">{R.pods}<small> × TP{R.tp}</small></div><div class="l">Pods</div></div>
-          <div class="kpi a"><div class="v">{fmt(kvAlloc)}<small> GB</small></div><div class="l">KV cache</div></div>
+          <div class="kpi a"><div class="v">{fmt(kvAlloc)}<small> GiB</small></div><div class="l">KV cache</div></div>
           <div class="kpi g"><div class="v">~{R.throughput_tokens_per_sec.toLocaleString()}</div><div class="l">Tokens/s</div><div class="cav">±40% · not a commitment</div></div>
         </div>
 
@@ -307,16 +312,16 @@
             {#each Array(stacks) as _, i}
               <div class="gpu">
                 <div class="stack">
-                  <div class="seg w" style="height:{pctOf(wPer)}" title="Weights {fmt(wPer)} GB"></div>
-                  <div class="seg k" style="height:{pctOf(kvPer)}" title="KV {fmt(kvPer)} GB"></div>
+                  <div class="seg w" style="height:{pctOf(wPer)}" title="Weights {fmt(wPer)} GiB"></div>
+                  <div class="seg k" style="height:{pctOf(kvPer)}" title="KV {fmt(kvPer)} GiB"></div>
                   <div class="seg r" style="height:{pctOf(Math.max(0, gpu.mem_gb - wPer - kvPer))}" title="Reserve"></div>
                 </div>
-                <div class="cap">GPU {i}<br>{gpu.mem_gb} GB</div>
+                <div class="cap">GPU {i}<br>{gpu.mem_gb} GiB</div>
               </div>
             {/each}
             {#if R.tp > 8}<div class="more">+{R.tp - 8}<br>more</div>{/if}
           </div>
-          <div class="legend"><span><i class="w"></i>Weights {fmt(wPer)} GB</span><span><i class="k"></i>KV {fmt(kvPer)} GB</span><span><i class="r"></i>Reserve {fmt(Math.max(0, gpu.mem_gb - wPer - kvPer))} GB</span></div>
+          <div class="legend"><span><i class="w"></i>Weights {fmt(wPer)} GiB</span><span><i class="k"></i>KV {fmt(kvPer)} GiB</span><span><i class="r"></i>Reserve {fmt(Math.max(0, gpu.mem_gb - wPer - kvPer))} GiB</span></div>
           <p class="replnote">This model runs as <b>{R.pods}</b> identical replica{R.pods > 1 ? 's' : ''} → {R.pods} × TP{R.tp} = <b>{R.gpus}</b> GPUs total{#if R.tp > 8} (showing 8 of {R.tp} GPUs in the replica){/if}.</p>
         </div>
 
@@ -343,12 +348,13 @@
 
         <div class="panel">
           <h2>Breakdown</h2>
-          <div class="li"><span>Weights ({effQuant})</span><b>{fmt(R.weights_gb)} GB</b></div>
+          <div class="li"><span>Weights ({effQuant})</span><b>{fmt(R.weights_gb)} GiB</b></div>
           <div class="li"><span>KV per token ({kvBytes === 1 ? 'FP8' : 'FP16'})</span><b>{(R.kv_per_token_gb * 1024).toFixed(3)} MB</b></div>
-          <div class="li"><span>KV per request ({ctx / 1024}K × {Math.round(util * 100)}%)</span><b>{fmt(R.kv_per_request_gb)} GB</b></div>
+          <div class="li"><span>KV per request ({ctx / 1024}K × {Math.round(util * 100)}%)</span><b>{fmt(R.kv_per_request_gb)} GiB</b></div>
           <div class="li"><span>Concurrency per pod</span><b>{R.concurrency_per_pod} req</b></div>
           <div class="li"><span>Pods → GPUs → nodes ({perNode}/node)</span><b>{R.pods} → {R.gpus} → {R.nodes}</b></div>
-          <div class="li"><span>Usable HBM per GPU ({memUtil})</span><b>{fmt(R.usable_gb)} GB</b></div>
+          <div class="li"><span>Usable HBM per GPU ({memUtil})</span><b>{fmt(R.usable_gb)} GiB</b></div>
+          <div class="li"><span>Pod headroom <small>(free after weights + 1 request)</small></span><b class:tightv={R.tight}>{(R.headroom_fraction * 100).toFixed(1)}%</b></div>
           <div class="li"><span>Time to first token <small>(indicative, prefill)</small></span><b>~{R.ttft_ms} ms <small>±50%</small></b></div>
           <div class="li"><span>Decode throughput / request</span><b>~{R.decode_tps_per_request} tok/s</b></div>
           <div class="li"><span>Aggregate throughput</span><b>~{R.throughput_tokens_per_sec.toLocaleString()} tok/s <small>±40%</small></b></div>
@@ -361,7 +367,7 @@
               <tr class:cur={s.concurrency === conc} class:infeasible={!s.feasible}>
                 <td class="num">{s.concurrency}</td>
                 {#if s.feasible}
-                  <td class="num">{s.gpus}</td><td class="num">{s.pods} × TP{s.tp}</td><td class="num">~{s.ttft_ms} ms</td><td class="num">~{s.decode_tps_per_request}</td><td class="num">~{s.throughput_tokens_per_sec.toLocaleString()}</td>
+                  <td class="num">{s.gpus}{#if s.tight}<span class="badge tightb" title="under 10% pod headroom">tight</span>{/if}</td><td class="num">{s.pods} × TP{s.tp}</td><td class="num">~{s.ttft_ms} ms</td><td class="num">~{s.decode_tps_per_request}</td><td class="num">~{s.throughput_tokens_per_sec.toLocaleString()}</td>
                   <td>{#if s.concurrency !== conc}<button class="btn ghost" onclick={() => (conc = s.concurrency)}>use</button>{:else}<span class="badge">current</span>{/if}</td>
                 {:else}
                   <td class="num" colspan="5" style="color:var(--err)">infeasible at this concurrency</td><td></td>
@@ -378,10 +384,12 @@
           {#if fc?.kind === 'short'}<div class="state err"><b>Fleet check — shortage.</b> Needs {fc.need} but only {fc.head} {gpu.name} uncommitted. Short by {fc.short} — reduce concurrency/context, quantize harder, or add {fc.nodes} node(s).</div>{/if}
           {#if fc?.kind === 'absent'}<div class="state warn"><b>Fleet check.</b> {gpu.name} is not in the defined fleet. Add a pool or switch SKU.</div>{/if}
         {/if}
+        {#if R.tight}<div class="state warn"><b>Tight fit — {(R.headroom_fraction * 100).toFixed(1)}% headroom.</b> Weights + one request of KV leave under 10% of the pod's HBM free, so this plan has no margin for the ±5% weight estimate, fragmentation, or a longer prompt than modelled. It will likely OOM on a real vLLM launch. Drop context, quantise the KV cache, or move to the next TP size.</div>{/if}
+        {#if R.weights_estimated}<div class="state warn"><b>Weight estimate is approximate.</b> This model carries no embedding geometry, so the weights fall back to a flat overhead factor — optimistic by ~5–15% at INT4/MXFP4, where the 16-bit embedding and lm_head are a large share of the checkpoint. Add <code>hidden_size</code> and <code>vocab_size</code> in the model catalog to sharpen it.</div>{/if}
         {#if R.multi_node}<div class="state warn"><b>TP {R.tp} &gt; {perNode} GPUs/node:</b> this replica spans nodes — needs NVLink/IB fabric; latency &amp; MBU degrade vs single-node TP.</div>{/if}
         {#if util >= 1}<div class="state warn">Sizing at 100% context utilisation buys worst-case memory that mostly sits idle. Size KV at P95 of observed sequence length.</div>{/if}
       {:else}
-        <div class="state err"><b>Infeasible.</b> {(result as any).reason} (weights {fmt((result as any).weights_gb)} GB, KV/request {fmt((result as any).kv_per_request_gb)} GB)</div>
+        <div class="state err"><b>Infeasible.</b> {(result as any).reason} (weights {fmt((result as any).weights_gb)} GiB, KV/request {fmt((result as any).kv_per_request_gb)} GiB)</div>
       {/if}
     </section>
   </div>
@@ -397,9 +405,9 @@
     <button class="btn primary" onclick={addPool} style="margin-top:10px">Add pool</button>
     {#if fleet.length}
       <table><thead><tr><th>Pool</th><th class="num">GPUs</th><th class="num">HBM</th><th></th></tr></thead><tbody>
-        {#each fleet as p, i}<tr><td>{p.node_count} node{p.node_count > 1 ? 's' : ''} × {p.gpus_per_node} × {gpuName(p.gpu_sku_id)}</td><td class="num">{p.node_count * p.gpus_per_node}</td><td class="num">{fmt(p.node_count * p.gpus_per_node * (catalog.gpus.find((g: GpuSku) => g.id === p.gpu_sku_id)?.mem_gb ?? 0) / 1024)} TB</td><td><button class="btn ghost" onclick={() => delPool(i)}>remove</button></td></tr>{/each}
+        {#each fleet as p, i}<tr><td>{p.node_count} node{p.node_count > 1 ? 's' : ''} × {p.gpus_per_node} × {gpuName(p.gpu_sku_id)}</td><td class="num">{p.node_count * p.gpus_per_node}</td><td class="num">{fmt(p.node_count * p.gpus_per_node * (catalog.gpus.find((g: GpuSku) => g.id === p.gpu_sku_id)?.mem_gb ?? 0) / 1024)} TiB</td><td><button class="btn ghost" onclick={() => delPool(i)}>remove</button></td></tr>{/each}
       </tbody></table>
-      <p class="tot">Fleet total: <b>{fleetTotals().gpus}</b> GPUs · {fleetTotals().nodes} nodes · {(fleetTotals().hbm / 1024).toFixed(1)} TB HBM</p>
+      <p class="tot">Fleet total: <b>{fleetTotals().gpus}</b> GPUs · {fleetTotals().nodes} nodes · {(fleetTotals().hbm / 1024).toFixed(1)} TiB HBM</p>
     {:else}<div class="empty">No pools yet — add a pool to define your fleet.</div>{/if}
   </section>
 
@@ -420,7 +428,7 @@
       {:else}
         {#each clusterBySku() as r}
           <div class="skuutil">
-            <div class="skuhead"><b>{r.name}</b><span>{r.committed} / {r.total} GPUs · {fmt(r.committedHbm / 1024)} / {fmt(r.totalHbm / 1024)} TB HBM · <b style="color:{r.over ? 'var(--err)' : r.util > 80 ? 'var(--warn)' : 'var(--brandink)'}">{r.total > 0 ? r.util.toFixed(0) + '%' : '—'}</b></span></div>
+            <div class="skuhead"><b>{r.name}</b><span>{r.committed} / {r.total} GPUs · {fmt(r.committedHbm / 1024)} / {fmt(r.totalHbm / 1024)} TiB HBM · <b style="color:{r.over ? 'var(--err)' : r.util > 80 ? 'var(--warn)' : 'var(--brandink)'}">{r.total > 0 ? r.util.toFixed(0) + '%' : '—'}</b></span></div>
             <div class="cells">
               {#each Array(Math.min(r.total, 96)) as _, i}<div class="cell" class:used={i < r.committed}></div>{/each}
               {#if r.total > 96}<span class="more">+{r.total - 96}</span>{/if}
@@ -434,10 +442,10 @@
 
     <section class="panel"><h2>Models on the cluster</h2>
       {#if plan.length}
-        <table><thead><tr><th>Deployment</th><th>SKU</th><th class="num">GPUs</th><th class="num">Pods</th><th class="num">KV GB</th><th></th></tr></thead><tbody>
+        <table><thead><tr><th>Deployment</th><th>SKU</th><th class="num">GPUs</th><th class="num">Pods</th><th class="num">KV GiB</th><th></th></tr></thead><tbody>
           {#each plan as d, i}<tr><td>{d.label}</td><td>{gpuName(d.gpu_sku_id)}</td><td class="num">{d.gpus}</td><td class="num">{d.pods} × TP{d.tp}</td><td class="num">{fmt(d.kv)}</td><td><button class="btn ghost danger" onclick={() => delDeployment(i)}>remove</button></td></tr>{/each}
         </tbody></table>
-        <p class="tot">Total demand: <b>{planTotals().gpus}</b> GPUs · {planTotals().pods} pods · {fmt(planTotals().kv)} GB KV</p>
+        <p class="tot">Total demand: <b>{planTotals().gpus}</b> GPUs · {planTotals().pods} pods · {fmt(planTotals().kv)} GiB KV</p>
       {:else}<div class="empty">No models added — size one on the <b>Sizing</b> tab and click “+ Add to cluster”.</div>{/if}
     </section>
 
@@ -493,6 +501,7 @@
             <div><span>Max context</span><b>{(m.max_ctx / 1024)}K</b></div>
             <div><span>TP options</span><b>{m.tp_options.join(', ')}</b></div>
             <div><span>Quants</span><b>{m.quants.join(', ')}</b></div>
+            <div><span>Embedding</span><b>{m.vocab_size && m.hidden_size ? `${m.vocab_size.toLocaleString()} × ${m.hidden_size}${m.tied_embeddings ? ' tied' : ''}` : '— (est.)'}</b></div>
           </div>
           {#if ident.role === 'admin'}<div class="mcard-f"><button class="btn ghost" onclick={() => editModel(m)}>edit</button> <button class="btn ghost danger" onclick={() => deleteModelUi(m.id)}>delete</button></div>{/if}
         </div>
@@ -533,6 +542,14 @@
       {#if errFor(mfErrors, 'head_dim')}<div class="ferr">{errFor(mfErrors, 'head_dim')}</div>{/if}
       {#if errFor(mfErrors, 'max_ctx')}<div class="ferr">{errFor(mfErrors, 'max_ctx')}</div>{/if}
       <div class="row3">
+        <label>Hidden size<small> (config.json)</small><input type="number" bind:value={mf.hidden_size} placeholder="8192" /></label>
+        <label>Vocab size<small> (config.json)</small><input type="number" bind:value={mf.vocab_size} placeholder="128256" /></label>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:24px"><input type="checkbox" style="width:auto" bind:checked={mf.tied_embeddings} />Tied embeddings</label>
+      </div>
+      <div class="hint">Optional but recommended: the embedding table and lm_head stay at 16-bit through quantisation. Supplying these sizes the un-quantised tail exactly instead of a flat overhead factor — worth 10%+ of the footprint at INT4/MXFP4.</div>
+      {#if errFor(mfErrors, 'vocab_size')}<div class="ferr">{errFor(mfErrors, 'vocab_size')}</div>{/if}
+      {#if errFor(mfErrors, 'hidden_size')}<div class="ferr">{errFor(mfErrors, 'hidden_size')}</div>{/if}
+      <div class="row3">
         <label>TP options<input bind:value={mf.tp_options} placeholder="8,16" /></label>
         <label style="display:flex;align-items:center;gap:8px;margin-top:24px"><input type="checkbox" style="width:auto" bind:checked={mf.mla} onchange={() => { if (mf.mla) { mf.kv_heads = 0; mf.head_dim = 0; } }} />MLA (latent attention)</label>
       </div>
@@ -547,13 +564,13 @@
   {#if ident.role === 'admin'}
     <section class="panel"><h2>New GPU SKU</h2>
       <div class="row"><label>ID<input bind:value={gf.id} placeholder="b300" /></label><label>Name<input bind:value={gf.name} placeholder="B300 288 GB" /></label></div>
-      <div class="row3"><label>Memory (GB)<input type="number" bind:value={gf.mem_gb} /></label><label>Bandwidth (TB/s)<input type="number" step="0.1" bind:value={gf.bw_tbs} /></label><label>Price ($/GPU-hr)<input type="number" step="0.1" bind:value={gf.price_per_gpu_hour} /></label></div>
+      <div class="row3"><label>Memory (GiB)<small> as nvidia-smi reports</small><input type="number" bind:value={gf.mem_gb} /></label><label>Bandwidth (TB/s)<input type="number" step="0.1" bind:value={gf.bw_tbs} /></label><label>Price ($/GPU-hr)<input type="number" step="0.1" bind:value={gf.price_per_gpu_hour} /></label></div>
       {#if gfErrors.length}<div class="ferr">{gfErrors[0].message}</div>{/if}
       <button class="btn primary" style="margin-top:12px" onclick={saveGpu}>Add / update GPU SKU</button>
     </section>
   {/if}
   <section class="panel"><h2>GPU SKUs</h2>
-    <table><thead><tr><th>SKU</th><th class="num">HBM (GB)</th><th class="num">BW (TB/s)</th><th class="num">$/GPU-hr</th>{#if ident.role === 'admin'}<th></th>{/if}</tr></thead><tbody>
+    <table><thead><tr><th>SKU</th><th class="num">HBM (GiB)</th><th class="num">BW (TB/s)</th><th class="num">$/GPU-hr</th>{#if ident.role === 'admin'}<th></th>{/if}</tr></thead><tbody>
       {#each catalog.gpus as g}<tr><td>{g.name}</td><td class="num">{g.mem_gb}</td><td class="num">{g.bw_tbs}</td><td class="num">{g.price_per_gpu_hour != null ? money(g.price_per_gpu_hour) : '—'}</td>{#if ident.role === 'admin'}<td><button class="btn ghost danger" onclick={() => deleteGpuUi(g.id)}>del</button></td>{/if}</tr>{/each}
     </tbody></table>
     <p class="tot">{catalog.gpus.length} GPU SKUs</p>
@@ -562,7 +579,7 @@
 {:else if tab === 'methodology'}
   <section class="panel doc">
     <h1 class="doctitle">How the calculator works</h1>
-    <p class="lead">LLM capacity planning is deterministic maths, not guesswork. Because autoregressive decoding generates <em>one token at a time</em>, serving is <b>memory-bound</b> — the bottleneck is memory <em>bandwidth</em>, not compute. Every figure on the Sizing tab comes from the formulas below. Fixed constants: runtime reserve <b>2.5 GB</b>, weight overhead <b>×1.02</b>, MBU <b>0.55</b>, MLA latent <b>576</b>.</p>
+    <p class="lead">LLM capacity planning is deterministic maths, not guesswork. Because autoregressive decoding generates <em>one token at a time</em>, serving is <b>memory-bound</b> — the bottleneck is memory <em>bandwidth</em>, not compute. Every figure on the Sizing tab comes from the formulas below. Fixed constants: runtime reserve <b>2.5 GiB</b>, MBU <b>0.55</b>, MLA latent <b>576</b>, tight-fit threshold <b>10%</b>.</p>
 
     <h2 class="dh">1 · Hardware memory modelling</h2>
     <p>Start with how much high-bandwidth memory (HBM) the inference engine (e.g. vLLM) may actually use. The <code>gpu_memory_utilization</code> factor caps it; a fixed runtime reserve is subtracted to prevent out-of-memory (OOM) failures.</p>
@@ -572,14 +589,29 @@
 
     <h2 class="dh">2 · Weights vs. dynamic cache</h2>
     <p>A pod's memory is split between <b>static model weights</b> (the parameters) and the <b>dynamic KV cache</b> (per-token attention state during generation). Whatever remains after weights is the budget for concurrency:</p>
-    <div class="formula">Free KV space = Usable pod memory − (Total parameters × Bytes per parameter)</div>
-    <p class="note">Bytes per parameter follow the quantisation: FP16 = 2 · FP8/INT8 = 1 · INT4/MXFP4 = 0.5 · NVFP4 ≈ 0.625. For Mixture-of-Experts (MoE) models, <em>all</em> experts must be resident, so weights use the <b>total</b> parameter count.</p>
+    <div class="formula">Free KV space = Usable pod memory − Weights</div>
+    <p class="note">For Mixture-of-Experts (MoE) models, <em>all</em> experts must be resident, so weights use the <b>total</b> parameter count — not the active one.</p>
+
+    <h3 class="dh3">Weights are not one flat bytes-per-parameter</h3>
+    <p>A quantised checkpoint is not uniformly quantised. The <b>embedding table and output head stay at 16-bit</b> in essentially every real INT4/FP8/MXFP4 release, because quantising them costs disproportionate quality. That tail is invisible at FP16 and dominant at 4-bit:</p>
+    <div class="formula">Weights = (Total params − Tail) × Effective bytes/param + Tail × 2</div>
+    <div class="formula">Tail (params) = vocab_size × hidden_size × (tied ? 1 : 2)</div>
+    <p>For Llama-3.3-70B the tail is 2 × 128,256 × 8,192 = <b>2.10 B parameters = 3.9 GiB</b> — over 10% of an INT4 checkpoint, far more than a flat overhead factor allows. It is the difference between predicting 32.9 GiB (wrong) and 37.1 GiB (what published AWQ/GPTQ checkpoints actually weigh — ~40 × 10⁹ bytes).</p>
+    <p><b>Effective</b> bytes/param also exceed the nominal bit-width, because low-bit formats store per-group scale metadata next to the data:</p>
+    <table class="qtab"><thead><tr><th>Quant</th><th class="num">Nominal</th><th class="num">Effective</th><th>Metadata</th></tr></thead><tbody>
+      <tr><td>FP16</td><td class="num">2</td><td class="num">2</td><td>—</td></tr>
+      <tr><td>FP8 / INT8</td><td class="num">1</td><td class="num">1</td><td>per-tensor/channel scale — negligible</td></tr>
+      <tr><td>INT4 (grouped, g=128)</td><td class="num">0.5</td><td class="num">0.52</td><td>fp16 scale + int4 zero per 128 weights</td></tr>
+      <tr><td>MXFP4 (block=32)</td><td class="num">0.5</td><td class="num">0.53125</td><td>E8M0 scale per 32 weights</td></tr>
+      <tr><td>NVFP4 (block=16)</td><td class="num">0.5</td><td class="num">0.5625</td><td>E4M3 scale per 16 weights</td></tr>
+    </tbody></table>
+    <p class="note">Models in the catalog without <code>hidden_size</code>/<code>vocab_size</code> fall back to the legacy <code>total × bytes × 1.02</code> estimate, and the sizing view labels the result approximate. Hugging Face import fills all three fields from <code>config.json</code>.</p>
 
     <h2 class="dh">3 · KV cache &amp; concurrency</h2>
     <p>KV cache grows linearly with both sequence length and batch size — the real limiter for long-context, high-concurrency serving. Per-token size depends on the attention geometry:</p>
     <div class="formula">Bytes per token = 2 × layers × KV-heads × head-dim × Bytes per element</div>
     <p>The factor <b>2</b> covers the Key and Value tensors. <b>MLA</b> models (DeepSeek, Kimi) compress KV into a latent instead — <code>layers × 576 × bytes</code> — materially smaller. Per user request:</p>
-    <div class="formula">KV per session (GB) = <span class="frac"><span class="fnum">Bytes per token × Active tokens</span><span class="fden">1024³</span></span></div>
+    <div class="formula">KV per session (GiB) = <span class="frac"><span class="fnum">Bytes per token × Active tokens</span><span class="fden">1024³</span></span></div>
     <p>where <em>active tokens = context length × average utilisation</em>. The most sessions one pod can hold is then bounded by the free space from §2:</p>
     <div class="formula">Max pod concurrency = ⌊ <span class="frac"><span class="fnum">Free KV space</span><span class="fden">KV per session</span></span> ⌋</div>
 
@@ -592,12 +624,22 @@
     <h2 class="dh">5 · Worked example — Llama 3.3 70B</h2>
     <p>Host Llama 3.3 70B Instruct at FP8 · 10 concurrent sessions · 128K context at 60% utilisation · on 2× H200 (TP2). <span class="note-i">Reproduce it on the Sizing tab.</span></p>
     <div class="steps2">
-      <div class="step"><div class="sh">1 · Usable memory</div>Usable/GPU = (141 × 0.90) − 2.5 = <b>124.4 GB</b><br>Pod = 124.4 × 2 = <b>248.8 GB</b></div>
-      <div class="step"><div class="sh">2 · Weights &amp; free cache</div>Weights (FP8) ≈ <b>72.0 GB</b><br>Free KV = 248.8 − 72.0 = <b>176.8 GB</b></div>
-      <div class="step"><div class="sh">3 · KV per session</div>Per token = 2×80×8×128×1 = 163,840 B (0.156 MB)<br>Active = 131,072 × 0.60 = 78,643 tok<br>Session KV ≈ <b>12.0 GB</b></div>
-      <div class="step"><div class="sh">4 · Concurrency</div>⌊176.8 ÷ 12.0⌋ = <b>14 sessions/pod</b><br>14 ≥ 10 target → <b>1 pod (2 GPUs)</b></div>
-      <div class="step"><div class="sh">5 · Throughput</div>Data/step = 72 + 10×12 = 192 GB<br>Bandwidth = 2×4.8 TB/s × 0.55 ≈ 5,280 GB/s<br>(5,280 ÷ 192) × 10 ≈ <b>275 tok/s</b></div>
+      <div class="step"><div class="sh">1 · Usable memory</div>Usable/GPU = (141 × 0.90) − 2.5 = <b>124.4 GiB</b><br>Pod = 124.4 × 2 = <b>248.8 GiB</b></div>
+      <div class="step"><div class="sh">2 · Weights &amp; free cache</div>Tail = 2×128,256×8,192 = 2.10 B @ fp16<br>(68.5 + 4.2) × 10⁹ B ÷ 2³⁰ ≈ <b>67.7 GiB</b><br>Free KV = 248.8 − 67.7 = <b>181.1 GiB</b></div>
+      <div class="step"><div class="sh">3 · KV per session</div>Per token = 2×80×8×128×1 = 163,840 B (0.156 MiB)<br>Active = 131,072 × 0.60 = 78,643 tok<br>Session KV ≈ <b>12.0 GiB</b></div>
+      <div class="step"><div class="sh">4 · Concurrency</div>⌊181.1 ÷ 12.0⌋ = <b>15 sessions/pod</b><br>15 ≥ 10 target → <b>1 pod (2 GPUs)</b></div>
+      <div class="step"><div class="sh">5 · Throughput</div>Data/step ≈ (66.7 + 10×12) × 2³⁰ ≈ 201×10⁹ B<br>Bandwidth = 2×4.8×10¹² × 0.55 ≈ 5.28×10¹² B/s<br>≈ 38.1 ms/step → <b>≈ 262 tok/s</b></div>
+      <div class="step"><div class="sh">6 · Headroom</div>(248.8 − 67.7 − 12.0) ÷ 248.8 = <b>68%</b><br>68% ≥ 10% → <b>fits, not tight</b></div>
     </div>
+
+    <h2 class="dh">6 · Fits · tight · infeasible</h2>
+    <p>A plan is <b>infeasible</b> when weights plus <em>one</em> request's KV can't fit even at the largest permitted TP size. Between that and a comfortable fit sits a band worth naming:</p>
+    <div class="formula">Pod headroom = <span class="frac"><span class="fnum">Usable pod memory − Weights − KV per session</span><span class="fden">Usable pod memory</span></span> · Tight = headroom &lt; 10%</div>
+    <p>A <b>tight</b> plan is arithmetically feasible but has no margin for the ±5% weight estimate, allocator fragmentation, or a prompt longer than the modelled average — the configuration that passes a spreadsheet and then OOMs on launch. GPT-OSS-120B (MXFP4) on a single H100 at 128K context is the canonical case: ~59.5 GiB of weights against 69.5 GiB usable leaves 6.7% headroom and room for exactly one request.</p>
+
+    <h2 class="dh">7 · A note on units</h2>
+    <p>Every memory figure in this tool is <b>GiB = 2³⁰ bytes</b> — the unit <code>nvidia-smi</code> reports and the one <code>gpu_memory_utilization</code> is applied against. Parameter counts are in billions (10⁹), so weights are converted explicitly: <code>params × bytes/param × 10⁹ ÷ 2³⁰</code>. Skipping that conversion (a common shortcut) makes weights read <b>7.4% larger</b> than they are relative to GPU capacity — conservative, but wrong, and it compounds against a KV figure that <em>was</em> converted.</p>
+    <p class="note">Bandwidth is the exception: <code>bw_tbs</code> is decimal TB/s (10¹² B/s), as vendors quote it. The roofline therefore converts memory to raw bytes before dividing, rather than mixing the two scales.</p>
 
     <h2 class="dh">Frequently asked</h2>
     <div class="faq">
@@ -608,7 +650,7 @@
       <div class="qa"><div class="q">Why are throughput and TTFT approximate?</div><div class="a">They're roofline estimates (±40% / ±50%). Real numbers depend on kernels, batching, prefix caching and speculative decoding — planning figures, not commitments. Validate against benchmarks before procurement.</div></div>
       <div class="qa"><div class="q">When is a model “infeasible”?</div><div class="a">If the weights plus one request's KV can't fit even at the largest permitted TP size, no valid deployment exists — the tool shows an infeasibility error rather than a plausible-but-wrong number.</div></div>
     </div>
-    <p class="tot">These are the exact formulas the Sizing tab runs. Constants: runtime reserve 2.5 GB · weight overhead ×1.02 · MBU 0.55 · MLA latent 576.</p>
+    <p class="tot">These are the exact formulas the Sizing tab runs. Constants: runtime reserve 2.5 GiB · MBU 0.55 · MLA latent 576 · tight-fit threshold 10%. All memory in GiB (2³⁰ bytes).</p>
   </section>
 {/if}
 </main>
@@ -644,6 +686,10 @@
   .kpi.p{border-top-color:var(--purple)}.kpi.a{border-top-color:var(--warnln)}.kpi.g{border-top-color:var(--brandink)}
   .kpi .v{font-family:'IBM Plex Mono',monospace;font-size:23px;font-weight:600;line-height:1.05}.kpi small{font-size:12px;color:var(--ink3);font-weight:500}
   .kpi .l{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink3);margin-top:4px;font-weight:600}.kpi .cav{font-size:9.5px;color:var(--warn);margin-top:2px;font-weight:600}
+  .kpi.tight{border-top-color:var(--warnln)}
+  .kpi .verdict{font-size:9.5px;color:var(--brandink);margin-top:2px;font-weight:700}.kpi .verdict.t{color:var(--warn)}
+  .tightv{color:var(--warn)}
+  .hint{font-size:11px;color:var(--ink3);line-height:1.5;margin:-2px 0 10px}
   .hbm{display:flex;gap:10px;align-items:flex-end;padding:6px 2px 0;overflow-x:auto}
   .gpu{display:flex;flex-direction:column;align-items:center;min-width:52px}
   .stack{width:44px;height:168px;border:1.5px solid var(--ink);border-radius:3px;display:flex;flex-direction:column-reverse;overflow:hidden;background:repeating-linear-gradient(0deg,var(--surface2),var(--surface2) 9px,var(--line2) 9px,var(--line2) 10px)}
@@ -661,7 +707,7 @@
   .btn{border:none;border-radius:6px;padding:7px 14px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}.btn.primary{background:var(--brand);color:#15181A}.btn.ghost{background:var(--surface2);color:var(--ink);border:1px solid var(--line)}
   .empty{padding:28px;text-align:center;color:var(--ink3);border:1px dashed var(--line);border-radius:6px;margin-top:12px}
   .tot{font-size:12.5px;color:var(--ink2);margin-top:12px}
-  .badge{font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;background:var(--wash);color:var(--brandink);vertical-align:middle}.badge.mla{background:var(--warnbg);color:var(--warn)}
+  .badge{font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;background:var(--wash);color:var(--brandink);vertical-align:middle}.badge.mla{background:var(--warnbg);color:var(--warn)}.badge.tightb{background:var(--warnbg);color:var(--warn);margin-left:6px}
   .meter{position:relative;height:14px;background:var(--line2);border-radius:7px;overflow:hidden}.meter .fill{height:100%;transition:width .2s}.meter .tick{position:absolute;top:0;left:100%;height:100%;border-left:1px dashed var(--ink3)}
   /* fleet-context prompt */
   .fleetctx{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;border-radius:8px;padding:12px 14px;margin-bottom:16px;font-size:13px;border:1px solid}
@@ -715,6 +761,11 @@
   .doctitle{font-size:24px;font-weight:800;letter-spacing:-.01em;margin:0 0 6px}
   .doc .lead{font-size:14px;color:var(--ink2);margin:0 0 8px}
   .doc h2.dh{font-size:15px;font-weight:700;text-transform:none;letter-spacing:0;color:var(--ink);margin:26px 0 8px;padding-top:14px;border-top:1px solid var(--line2)}
+  .doc h3.dh3{font-size:13px;font-weight:700;color:var(--ink);margin:18px 0 6px}
+  .doc .qtab{width:100%;border-collapse:collapse;font-size:12px;margin:8px 0 4px}
+  .doc .qtab th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink3);padding:5px 8px;border-bottom:1px solid var(--line)}
+  .doc .qtab td{padding:5px 8px;border-bottom:1px solid var(--line2);color:var(--ink2)}
+  .doc .qtab .num{text-align:right;font-family:'IBM Plex Mono',monospace}
   .doc p{font-size:13.5px;margin:8px 0}
   .doc code{font-family:'IBM Plex Mono',monospace;font-size:.86em;background:var(--surface2);padding:1px 5px;border-radius:3px}
   .formula{font-family:'IBM Plex Mono',monospace;font-size:13px;background:var(--surface2);border:1px solid var(--line);border-left:3px solid var(--brand);border-radius:5px;padding:11px 14px;margin:10px 0;overflow-x:auto;display:flex;align-items:center;flex-wrap:wrap;gap:2px}

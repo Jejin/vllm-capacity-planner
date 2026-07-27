@@ -10,7 +10,10 @@ The sizing math is a deterministic memory-bandwidth model (the same roofline vLL
 
 ## Features
 
-- **Deployment sizing** — pick a model, quantisation, KV dtype, context, concurrency and GPU SKU → TP size, weights/KV memory, concurrency-per-pod, pods, GPUs, nodes, TTFT, and throughput.
+- **Deployment sizing** — pick a model, quantisation, KV dtype, context, concurrency and GPU SKU → TP size, weights/KV memory, concurrency-per-pod, pods, GPUs, nodes, TTFT, and throughput. Every plan gets a **fits / tight / infeasible** verdict: "tight" means under 10% pod headroom once weights and one request's KV are placed — feasible on paper, likely to OOM on launch.
+- **Quantisation-aware weight model** — the 16-bit embedding and `lm_head` that survive quantisation are sized explicitly from `vocab_size × hidden_size`, and low-bit formats are charged their *effective* bytes/param including per-group scale metadata (INT4 ≈ 0.52, MXFP4 ≈ 0.53, NVFP4 ≈ 0.5625). A flat overhead factor under-sizes an INT4 70B by >10%.
+- **One memory unit throughout** — every figure is **GiB (2³⁰ bytes)**, matching `nvidia-smi` and what `gpu_memory_utilization` is applied against; bandwidth stays decimal TB/s as vendors quote it, and the roofline converts to raw bytes rather than mixing scales.
+- **GPU catalog** — NVIDIA datacenter (L4 → B300), AMD Instinct (MI300X/MI325X/MI355X), and workstation/consumer (RTX PRO 6000 Blackwell, 5090, 4090) SKUs, all admin-editable.
 - **Visuals** — per-GPU HBM allocation (weights / KV / reserve), tensor-parallel topology across GPUs & nodes, infeasibility & multi-node signals.
 - **Concurrency rubric** — sweep target concurrency and read off GPUs, per-request and aggregate tokens/sec.
 - **Fleet + Cluster** — define a mixed-SKU GPU fleet, add sized models, see **utilisation vs free space** per SKU, and get hard-blocked from over-committing the hardware.

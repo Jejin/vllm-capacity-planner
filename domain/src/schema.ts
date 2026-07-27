@@ -21,6 +21,11 @@ export const modelSchema = z
     max_ctx: z.number().int().positive().max(8_388_608),
     tp_options: z.array(z.number().int().positive()).min(1),
     quants: z.array(quantSchema).min(1),
+    // Embedding geometry — optional for backward compatibility with catalogs written before
+    // the un-quantised-tail weight term; supplying both sharpens low-bit weight estimates.
+    hidden_size: z.number().int().positive().optional(),
+    vocab_size: z.number().int().positive().optional(),
+    tied_embeddings: z.boolean().optional(),
   })
   .superRefine((m, ctx) => {
     if (m.active_params_b > m.total_params_b) {
@@ -33,6 +38,16 @@ export const modelSchema = z
     } else {
       if (m.kv_heads !== 0) ctx.addIssue({ code: 'custom', path: ['kv_heads'], message: 'MLA model (mla=true) must have kv_heads = 0 (unused)' });
       if (m.head_dim !== 0) ctx.addIssue({ code: 'custom', path: ['head_dim'], message: 'MLA model (mla=true) must have head_dim = 0 (unused)' });
+    }
+    // Embedding geometry is all-or-nothing: one half alone can't size the un-quantised tail.
+    if ((m.hidden_size == null) !== (m.vocab_size == null)) {
+      ctx.addIssue({ code: 'custom', path: ['vocab_size'], message: 'hidden_size and vocab_size must be supplied together (they size the 16-bit embedding/lm_head tail)' });
+    }
+    if (m.vocab_size != null && m.hidden_size != null) {
+      const tailB = ((m.tied_embeddings ? 1 : 2) * m.vocab_size * m.hidden_size) / 1e9;
+      if (tailB >= m.total_params_b) {
+        ctx.addIssue({ code: 'custom', path: ['vocab_size'], message: 'embedding tail must be smaller than total_params_b — check hidden_size / vocab_size' });
+      }
     }
   });
 

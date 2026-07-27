@@ -1,7 +1,13 @@
 // Server integration tests (Fastify inject) — covers Epics 1/2/3/4/5 story acceptance criteria.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { buildApp } from '../app.js';
+import { SEED_MODELS, SEED_GPUS } from '@vcp/domain';
 import type { FastifyInstance } from 'fastify';
+
+// Assert against the canonical seed rather than hardcoded counts, so growing the catalog
+// (new GPU SKUs, new models) doesn't break unrelated API tests.
+const N_MODELS = SEED_MODELS.length;
+const N_GPUS = SEED_GPUS.length;
 
 let app: FastifyInstance;
 const admin = { 'x-dev-sub': 'u-admin', 'x-dev-role': 'admin' };
@@ -16,16 +22,16 @@ describe('Epic 1 — Access & seeded catalog', () => {
     const r = await app.inject({ method: 'GET', url: '/api/v1/catalog' });
     expect(r.statusCode).toBe(401);
   });
-  it('lists the 13 seeded models + 8 GPUs (FR-1/7/5/8)', async () => {
+  it('lists every seeded model + GPU SKU (FR-1/7/5/8)', async () => {
     const r = await app.inject({ method: 'GET', url: '/api/v1/catalog', headers: user });
     expect(r.statusCode).toBe(200);
     const body = r.json();
-    expect(body.models).toHaveLength(13);
-    expect(body.gpus).toHaveLength(8);
+    expect(body.models).toHaveLength(N_MODELS);
+    expect(body.gpus).toHaveLength(N_GPUS);
   });
   it('healthz/readyz respond', async () => {
     expect((await app.inject({ url: '/healthz' })).statusCode).toBe(200);
-    expect((await app.inject({ url: '/readyz' })).json().models).toBe(13);
+    expect((await app.inject({ url: '/readyz' })).json().models).toBe(N_MODELS);
   });
 });
 
@@ -57,16 +63,16 @@ describe('Epic 3 — Catalog curation + RBAC (FR-2/3/4/29)', () => {
     const r = await app.inject({ method: 'DELETE', url: `/api/v1/models/${last}`, headers: admin });
     expect(r.statusCode).toBe(409);
   });
-  it('reset restores the 13+7 seed (FR-23)', async () => {
+  it('reset restores the full seed (FR-23)', async () => {
     await app.inject({ method: 'DELETE', url: '/api/v1/models/glm52', headers: admin });
     await app.inject({ method: 'POST', url: '/api/v1/catalog/reset', headers: admin });
-    expect((await app.inject({ url: '/readyz' })).json().models).toBe(13);
+    expect((await app.inject({ url: '/readyz' })).json().models).toBe(N_MODELS);
   });
   it('export → import round-trips (FR-22); import denied to standard users', async () => {
     const exported = (await app.inject({ url: '/api/v1/catalog/export', headers: user })).json();
     expect((await app.inject({ method: 'POST', url: '/api/v1/catalog/import', headers: user, payload: exported })).statusCode).toBe(403);
     const imp = await app.inject({ method: 'POST', url: '/api/v1/catalog/import', headers: admin, payload: exported });
-    expect(imp.json()).toEqual({ models: 13, gpus: 8 });
+    expect(imp.json()).toEqual({ models: N_MODELS, gpus: N_GPUS });
   });
 });
 
