@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -178,7 +178,8 @@
   async function resetCatalog() { if (!confirm('Reset the catalog to seeded defaults? This replaces all models and GPUs.')) return; await fetch('/api/v1/catalog/reset', { method: 'POST', headers: authH }); loadCatalog(); notice = 'Catalog reset to seeded defaults.'; }
 
   // ── Admin catalog forms (FR-2/3/4/6/7/8, validated via the shared §F schema) ──
-  const QUANTS = ['FP16', 'FP8', 'INT8', 'INT4', 'MXFP4', 'NVFP4'];
+  // QUANTS comes from the domain package — a local copy silently went stale and stopped
+  // offering the GGUF k-quants after they were added to the engine.
   type Err = { path: string; message: string };
   const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '', linear_attention_layers: '' as number | '', linear_state_bytes_per_layer: '' as number | '' });
   let mf = $state(blankModel());
@@ -243,6 +244,50 @@
     } else {
       notice = (await r.json()).error?.message ?? 'Fetch failed.';
     }
+  }
+
+  /** Our weight estimate (decimal GB) for the model currently in the admin form, at one quant.
+   *  Returns null until the form carries enough geometry to compute anything meaningful. */
+  function mfWeightsGb(q: string): number | null {
+    const total = +mf.total_params_b;
+    if (!Number.isFinite(total) || total <= 1) return null;
+    if (!(QUANTS as readonly string[]).includes(q)) return null;
+    const probe: Model = {
+      id: 'probe', name: 'probe', total_params_b: total, active_params_b: total,
+      layers: +mf.layers || 1, kv_heads: mf.mla ? 0 : (+mf.kv_heads || 1),
+      head_dim: mf.mla ? 0 : (+mf.head_dim || 1), mla: !!mf.mla,
+      max_ctx: +mf.max_ctx || 4096, tp_options: [1], quants: [q as any],
+      hidden_size: mf.hidden_size !== '' ? +mf.hidden_size : undefined,
+      vocab_size: mf.vocab_size !== '' ? +mf.vocab_size : undefined,
+      tied_embeddings: !!mf.tied_embeddings,
+    };
+    try { return (weightsGb(probe, q as any) * 2 ** 30) / 1e9; } catch { return null; }
+  }
+
+  // ── vLLM recipe import — fills the four fields config.json never carries ──
+  let recipeBusy = $state(false);
+  let recipeInfo = $state<any>(null);
+  async function recipeFetch(idOverride?: string) {
+    const target = (idOverride ?? hfId).trim();
+    if (!target) { notice = 'Enter a model ID first.'; return; }
+    recipeBusy = true; recipeInfo = null;
+    const r = await fetch('/api/v1/recipes/fetch', { method: 'POST', headers: authH, body: JSON.stringify({ model_id: target }) });
+    recipeBusy = false;
+    if (!r.ok) { notice = (await r.json()).error?.message ?? 'Recipe fetch failed.'; return; }
+    const d = await r.json();
+    recipeInfo = d;
+    const m = d.mapped ?? {};
+    // merge, never clobber geometry the HF import already established
+    if (m.total_params_b != null) mf.total_params_b = m.total_params_b;
+    if (m.active_params_b != null) mf.active_params_b = m.active_params_b;
+    if (m.max_ctx != null) mf.max_ctx = m.max_ctx;
+    if (m.tp_options?.length) mf.tp_options = m.tp_options.join(',');
+    if (m.quants?.length) mf.quants = m.quants;
+    if (!mf.id && m.id) mf.id = m.id;
+    if (!mf.name && m.name) mf.name = m.name;
+    hfMissing = hfMissing.filter((k) => !(d.filled ?? []).includes(k));
+    notice = `Recipe applied: ${(d.filled ?? []).join(', ') || 'nothing new'}.`;
+    document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' });
   }
 
   function toggleTheme() { const r = document.documentElement; r.setAttribute('data-theme', r.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'); }
@@ -530,6 +575,32 @@
     <section class="panel"><h2>Import a model from Hugging Face</h2>
       <div class="row"><label>Model ID (owner/model)<input bind:value={hfId} placeholder="Qwen/Qwen2.5-72B-Instruct" onkeydown={(e) => { if ((e as KeyboardEvent).key === 'Enter') hfFetch(); }} /></label><button class="btn primary" style="align-self:end;height:35px" onclick={hfFetch} disabled={hfBusy}>{hfBusy ? 'Fetching…' : 'Fetch config'}</button></div>
       <div class="hfsuggest">Try: {#each HF_SUGGEST as s}<button class="chip2" onclick={() => { hfId = s; hfFetch(); }}>{s}</button>{/each}</div>
+      <div class="row" style="margin-top:10px">
+        <div class="hint" style="margin:0">
+          <b>Two sources, one model.</b> Hugging Face <code>config.json</code> gives the geometry — layers, heads, embedding sizes, attention regime.
+          It never carries parameter counts, shipped quantisations, or the TP sizes people actually run.
+          <a href="https://recipes.vllm.ai" target="_blank" rel="noopener">recipes.vllm.ai</a> carries exactly those four.
+        </div>
+        <button class="btn" style="align-self:end;height:35px;white-space:nowrap" onclick={() => recipeFetch()} disabled={recipeBusy}>{recipeBusy ? 'Fetching…' : '+ Apply vLLM recipe'}</button>
+      </div>
+      {#if recipeInfo}
+        <div class="state ok" style="margin-top:10px">
+          <b>Recipe applied — {recipeInfo.model_id}.</b>
+          Supplied: {(recipeInfo.filled ?? []).join(', ') || '—'}{#if recipeInfo.min_vllm_version} · needs vLLM ≥ {recipeInfo.min_vllm_version}{/if}
+          {#if recipeInfo.unmapped_precisions?.length}<br><span style="color:var(--warn)">Skipped unmapped precisions: {recipeInfo.unmapped_precisions.join(', ')} (mixed-precision checkpoints have no single bytes/param).</span>{/if}
+          {#if recipeInfo.vram_minimums?.length}
+            <table class="qtab" style="margin-top:8px"><thead><tr><th>Variant</th><th class="num">Their VRAM floor</th><th class="num">Our weights</th><th class="num">Ratio</th></tr></thead><tbody>
+              {#each recipeInfo.vram_minimums as v}
+                {@const ours = mfWeightsGb(v.quant)}
+                <tr><td>{v.precision}</td><td class="num">{v.vram_gb} GB</td>
+                  <td class="num">{ours != null ? ours.toFixed(1) + ' GB' : '—'}</td>
+                  <td class="num" style={ours != null && ours / v.vram_gb > 1 ? 'color:var(--err)' : ''}>{ours != null ? (ours / v.vram_gb).toFixed(2) : '—'}</td></tr>
+              {/each}
+            </tbody></table>
+            <div style="font-size:11px;margin-top:4px">Their floor covers weights + KV + overhead, so a ratio around 0.85 is healthy. Above 1.00 means one of the two figures is wrong.</div>
+          {/if}
+        </div>
+      {/if}
       {#if hfCard}
         <div class="hfcard"><b>{hfCard.model_id}</b> — {hfCard.card.model_type ?? hfCard.card.architectures?.[0] ?? 'model'} · {hfCard.card.num_hidden_layers} layers · ctx {(hfCard.card.max_position_embeddings ?? 0).toLocaleString()} {#if hfCard.detectedMla}· <span class="badge mla">MLA</span>{/if}
           <div class="tot" style="margin-top:6px">Mapped into the form below. <b style="color:var(--warn)">Complete before saving: {hfMissing.join(', ')}</b> — HF configs omit parameter counts, TP sizes, and quant variants.</div>
