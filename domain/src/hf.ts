@@ -7,6 +7,18 @@ import type { GpuSku, SizingInput, Sizing } from './types.js';
 /** HF `architectures` / `model_type` values that use Multi-head Latent Attention. */
 const MLA_ARCHITECTURES = ['deepseek', 'kimi', 'mla'];
 
+/**
+ * Structural MLA detection. Name matching alone misses models whose architecture string
+ * doesn't say "mla" — GLM-5.2 ships as `GlmMoeDsaForCausalLM` yet is squarely MLA. The
+ * reliable signal is the compressed KV projection: `kv_lora_rank` only exists on MLA models,
+ * and `kv_lora_rank + qk_rope_head_dim` is the per-layer latent width (576 for DeepSeek,
+ * Kimi and GLM-5.2 alike).
+ */
+export function detectMla(cfg: HfConfig): boolean {
+  const arch = [cfg.model_type ?? '', ...(cfg.architectures ?? [])].join(' ').toLowerCase();
+  return MLA_ARCHITECTURES.some((a) => arch.includes(a)) || cfg.kv_lora_rank != null;
+}
+
 export interface HfConfig {
   architectures?: string[];
   model_type?: string;
@@ -19,6 +31,9 @@ export interface HfConfig {
   tie_word_embeddings?: boolean;
   max_position_embeddings?: number;
   sliding_window?: number | null;
+  /** MLA marker: compressed KV projection rank. Present only on latent-attention models. */
+  kv_lora_rank?: number;
+  qk_rope_head_dim?: number;
   /** Per-layer attention kinds, newer transformers configs: 'full_attention' | 'sliding_attention'. */
   layer_types?: string[];
   /** Gemma-style: one global layer every N (so N-1 of every N are windowed). */
@@ -55,8 +70,7 @@ function slug(id: string): string {
 
 /** Map a HF model id + its config.json to a partial §F Model (AD-11). */
 export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
-  const arch = [cfg.model_type ?? '', ...(cfg.architectures ?? [])].join(' ').toLowerCase();
-  const mla = MLA_ARCHITECTURES.some((a) => arch.includes(a));
+  const mla = detectMla(cfg);
   const heads = cfg.num_attention_heads;
   const head_dim = cfg.head_dim ?? (cfg.hidden_size && heads ? Math.round(cfg.hidden_size / heads) : undefined);
   const kv_heads = cfg.num_key_value_heads ?? heads; // GQA-correct: KV heads, fall back to attention heads
