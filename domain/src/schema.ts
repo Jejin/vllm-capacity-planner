@@ -32,6 +32,11 @@ export const modelSchema = z
     // Linear/recurrent attention — constant state per request, no per-token cache.
     linear_attention_layers: z.number().int().min(0).optional(),
     linear_state_bytes_per_layer: z.number().int().min(0).optional(),
+    // Mixed-precision checkpoints: the dense remainder and what it keeps under each quant.
+    dense_params_b: z.number().positive().optional(),
+    // NB: z.record(enum, ...) is EXHAUSTIVE in Zod 4 — it would demand every quant as a key.
+    // Keys are validated against QUANTS in the refinement below instead.
+    mixed_precision: z.record(z.string(), quantSchema).optional(),
   })
   .superRefine((m, ctx) => {
     if (m.active_params_b > m.total_params_b) {
@@ -75,6 +80,18 @@ export const modelSchema = z
     // A linear layer with no state size would be counted as free, understating memory.
     if (linear > 0 && m.linear_state_bytes_per_layer == null) {
       ctx.addIssue({ code: 'custom', path: ['linear_state_bytes_per_layer'], message: 'linear_attention_layers requires linear_state_bytes_per_layer (its constant per-request state)' });
+    }
+    // Mixed precision needs a dense split to apply to, and the split must leave a body to quantise.
+    for (const k of Object.keys(m.mixed_precision ?? {})) {
+      if (!(QUANTS as readonly string[]).includes(k)) {
+        ctx.addIssue({ code: 'custom', path: ['mixed_precision', k], message: `"${k}" is not a known quantisation` });
+      }
+    }
+    if (m.mixed_precision && Object.keys(m.mixed_precision).length > 0 && m.dense_params_b == null) {
+      ctx.addIssue({ code: 'custom', path: ['dense_params_b'], message: 'mixed_precision requires dense_params_b — the parameters that stay at the higher precision' });
+    }
+    if (m.dense_params_b != null && m.dense_params_b >= m.total_params_b) {
+      ctx.addIssue({ code: 'custom', path: ['dense_params_b'], message: 'dense_params_b must be smaller than total_params_b' });
     }
   });
 
