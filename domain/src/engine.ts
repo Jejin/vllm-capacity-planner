@@ -195,15 +195,27 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   const kv_per_token_gb = active_tokens > 0 ? kv_per_request_gb / active_tokens : 0;
   const usable_gb = gpu.mem_gb * mem_util_fraction - RUNTIME_GB;
 
-  // TP selection: smallest tp such that tp*usable - weights >= kv_per_request (FR-13 if none).
+  // TP selection: the TP size that needs the FEWEST TOTAL GPUs for the target concurrency.
+  //
+  // Picking the smallest TP that merely holds one request (the obvious rule) over-recommends
+  // hardware, because a bigger shard leaves proportionally more room for KV and packs far more
+  // sessions per replica. Llama-3.3-70B FP8 at 128K/conc-64 on H200: TP1 needs 16 GPUs, TP2
+  // needs 10, TP4 and TP8 need 8. The smallest-that-fits rule answers 10; the true minimum is 8.
+  //
+  // Ties break toward the SMALLER shard — same GPU count, less collective traffic. That makes
+  // this a cost/throughput objective; a latency-oriented planner would bias the other way.
   let tp: number | null = null;
   let free_gb = 0;
+  let best_gpus = Infinity;
   for (const t of [...model.tp_options].sort((a, b) => a - b)) {
     const f = t * usable_gb - weights_gb;
-    if (f >= kv_per_request_gb) {
+    if (f < kv_per_request_gb) continue; // cannot hold weights + one request
+    const conc = Math.max(1, Math.floor(f / kv_per_request_gb));
+    const total_gpus = Math.ceil(Math.max(1, target_concurrency) / conc) * t;
+    if (total_gpus < best_gpus) {
+      best_gpus = total_gpus;
       tp = t;
       free_gb = f;
-      break;
     }
   }
 

@@ -77,14 +77,14 @@ describe('Epic 3 — Catalog curation + RBAC (FR-2/3/4/29)', () => {
 });
 
 describe('Epic 2 — Sizing endpoint (FR-9/10)', () => {
-  it('computes AC-1 (Llama 70B → 10 GPUs, TP2) authoritatively', async () => {
+  it('computes AC-1 (Llama 70B → 8 GPUs, TP4) authoritatively', async () => {
     const r = await app.inject({ method: 'POST', url: '/api/v1/sizing', headers: user, payload: {
       model_id: 'llama33-70b', gpu_id: 'h200',
       input: { quant: 'FP8', kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6, target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8 },
     } });
     expect(r.statusCode).toBe(200);
     const s = r.json();
-    expect(s.tp).toBe(2); expect(s.gpus).toBe(10); expect(s.nodes).toBe(2);
+    expect(s.tp).toBe(4); expect(s.gpus).toBe(8); expect(s.nodes).toBe(1);
   });
   it('rejects selected_ctx > max_ctx (FR-9)', async () => {
     const r = await app.inject({ method: 'POST', url: '/api/v1/sizing', headers: user, payload: {

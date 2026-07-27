@@ -19,20 +19,20 @@ const near = (actual: number, expected: number, pct: number) =>
   Math.abs(actual - expected) <= Math.abs(expected) * pct;
 
 describe('§C sizing acceptance vectors (PRD §18.2)', () => {
-  it('AC-1 — Llama 3.3 70B FP8/KV-FP8 128K 60% conc64 H200 → TP2, 10 GPUs, 2 nodes', () => {
+  it('AC-1 — Llama 3.3 70B FP8/KV-FP8 128K 60% conc64 H200 → TP4, 8 GPUs, 1 node', () => {
     const r = computeSizing(model('llama33-70b'), gpu('h200'), {
       quant: 'FP8', kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
       target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
     }) as FeasibleSizing;
     expect(r.ok).toBe(true);
-    expect(r.tp).toBe(2);
+    expect(r.tp).toBe(4); // TP2 also fits one request but needs 10 GPUs; TP4 needs 8
     expect(near(r.weights_gb, 67.7, 0.05)).toBe(true);
     expect(near(r.kv_per_token_gb * 1024, 0.156, 0.05)).toBe(true); // ~0.156 MiB/token
     expect(near(r.kv_per_request_gb, 12.0, 0.05)).toBe(true);
-    expect(near(r.concurrency_per_pod, 15, 0.1)).toBe(true);
-    expect(r.pods).toBe(5);
-    expect(r.gpus).toBe(10);
-    expect(r.nodes).toBe(2);
+    expect(near(r.concurrency_per_pod, 35, 0.1)).toBe(true);
+    expect(r.pods).toBe(2);
+    expect(r.gpus).toBe(8);
+    expect(r.nodes).toBe(1);
   });
 
   it('AC-2 — GLM-5.2 743B FP8/KV-FP8 128K 60% conc64 H200 → TP8, 8 GPUs (one node)', () => {
@@ -106,6 +106,61 @@ describe('§C sizing acceptance vectors (PRD §18.2)', () => {
       target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
     });
     expect(r.ok).toBe(false);
+  });
+});
+
+// TP selection minimises TOTAL GPUs, not shard size. Picking the smallest TP that merely holds
+// one request over-recommends hardware, because a bigger shard packs far more sessions per pod.
+describe('§C TP selection minimises total GPUs', () => {
+  it('AC-38 — every feasible TP is considered; the cheapest total wins', () => {
+    const m = model('llama33-70b'), g = gpu('h200');
+    const input = {
+      quant: 'FP8' as const, kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
+      target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
+    };
+    const chosen = computeSizing(m, g, input) as FeasibleSizing;
+    // brute-force the same objective over the model's TP ladder
+    const usable = g.mem_gb * 0.9 - RUNTIME_GB;
+    const w = weightsGb(m, 'FP8');
+    const kv = kvPerRequestBytes(m, 1, 131072 * 0.6) / GIB;
+    let bestGpus = Infinity;
+    for (const t of m.tp_options) {
+      const free = t * usable - w;
+      if (free < kv) continue;
+      bestGpus = Math.min(bestGpus, Math.ceil(64 / Math.floor(free / kv)) * t);
+    }
+    expect(chosen.gpus).toBe(bestGpus);
+    expect(chosen.gpus).toBe(8); // the old smallest-that-fits rule answered 10
+  });
+
+  it('AC-39 — ties break toward the smaller shard (less collective traffic)', () => {
+    // TP4 and TP8 both reach 8 GPUs for this workload; TP4 must win
+    const r = computeSizing(model('llama33-70b'), gpu('h200'), {
+      quant: 'FP8', kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
+      target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
+    }) as FeasibleSizing;
+    expect(r.tp).toBe(4);
+    expect(r.multi_node).toBe(false);
+  });
+
+  it('AC-40 — a wider TP ladder never costs more GPUs than a narrow one', () => {
+    const g = gpu('h200');
+    const input = {
+      quant: 'FP8' as const, kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
+      target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
+    };
+    const wide = computeSizing(model('llama33-70b'), g, input) as FeasibleSizing;
+    const narrow = computeSizing({ ...model('llama33-70b'), tp_options: [2] }, g, input) as FeasibleSizing;
+    expect(wide.gpus).toBeLessThanOrEqual(narrow.gpus);
+  });
+
+  it('AC-41 — DeepSeek-V3 INT4 lands on 4 B200s, matching the published recipe', () => {
+    const r = computeSizing(model('dsv3'), gpu('b200'), {
+      quant: 'INT4', kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
+      target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
+    }) as FeasibleSizing;
+    expect(r.tp).toBe(4);
+    expect(r.gpus).toBe(4); // tp_options used to start at 8, forcing twice the hardware
   });
 });
 

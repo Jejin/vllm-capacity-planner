@@ -201,11 +201,15 @@ describe('concurrency rubric sweep', () => {
       { quant: 'Q4_K_M' as const, kv_dtype_bytes: 1, selected_ctx: 4096, avg_context_utilisation: 0.6, mem_util_fraction: 0.9, gpus_per_node: 1 },
       [1, 4],
     );
-    // 18.6 GiB of weights in 19.1 GiB usable. TP is picked for ONE request, so raising
-    // concurrency adds pods rather than TP size — every row stays TP1 and stays tight.
-    expect(rows.every((r) => r.feasible && r.tight)).toBe(true);
-    expect(rows.every((r) => r.tp === 1)).toBe(true);
-    expect(rows[1].pods).toBeGreaterThan(rows[0].pods);
+    // 18.6 GiB of weights in 19.1 GiB usable. At concurrency 1 a single tight GPU is cheapest;
+    // by concurrency 4 the engine prefers TP2 (2 GPUs) over 4 tight TP1 pods, so the verdict
+    // varies across the sweep exactly as the GPU-minimising rule implies.
+    expect(rows[0].feasible && rows[0].tight).toBe(true);
+    expect(rows[0].tp).toBe(1);
+    expect(rows[0].gpus).toBe(1);
+    expect(rows[1].tp).toBe(2);
+    expect(rows[1].gpus).toBe(2); // not 4 tight single-GPU pods
+    expect(rows[1].tight).toBe(false);
 
     // the flag does vary with context: at 8K the same model needs TP2, which is roomy
     const wider = concurrencySweep(
