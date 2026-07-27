@@ -29,6 +29,9 @@ export const modelSchema = z
     // Local/global attention — optional; both required together to cap KV on windowed layers.
     sliding_window: z.number().int().positive().optional(),
     full_attention_layers: z.number().int().min(0).optional(),
+    // Linear/recurrent attention — constant state per request, no per-token cache.
+    linear_attention_layers: z.number().int().min(0).optional(),
+    linear_state_bytes_per_layer: z.number().int().min(0).optional(),
   })
   .superRefine((m, ctx) => {
     if (m.active_params_b > m.total_params_b) {
@@ -52,13 +55,26 @@ export const modelSchema = z
         ctx.addIssue({ code: 'custom', path: ['vocab_size'], message: 'embedding tail must be smaller than total_params_b — check hidden_size / vocab_size' });
       }
     }
-    // Sliding-window geometry is all-or-nothing: a window with no layer split (or vice versa)
-    // cannot be applied, and would silently fall back to all-full-attention KV.
-    if ((m.sliding_window == null) !== (m.full_attention_layers == null)) {
-      ctx.addIssue({ code: 'custom', path: ['sliding_window'], message: 'sliding_window and full_attention_layers must be supplied together' });
+    // Attention-regime split must account for every layer: full + windowed + linear = layers.
+    const linear = m.linear_attention_layers ?? 0;
+    const cached = m.layers - linear;
+    if (linear > m.layers) {
+      ctx.addIssue({ code: 'custom', path: ['linear_attention_layers'], message: 'linear_attention_layers must be ≤ layers' });
     }
-    if (m.full_attention_layers != null && m.full_attention_layers > m.layers) {
-      ctx.addIssue({ code: 'custom', path: ['full_attention_layers'], message: 'full_attention_layers must be ≤ layers' });
+    if (m.full_attention_layers != null && m.full_attention_layers > cached) {
+      ctx.addIssue({ code: 'custom', path: ['full_attention_layers'], message: 'full_attention_layers + linear_attention_layers must be ≤ layers' });
+    }
+    // Any layer that is neither full nor linear is windowed, which needs a window length.
+    const windowed = cached - (m.full_attention_layers ?? cached);
+    if (windowed > 0 && m.sliding_window == null) {
+      ctx.addIssue({ code: 'custom', path: ['sliding_window'], message: 'layers are left over after full + linear, so sliding_window is required to size them' });
+    }
+    if (m.sliding_window != null && m.full_attention_layers == null) {
+      ctx.addIssue({ code: 'custom', path: ['full_attention_layers'], message: 'sliding_window needs full_attention_layers to know how the layers split' });
+    }
+    // A linear layer with no state size would be counted as free, understating memory.
+    if (linear > 0 && m.linear_state_bytes_per_layer == null) {
+      ctx.addIssue({ code: 'custom', path: ['linear_state_bytes_per_layer'], message: 'linear_attention_layers requires linear_state_bytes_per_layer (its constant per-request state)' });
     }
   });
 

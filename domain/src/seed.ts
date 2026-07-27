@@ -14,6 +14,8 @@ import type { Model, GpuSku } from './types.js';
 //   The old GQA 8x128 guess overstated its KV cache by ~3.6x. Also corrected: hidden 5120->6144,
 //   vocab 151552->154880, params 744/40 -> 743/39 (per the vLLM recipe), TP {8,16} -> {4,8,16}
 //   and the BF16 + AMD Quark MXFP4 checkpoints added.
+//   kimi-k2 / kimi-k3: VERIFIED 2026-07-28. K2 was already correct (61 layers, hidden 7168,
+//   vocab 163840, MLA 576/layer). K3 is new — see the note on its entry below.
 //   NOTE: `index_topk: 2048` (DSA sparse attention) selects which tokens each query attends to.
 //   It reduces attention COMPUTE, not cache residency — the KV cache still holds every token —
 //   so it is deliberately NOT modelled as a memory saving.
@@ -38,6 +40,12 @@ export const SEED_MODELS: Model[] = [
   { id: 'glm52', name: 'GLM-5.2 743B-A39B (MoE·MLA·DSA)', total_params_b: 743, active_params_b: 39, layers: 78, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 1048576, tp_options: [4, 8, 16], quants: ['FP16', 'FP8', 'MXFP4', 'NVFP4'], hidden_size: 6144, vocab_size: 154880, tied_embeddings: false },
   { id: 'dsv3', name: 'DeepSeek-V3 / R1 671B (MLA)', total_params_b: 671, active_params_b: 37, layers: 61, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 131072, tp_options: [8, 16], quants: ['FP8', 'INT4'], hidden_size: 7168, vocab_size: 129280, tied_embeddings: false },
   { id: 'kimi-k2', name: 'Kimi K2 1T-A32B (MLA)', total_params_b: 1026, active_params_b: 32.5, layers: 61, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 131072, tp_options: [16], quants: ['FP8', 'INT4'], hidden_size: 7168, vocab_size: 163840, tied_embeddings: false },
+  // Kimi K3 — hybrid attention. Only 24 of 93 layers keep a token-indexed cache (full MLA);
+  // the other 69 are KDA (Kimi Delta Attention), a recurrent form whose state is CONSTANT in
+  // sequence length. linear_state_bytes_per_layer = num_heads 96 x head_dim 128 x 128 x 4 B
+  // (fp32 recurrent state) = 6.29 MB/layer, so 69 layers cost a flat ~434 MB per request
+  // regardless of context. Sizing all 93 layers as MLA would overstate KV ~3.9x at 1M.
+  { id: 'kimi-k3', name: 'Kimi K3 2.8T-A60B (MoE·MLA+KDA)', total_params_b: 2800, active_params_b: 60, layers: 93, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 1048576, tp_options: [8, 16], quants: ['MXFP4'], hidden_size: 7168, vocab_size: 163840, tied_embeddings: false, full_attention_layers: 24, linear_attention_layers: 69, linear_state_bytes_per_layer: 6291456 },
 ];
 
 // price_per_gpu_hour: INDICATIVE market rental rates ($/GPU-hour) — [VERIFY] against your

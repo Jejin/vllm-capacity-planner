@@ -14,6 +14,28 @@ const MLA_ARCHITECTURES = ['deepseek', 'kimi', 'mla'];
  * and `kv_lora_rank + qk_rope_head_dim` is the per-layer latent width (576 for DeepSeek,
  * Kimi and GLM-5.2 alike).
  */
+/**
+ * Linear-attention layer count and per-layer state, for hybrid models.
+ * Kimi K3 lists both sides explicitly (`full_attn_layers` / `kda_layers`); the recurrent state
+ * is one [head_dim x head_dim] matrix per head, held at fp32 for numerical stability.
+ */
+export function linearAttention(cfg: HfConfig, layers: number | undefined):
+  { linear_attention_layers: number; linear_state_bytes_per_layer: number; full_attention_layers: number } | null {
+  const lac = cfg.linear_attn_config;
+  if (!lac) return null;
+  const full = lac.full_attn_layers?.length;
+  const linear = lac.kda_layers?.length ?? (full != null && layers != null ? layers - full : undefined);
+  if (full == null || linear == null || linear <= 0) return null;
+  const heads = lac.num_heads;
+  const hd = lac.head_dim;
+  if (!heads || !hd) return null;
+  return {
+    full_attention_layers: full,
+    linear_attention_layers: linear,
+    linear_state_bytes_per_layer: heads * hd * hd * 4, // fp32 recurrent state
+  };
+}
+
 export function detectMla(cfg: HfConfig): boolean {
   const arch = [cfg.model_type ?? '', ...(cfg.architectures ?? [])].join(' ').toLowerCase();
   return MLA_ARCHITECTURES.some((a) => arch.includes(a)) || cfg.kv_lora_rank != null;
@@ -38,6 +60,13 @@ export interface HfConfig {
   layer_types?: string[];
   /** Gemma-style: one global layer every N (so N-1 of every N are windowed). */
   sliding_window_pattern?: number;
+  /** Hybrid linear attention (Kimi K3 KDA, Qwen3-Next): which layers keep real attention. */
+  linear_attn_config?: {
+    full_attn_layers?: number[];
+    kda_layers?: number[];
+    num_heads?: number;
+    head_dim?: number;
+  };
   [k: string]: unknown;
 }
 
@@ -95,6 +124,14 @@ export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
   if (cfg.sliding_window && fullAttn !== null) {
     mapped.sliding_window = cfg.sliding_window;
     mapped.full_attention_layers = fullAttn;
+  }
+  // hybrid linear attention — overrides the full-layer count, since linear_attn_config
+  // enumerates the split directly
+  const lin = linearAttention(cfg, cfg.num_hidden_layers);
+  if (lin) {
+    mapped.full_attention_layers = lin.full_attention_layers;
+    mapped.linear_attention_layers = lin.linear_attention_layers;
+    mapped.linear_state_bytes_per_layer = lin.linear_state_bytes_per_layer;
   }
   // params + tp + quants are never in config.json — admin-supplied
   const missing: (keyof Model)[] = ['total_params_b', 'active_params_b', 'tp_options', 'quants'];

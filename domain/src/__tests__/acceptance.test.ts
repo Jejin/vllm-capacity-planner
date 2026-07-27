@@ -5,7 +5,7 @@
 // and GpuSku.mem_gb. Vectors were re-pinned when the engine stopped mixing 1e9-byte GB (weights)
 // with 2^30-byte GiB (KV, capacity), which had inflated weights ~7.4% against GPU capacity.
 import { describe, it, expect } from 'vitest';
-import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, GIB, QB, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB } from '../engine.js';
+import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, GIB, QB, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB } from '../engine.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema, gpuSkuSchema } from '../schema.js';
 import { reconcile, headroomCheck } from '../reconcile.js';
@@ -311,6 +311,69 @@ describe('§C sliding-window KV', () => {
     const m = model('llama33-70b');
     expect(m.sliding_window).toBeUndefined();
     expect(kvPerRequestBytes(m, 1, 78643.2)).toBeCloseTo(kvPerTokenBytes(m, 1) * 78643.2, 6);
+  });
+});
+
+// Hybrid linear attention. Recurrent layers (Kimi K3's KDA, Qwen3-Next, MiniMax) hold a
+// CONSTANT state per request — no per-token cache at all. Sizing them as full attention
+// invents cache that will never exist.
+describe('§C linear-attention layers (constant state)', () => {
+  it('AC-28 — Kimi K3 splits 24 full MLA / 69 linear across 93 layers', () => {
+    const m = model('kimi-k3');
+    expect(m.layers).toBe(93);
+    const s = layerSplit(m);
+    expect(s).toEqual({ full: 24, windowed: 0, linear: 69 });
+    expect(s.full + s.windowed + s.linear).toBe(m.layers); // every layer accounted for
+  });
+
+  it('AC-29 — only the 24 cached layers grow: 8.5 GiB at 1M, not 31.4', () => {
+    const m = model('kimi-k3');
+    const tokens = 1048576 * 0.6;
+    const real = kvPerRequestBytes(m, 1, tokens) / GIB;
+    const allFull = (kvPerTokenBytes(m, 1) * tokens) / GIB; // if all 93 layers were MLA
+    expect(near(real, 8.5, 0.05)).toBe(true);
+    expect(near(allFull, 31.4, 0.05)).toBe(true);
+    expect(allFull / real).toBeGreaterThan(3.5);
+  });
+
+  it('AC-30 — the linear state is genuinely constant in context length', () => {
+    const m = model('kimi-k3');
+    const stateGib = (69 * 6291456) / GIB; // 69 layers x 6.29 MB
+    // subtract the growing MLA term at two very different contexts; the remainder must match
+    const at = (tok: number) => kvPerRequestBytes(m, 1, tok) / GIB - (24 * 576 * tok) / GIB;
+    expect(at(1000)).toBeCloseTo(stateGib, 9);
+    expect(at(600_000)).toBeCloseTo(stateGib, 9);
+    expect(near(stateGib, 0.404, 0.02)).toBe(true); // ~414 MB, flat
+  });
+
+  it('AC-31 — Kimi K3 MXFP4 fits one 8x B300 node at its full 1M context', () => {
+    const r = computeSizing(model('kimi-k3'), gpu('b300'), {
+      quant: 'MXFP4', kv_dtype_bytes: 1, selected_ctx: 1048576, avg_context_utilisation: 0.6,
+      target_concurrency: 8, mem_util_fraction: 0.9, gpus_per_node: 8,
+    }) as FeasibleSizing;
+    expect(r.ok).toBe(true);
+    expect(r.tp).toBe(8);
+    expect(r.gpus).toBe(8);
+    expect(r.nodes).toBe(1); // the vLLM recipe's "at least 8x GB300"
+    expect(near(r.weights_gb, 1389, 0.05)).toBe(true);
+    expect(r.kv_windowed).toBe(true);
+  });
+
+  it('AC-32 — a model with no linear layers is unchanged', () => {
+    const m = model('kimi-k2');
+    expect(layerSplit(m)).toEqual({ full: 61, windowed: 0, linear: 0 });
+    expect(kvPerRequestBytes(m, 1, 78643.2)).toBeCloseTo(kvPerTokenBytes(m, 1) * 78643.2, 6);
+  });
+
+  it('AC-33 — validation rejects a layer split that does not account for every layer', () => {
+    const m = model('kimi-k3');
+    // linear layers with no state size would be counted as free
+    expect(modelSchema.safeParse({ ...m, linear_state_bytes_per_layer: undefined }).success).toBe(false);
+    // full + linear over-subscribing the layer count
+    expect(modelSchema.safeParse({ ...m, full_attention_layers: 40 }).success).toBe(false);
+    // leftover layers with no window to size them
+    expect(modelSchema.safeParse({ ...m, linear_attention_layers: 40, full_attention_layers: 24 }).success).toBe(false);
+    expect(modelSchema.safeParse(m).success).toBe(true);
   });
 });
 
