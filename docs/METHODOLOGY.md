@@ -151,4 +151,8 @@ A tight plan is arithmetically feasible but has no margin for the ±5% weight es
 
 Outputs are first-order roofline estimates (throughput ±40%, TTFT ±50%). Real numbers depend on kernels, batching, prefix caching and speculative decoding — treat them as planning figures and validate against benchmarks before procurement.
 
+**Catalog geometry is sourced, not guessed.** Every seeded model's layer count, attention geometry and embedding sizes are taken from its published `config.json`. Two corrections came out of that pass worth recording: GPT-OSS's 128-token window applies to exactly half its layers (18/36 and 12/24), and **GLM-5.2 is an MLA model, not GQA** — it ships as `GlmMoeDsaForCausalLM` with `kv_lora_rank: 512` + `qk_rope_head_dim: 64`, the same 576-element latent per layer DeepSeek uses. Sizing it as GQA 8×128 overstated its KV cache by ~3.6×, which is the difference between 8 GPUs and 24 for a 64-user deployment.
+
+**Sparse attention is not a memory saving.** GLM-5.2's `index_topk: 2048` (DSA) selects which cached tokens each query attends to. It cuts attention *compute*; the KV cache still holds every token. This tool deliberately does not model it as a cache reduction — treating token-selection sparsity as eviction would under-size the deployment.
+
 **Note on the ×1.02 fallback.** Models with no `hidden_size`/`vocab_size` still use the legacy flat factor. It is a worse estimate at low bit-widths, not a different unit — supply the embedding geometry and it disappears.

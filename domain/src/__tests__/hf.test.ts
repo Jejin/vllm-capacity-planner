@@ -31,6 +31,32 @@ describe('HF config.json → §F mapping (AD-11)', () => {
     expect(mapped.head_dim).toBe(0);
   });
 
+  it('detects MLA structurally from kv_lora_rank, not just the architecture name', () => {
+    // GLM-5.2 ships as GlmMoeDsaForCausalLM — no "mla" anywhere in the name, but the
+    // compressed KV projection makes it unambiguous
+    const { mapped, detectedMla } = hfConfigToModel('zai-org/GLM-5.2', {
+      architectures: ['GlmMoeDsaForCausalLM'], model_type: 'glm_moe_dsa',
+      num_hidden_layers: 78, num_attention_heads: 64, num_key_value_heads: 64, head_dim: 192,
+      hidden_size: 6144, vocab_size: 154880, tie_word_embeddings: false,
+      kv_lora_rank: 512, qk_rope_head_dim: 64, max_position_embeddings: 1048576,
+    });
+    expect(detectedMla).toBe(true);
+    expect(mapped.kv_heads).toBe(0); // the 64 KV heads in the config are NOT the cache geometry
+    expect(mapped.head_dim).toBe(0);
+    expect(mapped.layers).toBe(78);
+    expect(mapped.hidden_size).toBe(6144);
+    expect(mapped.vocab_size).toBe(154880);
+  });
+
+  it('does not mistake a plain GQA model for MLA', () => {
+    const { detectedMla } = hfConfigToModel('zai-org/GLM-4.5', {
+      architectures: ['Glm4MoeForCausalLM'], model_type: 'glm4_moe',
+      num_hidden_layers: 92, num_attention_heads: 96, num_key_value_heads: 8, head_dim: 128,
+      hidden_size: 5120, vocab_size: 151552, max_position_embeddings: 131072,
+    });
+    expect(detectedMla).toBe(false); // no kv_lora_rank => real GQA
+  });
+
   it('derives head_dim from hidden_size/heads when absent', () => {
     const { mapped } = hfConfigToModel('x/y', { num_hidden_layers: 32, num_attention_heads: 32, num_key_value_heads: 8, hidden_size: 4096, max_position_embeddings: 8192 });
     expect(mapped.head_dim).toBe(128); // 4096/32

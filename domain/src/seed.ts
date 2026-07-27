@@ -1,12 +1,22 @@
 // Canonical seeded catalog (addendum §B). ONE source of truth — consumed by the DB
-// migration seed AND the FR-23 reset (AD-15). [VERIFY] flags: glm45 layer/head cfg and
-// all GPU bandwidths were self-flagged approximate in the addendum (OQ-2) — confirm before prod.
+// migration seed AND the FR-23 reset (AD-15). [VERIFY]: all GPU bandwidths were self-flagged
+// approximate in the addendum (OQ-2) — confirm before prod. Model geometry is now sourced.
 
 import type { Model, GpuSku } from './types.js';
 
 // hidden_size / vocab_size / tied_embeddings come from each model's HF config.json and size the
-// 16-bit embedding + lm_head tail that survives quantisation (engine.weightsGb). [VERIFY] the
-// glm52 pair — that entry's geometry was already flagged approximate upstream.
+// 16-bit embedding + lm_head tail that survives quantisation (engine.weightsGb).
+//
+// glm45 / glm52: VERIFIED 2026-07-28 against the published configs.
+//   GLM-4.5 (glm4_moe) was already correct: 92 layers, GQA 8x128, hidden 5120, vocab 151552.
+//   GLM-5.2 (glm_moe_dsa) was WRONG and is corrected here — it is an MLA model, not GQA:
+//   kv_lora_rank 512 + qk_rope_head_dim 64 = the same 576 latent elements/layer DeepSeek uses.
+//   The old GQA 8x128 guess overstated its KV cache by ~3.6x. Also corrected: hidden 5120->6144,
+//   vocab 151552->154880, params 744/40 -> 743/39 (per the vLLM recipe), TP {8,16} -> {4,8,16}
+//   and the BF16 + AMD Quark MXFP4 checkpoints added.
+//   NOTE: `index_topk: 2048` (DSA sparse attention) selects which tokens each query attends to.
+//   It reduces attention COMPUTE, not cache residency — the KV cache still holds every token —
+//   so it is deliberately NOT modelled as a memory saving.
 // sliding_window/full_attention_layers: VERIFIED 2026-07-28 against the published
 // config.json for both GPT-OSS checkpoints — `layer_types` strictly alternates
 // sliding_attention/full_attention with `sliding_window: 128`:
@@ -25,7 +35,7 @@ export const SEED_MODELS: Model[] = [
   { id: 'gptoss-120b', name: 'GPT-OSS 120B (MoE 5.1B act)', total_params_b: 117, active_params_b: 5.1, layers: 36, kv_heads: 8, head_dim: 64, mla: false, max_ctx: 131072, tp_options: [1, 2, 4], quants: ['MXFP4'], hidden_size: 2880, vocab_size: 201088, tied_embeddings: false, sliding_window: 128, full_attention_layers: 18 },
   { id: 'qwen3-235b', name: 'Qwen3-235B-A22B (MoE)', total_params_b: 235, active_params_b: 22, layers: 94, kv_heads: 4, head_dim: 128, mla: false, max_ctx: 262144, tp_options: [4, 8, 16], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 4096, vocab_size: 151936, tied_embeddings: false },
   { id: 'glm45', name: 'GLM-4.5 355B-A32B (MoE)', total_params_b: 355, active_params_b: 32, layers: 92, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [8, 16], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 5120, vocab_size: 151552, tied_embeddings: false },
-  { id: 'glm52', name: 'GLM-5.2 744B-A40B (MoE·DSA)', total_params_b: 744, active_params_b: 40, layers: 78, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 1048576, tp_options: [8, 16], quants: ['FP8', 'NVFP4'], hidden_size: 5120, vocab_size: 151552, tied_embeddings: false },
+  { id: 'glm52', name: 'GLM-5.2 743B-A39B (MoE·MLA·DSA)', total_params_b: 743, active_params_b: 39, layers: 78, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 1048576, tp_options: [4, 8, 16], quants: ['FP16', 'FP8', 'MXFP4', 'NVFP4'], hidden_size: 6144, vocab_size: 154880, tied_embeddings: false },
   { id: 'dsv3', name: 'DeepSeek-V3 / R1 671B (MLA)', total_params_b: 671, active_params_b: 37, layers: 61, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 131072, tp_options: [8, 16], quants: ['FP8', 'INT4'], hidden_size: 7168, vocab_size: 129280, tied_embeddings: false },
   { id: 'kimi-k2', name: 'Kimi K2 1T-A32B (MLA)', total_params_b: 1026, active_params_b: 32.5, layers: 61, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 131072, tp_options: [16], quants: ['FP8', 'INT4'], hidden_size: 7168, vocab_size: 163840, tied_embeddings: false },
 ];

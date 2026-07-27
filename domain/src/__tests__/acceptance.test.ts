@@ -35,7 +35,7 @@ describe('§C sizing acceptance vectors (PRD §18.2)', () => {
     expect(r.nodes).toBe(2);
   });
 
-  it('AC-2 — GLM-5.2 744B FP8/KV-FP8 128K 60% conc64 H200 → TP8, 24 GPUs', () => {
+  it('AC-2 — GLM-5.2 743B FP8/KV-FP8 128K 60% conc64 H200 → TP8, 8 GPUs (one node)', () => {
     const r = computeSizing(model('glm52'), gpu('h200'), {
       quant: 'FP8', kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
       target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
@@ -44,10 +44,35 @@ describe('§C sizing acceptance vectors (PRD §18.2)', () => {
     expect(r.tp).toBe(8);
     expect(near(r.weights_gb, 694, 0.05)).toBe(true); // 16-bit embedding tail split out, in GiB
     expect(near(r.free_gb, 301, 0.05)).toBe(true); // free KV budget/replica
-    expect(near(r.kv_per_request_gb, 11.7, 0.05)).toBe(true);
-    expect(near(r.concurrency_per_pod, 25, 0.1)).toBe(true);
-    expect(r.pods).toBe(3);
-    expect(r.gpus).toBe(24);
+    // MLA (kv_lora_rank 512 + qk_rope_head_dim 64 = 576/layer), NOT the GQA 8x128 first assumed
+    expect(near(r.kv_per_request_gb, 3.29, 0.05)).toBe(true);
+    expect(near(r.concurrency_per_pod, 91, 0.1)).toBe(true);
+    expect(r.pods).toBe(1);
+    expect(r.gpus).toBe(8);
+    expect(r.nodes).toBe(1); // matches the vLLM recipe's "8xH200 single-node FP8"
+  });
+
+  it('AC-2b — GLM-5.2 at its full 1M context still fits one node', () => {
+    const r = computeSizing(model('glm52'), gpu('b200'), {
+      quant: 'FP8', kv_dtype_bytes: 1, selected_ctx: 1048576, avg_context_utilisation: 0.6,
+      target_concurrency: 8, mem_util_fraction: 0.9, gpus_per_node: 8,
+    }) as FeasibleSizing;
+    expect(r.ok).toBe(true);
+    expect(r.tp).toBe(8);
+    expect(r.gpus).toBe(8);
+    expect(r.nodes).toBe(1); // the recipe's "8xB200 for the full 1M context"
+    expect(near(r.kv_per_request_gb, 26.3, 0.05)).toBe(true); // 1M ctx MLA KV is still 26 GiB/request
+  });
+
+  it('AC-2c — GLM-5.2 is MLA: the old GQA 8x128 guess overstated its KV ~3.6x', () => {
+    const m = model('glm52');
+    expect(m.mla).toBe(true);
+    expect(m.kv_heads).toBe(0);
+    expect(m.head_dim).toBe(0);
+    const tokens = 131072 * 0.6;
+    const mlaKv = kvPerRequestBytes(m, 1, tokens);
+    const gqaGuess = 2 * m.layers * 8 * 128 * 1 * tokens; // what the seed used to claim
+    expect(gqaGuess / mlaKv).toBeCloseTo(3.56, 1);
   });
 
   it('AC-3 — DeepSeek-V3 671B (MLA) FP8/KV-FP8 128K 60% conc64 H200 → TP8, 8 GPUs, conc/pod ≥100', () => {
