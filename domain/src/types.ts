@@ -16,6 +16,15 @@ export interface Model {
   max_ctx: number;
   tp_options: number[];
   quants: Quant[];
+  // --- embedding geometry (optional; drives the un-quantised-tail weight term) ---
+  // Real checkpoints keep the embedding table and lm_head at 16-bit even when the
+  // transformer body is quantised. At INT4/MXFP4 that tail is a double-digit share of
+  // the footprint, so omitting it under-sizes the deployment. All three come straight
+  // from HF config.json (hidden_size / vocab_size / tie_word_embeddings). When absent
+  // the engine falls back to the legacy flat WEIGHT_OVERHEAD factor.
+  hidden_size?: number;
+  vocab_size?: number;
+  tied_embeddings?: boolean; // true => one shared table, false/undefined => embedding + lm_head
 }
 
 /** A GPU type (addendum §F.2). */
@@ -51,6 +60,12 @@ export interface FeasibleSizing {
   gpus: number;
   nodes: number;
   multi_node: boolean;
+  /** Fraction of pod HBM still free once weights + ONE request of KV are placed (0..1). */
+  headroom_fraction: number;
+  /** headroom_fraction < TIGHT_HEADROOM — it fits, but with no margin for modelling error. */
+  tight: boolean;
+  /** True when the weight estimate used the legacy flat overhead (no embedding geometry on the model). */
+  weights_estimated: boolean;
   throughput_tokens_per_sec: number; // aggregate decode throughput across the deployment, ±40%
   decode_tps_per_request: number; // per-request decode tokens/sec (1 / step time), ±40%
   ttft_ms: number; // indicative time-to-first-token (prefill, bandwidth floor), ±50%
