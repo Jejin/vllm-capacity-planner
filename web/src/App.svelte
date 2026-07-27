@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, serveCommand, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -45,10 +45,12 @@
   // Effective quant — always one the selected model actually supports, so switching models can
   // never compute with an unsupported quant (e.g. FP16 on GLM-5.2, which only offers FP8/NVFP4).
   const effQuant = $derived(model && model.quants.includes(quant) ? quant : (model?.quants[0] ?? 'FP8'));
-  const result = $derived(computeSizing(model, gpu, {
+  // named so the launch-command builder reuses the exact inputs the sizing ran on
+  const sizingInput = $derived({
     quant: effQuant, kv_dtype_bytes: kvBytes, selected_ctx: Math.min(ctx, model?.max_ctx ?? ctx),
     avg_context_utilisation: util, target_concurrency: conc, mem_util_fraction: memUtil, gpus_per_node: perNode,
-  }));
+  });
+  const result = $derived(computeSizing(model, gpu, sizingInput));
   const R = $derived(result.ok ? (result as FeasibleSizing) : null);
   const fmt = (x: number, d = 1) => (x >= 1000 ? Math.round(x).toLocaleString() : x.toFixed(d));
 
@@ -58,6 +60,19 @@
   const kvPer = $derived(R ? (activePer * R.kv_per_request_gb) / R.tp : 0);
   const kvAlloc = $derived(R ? activePer * R.kv_per_request_gb : 0);
   const stacks = $derived(R ? Math.min(R.tp, 8) : 0);
+  // launch command for ONE replica of the current plan
+  let cmdDocker = $state(false);
+  let cmdCopied = $state(false);
+  /** Catalogue entries carry display names; only use one as a serve id if it looks like one. */
+  const hfIdFor = (m: Model) => (/^[\w.-]+\/[\w.-]+$/.test(m.name) ? m.name : undefined);
+  const serveCmd = $derived(
+    R && model ? serveCommand(model, sizingInput, R, { hf_id: hfIdFor(model), docker: cmdDocker }) : null,
+  );
+  async function copyCmd() {
+    if (!serveCmd) return;
+    try { await navigator.clipboard.writeText(serveCmd.command); cmdCopied = true; setTimeout(() => (cmdCopied = false), 1600); }
+    catch { notice = 'Clipboard unavailable — select the command and copy manually.'; }
+  }
   // what this model's KV would cost if every layer were full-context — the comparison the
   // sliding-window banner quotes, computed exactly rather than scaled from the layer ratio
   const kvNominalGb = $derived(
@@ -417,6 +432,19 @@
           <div class="li"><span>Decode throughput / request</span><b>~{R.decode_tps_per_request} tok/s</b></div>
           <div class="li"><span>Aggregate throughput</span><b>~{R.throughput_tokens_per_sec.toLocaleString()} tok/s <small>±40%</small></b></div>
         </div>
+
+        {#if serveCmd}
+          <div class="panel">
+            <h2>Launch command
+              <span style="float:right;display:flex;gap:6px">
+                <button class="btn ghost" onclick={() => (cmdDocker = !cmdDocker)}>{cmdDocker ? 'plain' : 'docker'}</button>
+                <button class="btn" onclick={copyCmd}>{cmdCopied ? 'copied' : 'copy'}</button>
+              </span>
+            </h2>
+            <pre class="cmd">{serveCmd.command}</pre>
+            <ul class="cmdnotes">{#each serveCmd.notes as n}<li>{n}</li>{/each}</ul>
+          </div>
+        {/if}
 
         <div class="panel">
           <h2>Concurrency rubric — pick a target, see the cost &amp; throughput</h2>
@@ -810,6 +838,9 @@
   .kpi .verdict{font-size:9.5px;color:var(--brandink);margin-top:2px;font-weight:700}.kpi .verdict.t{color:var(--warn)}
   .tightv{color:var(--warn)}
   .hint{font-size:11px;color:var(--ink3);line-height:1.5;margin:-2px 0 10px}
+  .cmd{font-family:'IBM Plex Mono',monospace;font-size:11.5px;line-height:1.6;background:var(--wash);border:1px solid var(--line);border-radius:6px;padding:12px 14px;overflow-x:auto;white-space:pre;margin:0;color:var(--ink)}
+  .cmdnotes{margin:10px 0 0;padding-left:18px;font-size:11.5px;color:var(--ink2);line-height:1.6}
+  .cmdnotes li{margin-bottom:4px}
   .hbm{display:flex;gap:10px;align-items:flex-end;padding:6px 2px 0;overflow-x:auto}
   .gpu{display:flex;flex-direction:column;align-items:center;min-width:52px}
   .stack{width:44px;height:168px;border:1.5px solid var(--ink);border-radius:3px;display:flex;flex-direction:column-reverse;overflow:hidden;background:repeating-linear-gradient(0deg,var(--surface2),var(--surface2) 9px,var(--line2) 9px,var(--line2) 10px)}
