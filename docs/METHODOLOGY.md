@@ -95,6 +95,23 @@ where *active tokens = context length × average utilisation*. The most sessions
 Max pod concurrency = floor( Free KV space / KV per session )
 ```
 
+### Choosing the tensor-parallel size
+
+The obvious rule — smallest TP that holds the weights plus one request — **over-recommends hardware.** A bigger shard leaves proportionally more room for KV and so packs far more sessions per replica, and total cost is `pods × TP`, not `TP`.
+
+Llama-3.3-70B at FP8, 128K/60%, 64 concurrent, on H200:
+
+| TP | free KV | sessions/pod | pods | **total GPUs** |
+|---|---|---|---|---|
+| 1 | 57 GiB | 4 | 16 | 16 |
+| 2 | 181 GiB | 15 | 5 | 10 |
+| 4 | 430 GiB | 35 | 2 | **8** |
+| 8 | 927 GiB | 77 | 1 | **8** |
+
+The engine evaluates every TP in the model's ladder and takes the cheapest total, breaking ties toward the **smaller** shard (same GPU count, less collective traffic). That makes this a cost/throughput objective; a latency-oriented planner would bias toward larger shards instead.
+
+This is also why `tp_options` should be generous. Listing extra small sizes is harmless — infeasible ones are skipped — but listing too few silently forces more hardware than the model needs.
+
 ### Local & global attention
 
 Not every layer attends over the whole context. Many models alternate **full-attention** layers with **sliding-window** layers that only look back a fixed number of tokens. Windowed layers' KV stops growing once the sequence passes the window:

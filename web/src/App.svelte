@@ -648,6 +648,9 @@
     <div class="formula">KV per session (GiB) = <span class="frac"><span class="fnum">Bytes per token × Active tokens</span><span class="fden">1024³</span></span></div>
     <p>where <em>active tokens = context length × average utilisation</em>. The most sessions one pod can hold is then bounded by the free space from §2:</p>
     <div class="formula">Max pod concurrency = ⌊ <span class="frac"><span class="fnum">Free KV space</span><span class="fden">KV per session</span></span> ⌋</div>
+    <h3 class="dh3">Choosing the tensor-parallel size</h3>
+    <p>The obvious rule — smallest TP that holds the weights plus one request — <b>over-recommends hardware</b>. A bigger shard leaves proportionally more room for KV and packs far more sessions per replica, and what you pay for is <code>pods × TP</code>, not <code>TP</code>. Llama-3.3-70B at FP8, 128K/60%, 64 concurrent on H200: TP1 needs 16 GPUs, TP2 needs 10, TP4 and TP8 need <b>8</b>.</p>
+    <p class="note">The engine evaluates every TP in the model's ladder and takes the cheapest total, breaking ties toward the <em>smaller</em> shard — same GPU count, less collective traffic. That makes this a cost/throughput objective; a latency-oriented planner would bias toward larger shards.</p>
 
     <h2 class="dh">4 · Decode roofline throughput</h2>
     <p>For every token generated, the weights and active KV cache must be read from memory to the compute cores — so generation speed is bounded by achievable memory bandwidth (with a Memory-Bandwidth-Utilisation penalty, here 55%).</p>
