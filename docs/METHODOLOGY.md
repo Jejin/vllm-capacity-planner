@@ -107,6 +107,19 @@ GPT-OSS-120B is the clearest case: 18 of its 36 layers are locally banded at 128
 
 Because the windowed layers stop growing, the per-token KV figure the app reports is an *effective average* over the request rather than a constant marginal rate. It still reconciles exactly: per-token × active tokens = per-request. A model with no window declared is treated as all-full-attention — the safe direction to be wrong in.
 
+### Linear & recurrent layers
+
+A third regime is spreading fast. Hybrid models replace most attention layers with a **recurrent** form — Kimi K3's KDA, Qwen3-Next, MiniMax — whose state is a fixed-size matrix per layer that does not grow with the sequence at all:
+
+```
+KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) )
+               + linear × constant_state
+```
+
+Kimi K3 has 93 layers, of which only **24** keep a token-indexed cache; the other 69 are KDA, costing a flat ~414 MB per request whether the context is 1K or 1M (state = `num_heads × head_dim² × 4` bytes, fp32). At its full 1M window that is **8.5 GiB** of KV instead of the 31.4 GiB an all-93-layer sizing would claim — the difference between fitting one 8×B300 node and not. The constant term dominates at short context and vanishes at long, so it is modelled rather than dropped.
+
+Every layer must be accounted for: `full + windowed + linear = layers`, and validation rejects a split that leaves layers unexplained.
+
 `config.json` expresses this three ways, all of which the HF importer handles: `layer_types` (per-layer array), `sliding_window_pattern` (one global every N), or a bare `sliding_window` (every layer windowed).
 
 ## 4. Decode roofline throughput
@@ -151,7 +164,7 @@ A tight plan is arithmetically feasible but has no margin for the ±5% weight es
 
 Outputs are first-order roofline estimates (throughput ±40%, TTFT ±50%). Real numbers depend on kernels, batching, prefix caching and speculative decoding — treat them as planning figures and validate against benchmarks before procurement.
 
-**Catalog geometry is sourced, not guessed.** Every seeded model's layer count, attention geometry and embedding sizes are taken from its published `config.json`. Two corrections came out of that pass worth recording: GPT-OSS's 128-token window applies to exactly half its layers (18/36 and 12/24), and **GLM-5.2 is an MLA model, not GQA** — it ships as `GlmMoeDsaForCausalLM` with `kv_lora_rank: 512` + `qk_rope_head_dim: 64`, the same 576-element latent per layer DeepSeek uses. Sizing it as GQA 8×128 overstated its KV cache by ~3.6×, which is the difference between 8 GPUs and 24 for a 64-user deployment.
+**Catalog geometry is sourced, not guessed.** Every seeded model's layer count, attention geometry and embedding sizes are taken from its published `config.json`. Three findings came out of that pass worth recording: GPT-OSS's 128-token window applies to exactly half its layers (18/36 and 12/24), and **GLM-5.2 is an MLA model, not GQA** — it ships as `GlmMoeDsaForCausalLM` with `kv_lora_rank: 512` + `qk_rope_head_dim: 64`, the same 576-element latent per layer DeepSeek uses. Sizing it as GQA 8×128 overstated its KV cache by ~3.6×, which is the difference between 8 GPUs and 24 for a 64-user deployment. And Kimi K3 is only 26% attention layers — see below.
 
 **Sparse attention is not a memory saving.** GLM-5.2's `index_topk: 2048` (DSA) selects which cached tokens each query attends to. It cuts attention *compute*; the KV cache still holds every token. This tool deliberately does not model it as a cache reduction — treating token-selection sparsity as eviction would under-size the deployment.
 

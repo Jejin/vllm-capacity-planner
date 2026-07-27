@@ -109,6 +109,33 @@ describe('HF config.json → §F mapping (AD-11)', () => {
     expect(mapped.full_attention_layers).toBe(0);
   });
 
+  it('maps hybrid linear attention from linear_attn_config (Kimi K3 style)', () => {
+    const { mapped } = hfConfigToModel('moonshotai/Kimi-K3', {
+      architectures: ['KimiLinearForCausalLM'], model_type: 'kimi_linear',
+      num_hidden_layers: 93, num_attention_heads: 96, num_key_value_heads: 96,
+      hidden_size: 7168, vocab_size: 163840, kv_lora_rank: 512, qk_rope_head_dim: 64,
+      max_position_embeddings: 1048576,
+      linear_attn_config: {
+        full_attn_layers: Array.from({ length: 24 }, (_, i) => (i + 1) * 4),
+        kda_layers: Array.from({ length: 69 }, (_, i) => i + 1),
+        num_heads: 96, head_dim: 128,
+      },
+    });
+    expect(mapped.full_attention_layers).toBe(24);
+    expect(mapped.linear_attention_layers).toBe(69);
+    expect(mapped.linear_state_bytes_per_layer).toBe(96 * 128 * 128 * 4); // fp32 recurrent state
+    expect(mapped.mla).toBe(true); // kv_lora_rank still marks the 24 cached layers as MLA
+  });
+
+  it('leaves linear fields unset for a normal model', () => {
+    const { mapped } = hfConfigToModel('meta-llama/Llama-3.3-70B-Instruct', {
+      num_hidden_layers: 80, num_attention_heads: 64, num_key_value_heads: 8, head_dim: 128,
+      hidden_size: 8192, vocab_size: 128256, max_position_embeddings: 131072,
+    });
+    expect(mapped.linear_attention_layers).toBeUndefined();
+    expect(mapped.linear_state_bytes_per_layer).toBeUndefined();
+  });
+
   it('leaves window fields unset when the config declares no window', () => {
     const { mapped } = hfConfigToModel('meta-llama/Llama-3.3-70B-Instruct', {
       num_hidden_layers: 80, num_attention_heads: 64, num_key_value_heads: 8, head_dim: 128,

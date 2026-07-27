@@ -82,32 +82,47 @@ export function kvPerTokenBytes(model: Model, kvDtypeBytes: number): number {
   return model.layers * kvPerLayerPerTokenBytes(model, kvDtypeBytes);
 }
 
-/** True when the model declares a usable sliding-window layer split. */
+/**
+ * How a model's layers divide across the three attention regimes.
+ *   full    — KV grows with the sequence
+ *   windowed— KV grows to `sliding_window` tokens, then stops
+ *   linear  — recurrent state, CONSTANT in sequence length (no per-token cache at all)
+ * Undeclared models are all-full, which is the safe direction to be wrong in.
+ */
+export function layerSplit(model: Model): { full: number; windowed: number; linear: number } {
+  const linear = model.linear_attention_layers ?? 0;
+  const cached = model.layers - linear; // layers that keep a token-indexed cache
+  const full = model.full_attention_layers ?? cached;
+  const windowed = Math.max(0, cached - full);
+  return { full: Math.max(0, Math.min(full, cached)), windowed, linear };
+}
+
+/** True when some layers are sliding-window or linear, so KV is below the all-full figure. */
 export function hasWindowedLayers(model: Model): boolean {
-  return (
-    !!model.sliding_window &&
-    model.full_attention_layers != null &&
-    model.full_attention_layers < model.layers
-  );
+  const { windowed, linear } = layerSplit(model);
+  return (!!model.sliding_window && windowed > 0) || linear > 0;
 }
 
 /**
  * KV bytes for ONE request holding `activeTokens` of context.
  *
- * Full-context layers grow with the sequence; sliding-window layers stop at the window:
- *   full × perLayer × tokens + windowed × perLayer × min(tokens, window)
+ *   full × perLayer × tokens
+ * + windowed × perLayer × min(tokens, window)
+ * + linear × constant state
  *
- * This is not a refinement — for GPT-OSS-120B at 128K it halves the KV, because 18 of its 36
- * layers are locally banded at 128 tokens. Treating those as full-context roughly doubles the
- * cache and can turn a comfortable plan into a false "tight" verdict.
+ * None of this is a refinement. GPT-OSS-120B at 128K halves (18 of 36 layers banded at 128
+ * tokens); Kimi K3 falls ~3.9x (only 24 of 93 layers keep a token cache at all — the other 69
+ * are KDA, whose state does not grow). Sizing those as full attention manufactures cache that
+ * will never exist, and can turn a comfortable plan into a false "tight" verdict.
  */
 export function kvPerRequestBytes(model: Model, kvDtypeBytes: number, activeTokens: number): number {
   const perLayer = kvPerLayerPerTokenBytes(model, kvDtypeBytes);
-  if (!hasWindowedLayers(model)) return model.layers * perLayer * activeTokens;
-  const full = model.full_attention_layers!;
-  const windowed = model.layers - full;
-  const windowTokens = Math.min(activeTokens, model.sliding_window!);
-  return perLayer * (full * activeTokens + windowed * windowTokens);
+  const { full, windowed, linear } = layerSplit(model);
+  const windowTokens = model.sliding_window
+    ? Math.min(activeTokens, model.sliding_window)
+    : activeTokens;
+  const linearState = linear * (model.linear_state_bytes_per_layer ?? 0);
+  return perLayer * (full * activeTokens + windowed * windowTokens) + linearState;
 }
 
 /**

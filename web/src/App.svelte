@@ -180,12 +180,12 @@
   // ── Admin catalog forms (FR-2/3/4/6/7/8, validated via the shared §F schema) ──
   const QUANTS = ['FP16', 'FP8', 'INT8', 'INT4', 'MXFP4', 'NVFP4'];
   type Err = { path: string; message: string };
-  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '' });
+  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '', linear_attention_layers: '' as number | '', linear_state_bytes_per_layer: '' as number | '' });
   let mf = $state(blankModel());
   let mfEditing = $state(false);
   let mfErrors = $state<Err[]>([]);
   const errFor = (errs: Err[], p: string) => errs.find((e) => e.path === p)?.message;
-  function editModel(m: Model) { mf = { ...m, tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '' } as any; mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
+  function editModel(m: Model) { mf = { ...m, tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '' } as any; mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
   function newModelForm() { mf = blankModel(); mfEditing = false; mfErrors = []; }
   function toggleQuant(q: string) { mf.quants = mf.quants.includes(q) ? mf.quants.filter((x) => x !== q) : [...mf.quants, q]; }
   async function saveModel() {
@@ -197,8 +197,12 @@
     // same all-or-nothing rule for the sliding-window pair
     const win = mf.sliding_window !== '' && mf.full_attention_layers !== ''
       ? { sliding_window: +mf.sliding_window, full_attention_layers: +mf.full_attention_layers }
+      : (mf.full_attention_layers !== '' ? { full_attention_layers: +mf.full_attention_layers } : {});
+    // linear/recurrent layers — constant state, sent as a pair
+    const lin = mf.linear_attention_layers !== '' && mf.linear_state_bytes_per_layer !== ''
+      ? { linear_attention_layers: +mf.linear_attention_layers, linear_state_bytes_per_layer: +mf.linear_state_bytes_per_layer }
       : {};
-    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...win };
+    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...win, ...lin };
     const r = await fetch(mfEditing ? `/api/v1/models/${mf.id}` : '/api/v1/models', { method: mfEditing ? 'PUT' : 'POST', headers: authH, body: JSON.stringify(body) });
     if (r.ok) { newModelForm(); loadCatalog(); notice = 'Model saved.'; }
     else { const e = await r.json(); mfErrors = e.error?.fields ?? [{ path: '', message: e.error?.message ?? 'Save failed.' }]; }
@@ -232,7 +236,7 @@
       const d = await r.json();
       hfCard = d; hfMissing = d.missing ?? [];
       const m = d.mapped ?? {};
-      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '' };
+      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '' };
       mfEditing = false; mfErrors = [];
       notice = `Fetched ${d.model_id}. Review below, complete params / TP / quants (highlighted), then Create model.`;
       document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' });
@@ -294,7 +298,7 @@
     <section class="panel">
       <h2>Deployment inputs</h2>
       <label>Model<select bind:value={modelId}>{#each catalog.models as m}<option value={m.id}>{m.name}</option>{/each}</select></label>
-      <div class="meta">total {model?.total_params_b} B · active {model?.active_params_b} B · layers {model?.layers} · {model?.mla ? 'MLA (latent 576/layer)' : `GQA ${model?.kv_heads} KV-heads × ${model?.head_dim}`} · max ctx {((model?.max_ctx ?? 0) / 1024)}K · TP {`{${model?.tp_options.join(',')}}`}{#if model?.vocab_size && model?.hidden_size} · emb {model.vocab_size.toLocaleString()}×{model.hidden_size}{model.tied_embeddings ? ' (tied)' : ''}{/if}{#if model?.sliding_window && model?.full_attention_layers != null} · <b>SWA {model.full_attention_layers}/{model.layers} full</b>, {model.sliding_window}-tok window{/if}</div>
+      <div class="meta">total {model?.total_params_b} B · active {model?.active_params_b} B · layers {model?.layers} · {model?.mla ? 'MLA (latent 576/layer)' : `GQA ${model?.kv_heads} KV-heads × ${model?.head_dim}`} · max ctx {((model?.max_ctx ?? 0) / 1024)}K · TP {`{${model?.tp_options.join(',')}}`}{#if model?.vocab_size && model?.hidden_size} · emb {model.vocab_size.toLocaleString()}×{model.hidden_size}{model.tied_embeddings ? ' (tied)' : ''}{/if}{#if model?.sliding_window && model?.full_attention_layers != null} · <b>SWA {model.full_attention_layers}/{model.layers} full</b>, {model.sliding_window}-tok window{/if}{#if model?.linear_attention_layers} · <b>{model.linear_attention_layers} linear</b> (constant state){/if}</div>
       <div class="row"><label>Quantisation<select bind:value={quant}>{#each (model?.quants ?? []) as q}<option value={q}>{q}</option>{/each}</select></label>
         <label>KV dtype<select bind:value={kvBytes}><option value={1}>FP8 (1B)</option><option value={2}>FP16 (2B)</option></select></label></div>
       <div class="row"><label>Max context<select bind:value={ctx}>{#each ctxChoices as c}<option value={c}>{c / 1024}K</option>{/each}</select></label>
@@ -394,7 +398,8 @@
           {#if fc?.kind === 'absent'}<div class="state warn"><b>Fleet check.</b> {gpu.name} is not in the defined fleet. Add a pool or switch SKU.</div>{/if}
         {/if}
         {#if R.tight}<div class="state warn"><b>Tight fit — {(R.headroom_fraction * 100).toFixed(1)}% headroom.</b> Weights + one request of KV leave under 10% of the pod's HBM free, so this plan has no margin for the ±5% weight estimate, fragmentation, or a longer prompt than modelled. It will likely OOM on a real vLLM launch. Drop context, quantise the KV cache, or move to the next TP size.</div>{/if}
-        {#if R.kv_windowed}<div class="state ok"><b>Local/global attention applied.</b> {model.full_attention_layers} of {model.layers} layers keep full context; the other {model.layers - (model.full_attention_layers ?? 0)} stop growing at {model.sliding_window} tokens. KV per request is <b>{fmt(R.kv_per_request_gb)} GiB</b> instead of the {fmt(kvNominalGb)} GiB an all-full-attention model of this shape would need — a {(kvNominalGb / R.kv_per_request_gb).toFixed(1)}× saving at this context.</div>{/if}
+        {#if R.kv_windowed && model?.linear_attention_layers}<div class="state ok"><b>Hybrid attention applied.</b> Only {model.full_attention_layers} of {model.layers} layers keep a token-indexed cache; the other {model.linear_attention_layers} are linear/recurrent and hold a constant {fmt((model.linear_attention_layers * (model.linear_state_bytes_per_layer ?? 0)) / 2 ** 30)} GiB regardless of context. KV per request is <b>{fmt(R.kv_per_request_gb)} GiB</b> instead of the {fmt(kvNominalGb)} GiB all-{model.layers}-layer sizing would claim — a {(kvNominalGb / R.kv_per_request_gb).toFixed(1)}× difference.</div>
+        {:else if R.kv_windowed}<div class="state ok"><b>Local/global attention applied.</b> {model.full_attention_layers} of {model.layers} layers keep full context; the other {model.layers - (model.full_attention_layers ?? 0)} stop growing at {model.sliding_window} tokens. KV per request is <b>{fmt(R.kv_per_request_gb)} GiB</b> instead of the {fmt(kvNominalGb)} GiB an all-full-attention model of this shape would need — a {(kvNominalGb / R.kv_per_request_gb).toFixed(1)}× saving at this context.</div>{/if}
         {#if R.weights_estimated}<div class="state warn"><b>Weight estimate is approximate.</b> This model carries no embedding geometry, so the weights fall back to a flat overhead factor — optimistic by ~5–15% at INT4/MXFP4, where the 16-bit embedding and lm_head are a large share of the checkpoint. Add <code>hidden_size</code> and <code>vocab_size</code> in the model catalog to sharpen it.</div>{/if}
         {#if R.multi_node}<div class="state warn"><b>TP {R.tp} &gt; {perNode} GPUs/node:</b> this replica spans nodes — needs NVLink/IB fabric; latency &amp; MBU degrade vs single-node TP.</div>{/if}
         {#if util >= 1}<div class="state warn">Sizing at 100% context utilisation buys worst-case memory that mostly sits idle. Size KV at P95 of observed sequence length.</div>{/if}
@@ -512,7 +517,7 @@
             <div><span>TP options</span><b>{m.tp_options.join(', ')}</b></div>
             <div><span>Quants</span><b>{m.quants.join(', ')}</b></div>
             <div><span>Embedding</span><b>{m.vocab_size && m.hidden_size ? `${m.vocab_size.toLocaleString()} × ${m.hidden_size}${m.tied_embeddings ? ' tied' : ''}` : '— (est.)'}</b></div>
-            <div><span>Attention</span><b>{m.sliding_window && m.full_attention_layers != null ? `${m.full_attention_layers}/${m.layers} full · ${m.sliding_window}-tok window` : 'all full-context'}</b></div>
+            <div><span>Attention</span><b>{m.linear_attention_layers ? `${m.full_attention_layers}/${m.layers} cached · ${m.linear_attention_layers} linear` : m.sliding_window && m.full_attention_layers != null ? `${m.full_attention_layers}/${m.layers} full · ${m.sliding_window}-tok window` : 'all full-context'}</b></div>
           </div>
           {#if ident.role === 'admin'}<div class="mcard-f"><button class="btn ghost" onclick={() => editModel(m)}>edit</button> <button class="btn ghost danger" onclick={() => deleteModelUi(m.id)}>delete</button></div>{/if}
         </div>
@@ -565,6 +570,13 @@
       <div class="hint">Leave both blank for a normal full-context model. If the model alternates local and global attention (GPT-OSS, Gemma, Mistral v0.1), the windowed layers stop accumulating KV at the window — for GPT-OSS-120B at 128K that halves the cache. From <code>config.json</code>: <code>sliding_window</code> plus <code>layer_types</code> or <code>sliding_window_pattern</code>.</div>
       {#if errFor(mfErrors, 'sliding_window')}<div class="ferr">{errFor(mfErrors, 'sliding_window')}</div>{/if}
       {#if errFor(mfErrors, 'full_attention_layers')}<div class="ferr">{errFor(mfErrors, 'full_attention_layers')}</div>{/if}
+      <div class="row3">
+        <label>Linear-attn layers<small> (KDA etc)</small><input type="number" bind:value={mf.linear_attention_layers} placeholder="69" /></label>
+        <label>Linear state / layer<small> (bytes)</small><input type="number" bind:value={mf.linear_state_bytes_per_layer} placeholder="6291456" /></label>
+      </div>
+      <div class="hint">For hybrid models (Kimi K3's KDA, Qwen3-Next, MiniMax) whose recurrent layers hold a <em>constant</em> state instead of a growing cache. State per layer is typically <code>num_heads × head_dim² × 4</code> bytes (fp32). Every layer must be accounted for: full + windowed + linear = layers.</div>
+      {#if errFor(mfErrors, 'linear_state_bytes_per_layer')}<div class="ferr">{errFor(mfErrors, 'linear_state_bytes_per_layer')}</div>{/if}
+      {#if errFor(mfErrors, 'linear_attention_layers')}<div class="ferr">{errFor(mfErrors, 'linear_attention_layers')}</div>{/if}
       {#if errFor(mfErrors, 'vocab_size')}<div class="ferr">{errFor(mfErrors, 'vocab_size')}</div>{/if}
       {#if errFor(mfErrors, 'hidden_size')}<div class="ferr">{errFor(mfErrors, 'hidden_size')}</div>{/if}
       <div class="row3">
@@ -664,6 +676,11 @@
     <div class="formula">KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) )</div>
     <p>GPT-OSS-120B is the clearest case in this catalog: 18 of its 36 layers are locally banded at 128 tokens. At 128K context that is the difference between <b>2.7 GiB</b> and <b>5.4 GiB</b> per request — and the difference between a plan with room for three concurrent requests on one H100 and a plan that looks dangerously tight with room for one. Gemma (one global layer every N) and Mistral v0.1 (every layer windowed) use the same trick with different patterns.</p>
     <p class="note">Because the windowed layers stop growing, the per-token KV figure shown on the Sizing tab is an <em>effective average</em> over the whole request, not a constant marginal rate. It still reconciles exactly: per-token × active tokens = per-request. Models with no window declared are treated as all-full-attention, which is the safe direction to be wrong in.</p>
+    <h3 class="dh3">Linear &amp; recurrent layers</h3>
+    <p>A third regime is spreading fast. Hybrid models replace most attention layers with a <b>recurrent</b> form — Kimi K3's KDA, Qwen3-Next, MiniMax — whose state is a fixed-size matrix per layer. It does not grow with the sequence <em>at all</em>:</p>
+    <div class="formula">KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) ) + linear × constant</div>
+    <p>Kimi K3 is 93 layers, of which only <b>24</b> keep a token-indexed cache; the other 69 are KDA, costing a flat ~414 MB per request whether the context is 1K or 1M. At its full 1M window that is <b>8.5 GiB</b> of KV instead of the 31.4 GiB an all-93-layer sizing would claim — the difference between fitting one 8×B300 node and not. The constant term dominates at short context and vanishes at long; both ends matter, so it is modelled rather than dropped.</p>
+
     <p class="note"><b>Sparse attention is not a memory saving.</b> Schemes like GLM-5.2's DSA (<code>index_topk: 2048</code>) choose which cached tokens each query attends to. That cuts attention <em>compute</em> — the KV cache still holds every token. Treating token-selection sparsity as eviction would under-size the deployment, so this tool does not model it as one.</p>
 
     <h2 class="dh">8 · A note on units</h2>

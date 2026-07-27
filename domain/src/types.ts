@@ -34,7 +34,14 @@ export interface Model {
   // long-context KV several-fold. Absent => every layer treated as full-context.
   // From config.json: `sliding_window` + `layer_types` / `sliding_window_pattern`.
   sliding_window?: number; // window length in tokens
-  full_attention_layers?: number; // layers using full context; the rest use the window
+  full_attention_layers?: number; // layers using full context; the rest are windowed or linear
+  // --- linear / recurrent attention (optional) ---
+  // Hybrid models (Kimi K3's KDA, Qwen3-Next, MiniMax) replace most attention layers with a
+  // recurrent form whose state is CONSTANT in sequence length — it never accumulates a
+  // per-token cache. Sizing those layers as full attention massively overstates KV.
+  // Layer split is: full_attention_layers + linear_attention_layers + windowed = layers.
+  linear_attention_layers?: number;
+  linear_state_bytes_per_layer?: number; // fixed state per layer per request, in bytes
 }
 
 /** A GPU type (addendum §F.2). */
