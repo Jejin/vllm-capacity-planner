@@ -359,6 +359,46 @@ describe('§C linear-attention layers (constant state)', () => {
     expect(r.kv_windowed).toBe(true);
   });
 
+  it('AC-34 — Qwen3.6-27B: 16 of 64 layers cached, gated delta-net for the rest', () => {
+    const m = model('qwen36-27b');
+    expect(layerSplit(m)).toEqual({ full: 16, windowed: 0, linear: 48 });
+    const tokens = 262144 * 0.6;
+    const real = kvPerRequestBytes(m, 1, tokens) / GIB;
+    const allFull = (kvPerTokenBytes(m, 1) * tokens) / GIB;
+    expect(near(real, 4.94, 0.05)).toBe(true);
+    expect(near(allFull, 19.2, 0.05)).toBe(true);
+    expect(allFull / real).toBeGreaterThan(3.8); // 64/16 on the cached term
+  });
+
+  it('AC-35 — its 248K vocab makes the fp16 tail ~30% of an INT4 checkpoint', () => {
+    const m = model('qwen36-27b');
+    expect(near(unquantisedParamsB(m)!, 2.543, 0.01)).toBe(true); // 2 x 248320 x 5120
+    const w = weightsGb(m, 'INT4');
+    const bodyOnly = paramBytesToGib(m.total_params_b, QB.INT4);
+    expect(near(w, 16.6, 0.05)).toBe(true);
+    expect(w / bodyOnly).toBeGreaterThan(1.25); // tail dominates on a big-vocab small model
+  });
+
+  it('AC-36 — FP8 serves on a single H100, matching the recipe', () => {
+    const r = computeSizing(model('qwen36-27b'), gpu('h100'), {
+      quant: 'FP8', kv_dtype_bytes: 1, selected_ctx: 262144, avg_context_utilisation: 0.6,
+      target_concurrency: 8, mem_util_fraction: 0.9, gpus_per_node: 8,
+    }) as FeasibleSizing;
+    expect(r.ok).toBe(true);
+    expect(r.tp).toBe(1);
+    expect(r.gpus).toBe(1); // "FP8: single GPU"
+    expect(r.kv_windowed).toBe(true);
+  });
+
+  it('AC-37 — INT4 fits a single 24 GB card at moderate context', () => {
+    const r = computeSizing(model('qwen36-27b'), gpu('rtx4090'), {
+      quant: 'INT4', kv_dtype_bytes: 1, selected_ctx: 32768, avg_context_utilisation: 0.6,
+      target_concurrency: 1, mem_util_fraction: 0.9, gpus_per_node: 1,
+    }) as FeasibleSizing;
+    expect(r.ok).toBe(true);
+    expect(r.tp).toBe(1); // "Int4: single 24GB GPU"
+  });
+
   it('AC-32 — a model with no linear layers is unchanged', () => {
     const m = model('kimi-k2');
     expect(layerSplit(m)).toEqual({ full: 61, windowed: 0, linear: 0 });
