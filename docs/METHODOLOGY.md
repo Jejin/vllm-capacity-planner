@@ -116,11 +116,13 @@ KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) 
                + linear × constant_state
 ```
 
-Kimi K3 has 93 layers, of which only **24** keep a token-indexed cache; the other 69 are KDA, costing a flat ~414 MB per request whether the context is 1K or 1M (state = `num_heads × head_dim² × 4` bytes, fp32). At its full 1M window that is **8.5 GiB** of KV instead of the 31.4 GiB an all-93-layer sizing would claim — the difference between fitting one 8×B300 node and not. The constant term dominates at short context and vanishes at long, so it is modelled rather than dropped.
+Qwen3.6-27B is 64 layers with only **16** cached (4.9 GiB of KV at 256K instead of 19.2), and Kimi K3 has 93 layers of which only **24** keep a token-indexed cache; the other 69 are KDA, costing a flat ~414 MB per request whether the context is 1K or 1M (state = `num_heads × head_dim² × 4` bytes, fp32). At its full 1M window that is **8.5 GiB** of KV instead of the 31.4 GiB an all-93-layer sizing would claim — the difference between fitting one 8×B300 node and not. The constant term dominates at short context and vanishes at long, so it is modelled rather than dropped.
 
 Every layer must be accounted for: `full + windowed + linear = layers`, and validation rejects a split that leaves layers unexplained.
 
-`config.json` expresses this three ways, all of which the HF importer handles: `layer_types` (per-layer array), `sliding_window_pattern` (one global every N), or a bare `sliding_window` (every layer windowed).
+Vendors spell this incompatibly, and the importer handles each. Kimi K3 nests a `linear_attn_config` listing both layer sets; Qwen3.6 puts `linear_attention` in `layer_types` alongside flat `linear_num_value_heads` / `linear_key_head_dim` keys. The importer buckets `layer_types` by vocabulary — anything containing *linear*, *mamba* or *recurrent* is linear; *sliding* or *local* is windowed; anything unrecognised defaults to full attention, so a new spelling over-sizes rather than under-sizes.
+
+`config.json` expresses the sliding-window case three ways, all of which the HF importer handles: `layer_types` (per-layer array), `sliding_window_pattern` (one global every N), or a bare `sliding_window` (every layer windowed).
 
 ## 4. Decode roofline throughput
 

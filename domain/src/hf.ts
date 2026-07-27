@@ -21,19 +21,37 @@ const MLA_ARCHITECTURES = ['deepseek', 'kimi', 'mla'];
  */
 export function linearAttention(cfg: HfConfig, layers: number | undefined):
   { linear_attention_layers: number; linear_state_bytes_per_layer: number; full_attention_layers: number } | null {
+  // --- Kimi spelling: nested linear_attn_config enumerating both layer sets ---
   const lac = cfg.linear_attn_config;
-  if (!lac) return null;
-  const full = lac.full_attn_layers?.length;
-  const linear = lac.kda_layers?.length ?? (full != null && layers != null ? layers - full : undefined);
-  if (full == null || linear == null || linear <= 0) return null;
-  const heads = lac.num_heads;
-  const hd = lac.head_dim;
-  if (!heads || !hd) return null;
-  return {
-    full_attention_layers: full,
-    linear_attention_layers: linear,
-    linear_state_bytes_per_layer: heads * hd * hd * 4, // fp32 recurrent state
-  };
+  if (lac) {
+    const full = lac.full_attn_layers?.length;
+    const linear = lac.kda_layers?.length ?? (full != null && layers != null ? layers - full : undefined);
+    if (full != null && linear != null && linear > 0 && lac.num_heads && lac.head_dim) {
+      return {
+        full_attention_layers: full,
+        linear_attention_layers: linear,
+        // recurrent state is one [head_dim x head_dim] matrix per head, fp32 for stability
+        linear_state_bytes_per_layer: lac.num_heads * lac.head_dim * lac.head_dim * 4,
+      };
+    }
+  }
+
+  // --- Qwen spelling: 'linear_attention' in layer_types + flat linear_* dimensions ---
+  if (Array.isArray(cfg.layer_types) && cfg.layer_types.length > 0) {
+    const { full, linear } = bucketLayerTypes(cfg.layer_types);
+    const vHeads = cfg.linear_num_value_heads;
+    const kDim = cfg.linear_key_head_dim;
+    const vDim = cfg.linear_value_head_dim;
+    if (linear > 0 && vHeads && kDim && vDim) {
+      return {
+        full_attention_layers: full,
+        linear_attention_layers: linear,
+        // gated delta-net state: [v_heads x k_head_dim x v_head_dim], fp32
+        linear_state_bytes_per_layer: vHeads * kDim * vDim * 4,
+      };
+    }
+  }
+  return null;
 }
 
 export function detectMla(cfg: HfConfig): boolean {
@@ -60,13 +78,19 @@ export interface HfConfig {
   layer_types?: string[];
   /** Gemma-style: one global layer every N (so N-1 of every N are windowed). */
   sliding_window_pattern?: number;
-  /** Hybrid linear attention (Kimi K3 KDA, Qwen3-Next): which layers keep real attention. */
+  /** Hybrid linear attention, Kimi spelling: nested config listing both layer sets. */
   linear_attn_config?: {
     full_attn_layers?: number[];
     kda_layers?: number[];
     num_heads?: number;
     head_dim?: number;
   };
+  /** Hybrid linear attention, Qwen spelling: flat keys + 'linear_attention' in layer_types. */
+  linear_num_key_heads?: number;
+  linear_num_value_heads?: number;
+  linear_key_head_dim?: number;
+  linear_value_head_dim?: number;
+  full_attention_interval?: number;
   [k: string]: unknown;
 }
 
@@ -74,9 +98,25 @@ export interface HfConfig {
  * Resolve how many layers keep full context, across the three ways configs express it.
  * Returns null when the model has no usable sliding-window declaration.
  */
+/**
+ * Bucket a `layer_types` array into the three regimes. Configs use different vocabularies —
+ * GPT-OSS says 'sliding_attention', Qwen3.6 says 'linear_attention' — and anything that is not
+ * recognisably windowed or linear is treated as full attention, which is the safe default.
+ */
+export function bucketLayerTypes(types: string[]): { full: number; sliding: number; linear: number } {
+  let full = 0, sliding = 0, linear = 0;
+  for (const t of types) {
+    const k = t.toLowerCase();
+    if (k.includes('linear') || k.includes('mamba') || k.includes('recurrent')) linear++;
+    else if (k.includes('sliding') || k.includes('local')) sliding++;
+    else full++;
+  }
+  return { full, sliding, linear };
+}
+
 export function fullAttentionLayers(cfg: HfConfig, layers: number | undefined): number | null {
   if (Array.isArray(cfg.layer_types) && cfg.layer_types.length > 0) {
-    return cfg.layer_types.filter((t) => t === 'full_attention').length;
+    return bucketLayerTypes(cfg.layer_types).full;
   }
   if (!cfg.sliding_window) return null; // no window at all => every layer is full-context
   if (cfg.sliding_window_pattern && cfg.sliding_window_pattern > 0 && layers) {

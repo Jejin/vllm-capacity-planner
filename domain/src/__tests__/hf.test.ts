@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { hfConfigToModel, concurrencySweep } from '../hf.js';
+import { hfConfigToModel, concurrencySweep, bucketLayerTypes } from '../hf.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema } from '../schema.js';
 
@@ -125,6 +125,33 @@ describe('HF config.json → §F mapping (AD-11)', () => {
     expect(mapped.linear_attention_layers).toBe(69);
     expect(mapped.linear_state_bytes_per_layer).toBe(96 * 128 * 128 * 4); // fp32 recurrent state
     expect(mapped.mla).toBe(true); // kv_lora_rank still marks the 24 cached layers as MLA
+  });
+
+  it('maps the Qwen spelling: linear_attention in layer_types + flat linear_* dims', () => {
+    // Qwen3.6 declares hybrid attention completely differently from Kimi — no linear_attn_config,
+    // and 'linear_attention' rather than 'sliding_attention' in layer_types
+    const layer_types = Array.from({ length: 64 }, (_, i) => ((i + 1) % 4 === 0 ? 'full_attention' : 'linear_attention'));
+    const { mapped } = hfConfigToModel('Qwen/Qwen3.6-27B', {
+      architectures: ['Qwen3_5ForConditionalGeneration'], model_type: 'qwen3_5_text',
+      num_hidden_layers: 64, num_attention_heads: 24, num_key_value_heads: 4, head_dim: 256,
+      hidden_size: 5120, vocab_size: 248320, max_position_embeddings: 262144, layer_types,
+      linear_num_key_heads: 16, linear_num_value_heads: 48,
+      linear_key_head_dim: 128, linear_value_head_dim: 128, full_attention_interval: 4,
+    });
+    expect(mapped.full_attention_layers).toBe(16);
+    expect(mapped.linear_attention_layers).toBe(48);
+    expect(mapped.linear_state_bytes_per_layer).toBe(48 * 128 * 128 * 4); // v_heads x k_dim x v_dim, fp32
+    expect(mapped.mla).toBe(false); // real GQA on the 16 cached layers
+    expect(mapped.kv_heads).toBe(4);
+    expect(mapped.head_dim).toBe(256);
+  });
+
+  it('buckets layer_types by vocabulary, defaulting unknown kinds to full attention', () => {
+    expect(bucketLayerTypes(['full_attention', 'sliding_attention', 'linear_attention']))
+      .toEqual({ full: 1, sliding: 1, linear: 1 });
+    expect(bucketLayerTypes(['mamba', 'recurrent', 'local_attention']))
+      .toEqual({ full: 0, sliding: 1, linear: 2 });
+    expect(bucketLayerTypes(['something_new'])).toEqual({ full: 1, sliding: 0, linear: 0 });
   });
 
   it('leaves linear fields unset for a normal model', () => {
