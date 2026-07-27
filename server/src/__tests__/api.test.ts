@@ -95,6 +95,22 @@ describe('Epic 2 — Sizing endpoint (FR-9/10)', () => {
   });
 });
 
+describe('vLLM recipe import (admin)', () => {
+  it('is admin-only, like the HF import', async () => {
+    const r = await app.inject({ method: 'POST', url: '/api/v1/recipes/fetch', headers: user, payload: { model_id: 'zai-org/GLM-5.2' } });
+    expect(r.statusCode).toBe(403);
+  });
+  it('rejects a malformed model id before any egress', async () => {
+    const r = await app.inject({ method: 'POST', url: '/api/v1/recipes/fetch', headers: admin, payload: { model_id: 'not-an-owner-slash-model' } });
+    expect(r.statusCode).toBe(400);
+    expect(r.json().error.code).toBe('bad_request');
+  });
+  it('requires a model_id', async () => {
+    const r = await app.inject({ method: 'POST', url: '/api/v1/recipes/fetch', headers: admin, payload: {} });
+    expect(r.statusCode).toBe(422);
+  });
+});
+
 describe('Epic 4 — Reconciliation hard-block + headroom (FR-19..21)', () => {
   it('flags per-SKU over-commitment and returns headroom verdicts', async () => {
     const r = await app.inject({ method: 'POST', url: '/api/v1/reconcile', headers: user, payload: {

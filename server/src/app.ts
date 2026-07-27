@@ -2,7 +2,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import {
   computeSizing, reconcile, headroomCheck, modelSchema, gpuSkuSchema, sizingInputSchema,
-  catalogSchema, toFields, hfConfigToModel, type Model, type GpuSku,
+  catalogSchema, toFields, hfConfigToModel, recipeToModel, type Model, type GpuSku,
 } from '@vcp/domain';
 import { z } from 'zod';
 import { existsSync } from 'node:fs';
@@ -188,6 +188,33 @@ export function buildApp(opts: { dbPath?: string; now?: () => string; webDist?: 
     }
   }));
 
+  // ── vLLM recipe import (admin) ──
+  // recipes.vllm.ai publishes a JSON document per model. It carries the four §F fields a HF
+  // config.json never does — parameter counts, context length, shipped quantisations and the
+  // TP sizes people actually run — i.e. exactly what /huggingface/fetch reports as `missing`.
+  // Same egress hardening and audit trail; still a human-confirmed commit.
+  app.post('/api/v1/recipes/fetch', adminOnly(async (req, reply, id) => {
+    const parsed = z.object({ model_id: z.string().min(1).max(200) }).safeParse(req.body);
+    if (!parsed.success) return fail(reply, 422, 'validation', 'model_id required.');
+    const mid = parsed.data.model_id.trim()
+      .replace(/^https?:\/\/recipes\.vllm\.ai\//, '')
+      .replace(/^https?:\/\/huggingface\.co\//, '')
+      .replace(/\.json$/, '')
+      .replace(/^\/+|\/+$/g, '');
+    if (!/^[\w.-]+\/[\w.-]+$/.test(mid)) return fail(reply, 400, 'bad_request', 'Expected an owner/model id, e.g. zai-org/GLM-5.2.');
+    try {
+      const res = await fetchAllowlisted(`https://recipes.vllm.ai/${mid}.json`, RECIPE_HOSTS, 'vLLM recipes');
+      if (res.status === 404) return fail(reply, 502, 'not_found', `No vLLM recipe published for "${mid}".`);
+      if (!res.ok) return fail(reply, 502, 'not_found', `recipes.vllm.ai returned ${res.status} for "${mid}".`);
+      const doc = (await res.json()) as Record<string, unknown>;
+      const out = recipeToModel(doc as any);
+      store.audit({ actor_sub: id.sub, action: 'recipe.fetch', detail: mid }, now());
+      return reply.send({ model_id: mid, ...out });
+    } catch {
+      return fail(reply, 502, 'not_found', 'Could not reach recipes.vllm.ai (egress blocked or timed out).');
+    }
+  }));
+
   // ── Saved configurations (per-user, owner-scoped) — FR-27/28/29 ──
   const saveReq = z.object({ name: z.string().min(1).max(120), snapshot: z.record(z.string(), z.unknown()) });
   app.post('/api/v1/configs', authed(async (req, reply, id) => {
@@ -246,15 +273,19 @@ function cryptoId(): string {
 }
 
 /** Fetch from Hugging Face with SSRF-ish hardening (AD-19): timeout + final host must be HF. */
-async function fetchHf(url: string): Promise<Response> {
+/** Egress with a host allowlist enforced AFTER redirects (AD-19). */
+async function fetchAllowlisted(url: string, allowed: RegExp, label: string): Promise<Response> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 12_000);
   try {
     const res = await fetch(url, { signal: ctrl.signal, redirect: 'follow', headers: { 'user-agent': 'vllm-capacity-planner' } });
     const host = new URL(res.url).hostname;
-    if (!/(^|\.)huggingface\.co$|(^|\.)hf\.co$/.test(host)) throw new Error('redirected off Hugging Face');
+    if (!allowed.test(host)) throw new Error(`redirected off ${label}`);
     return res;
   } finally {
     clearTimeout(t);
   }
 }
+const HF_HOSTS = /(^|\.)huggingface\.co$|(^|\.)hf\.co$/;
+const RECIPE_HOSTS = /(^|\.)recipes\.vllm\.ai$/;
+const fetchHf = (url: string) => fetchAllowlisted(url, HF_HOSTS, 'Hugging Face');
