@@ -52,8 +52,24 @@ For Llama-3.3-70B the tail is 2 × 128,256 × 8,192 = **2.10 B parameters = 3.9 
 | INT4 (grouped, g=128) | 0.5 | **0.52** | fp16 scale + int4 zero per 128 weights |
 | MXFP4 (block=32) | 0.5 | **0.53125** | E8M0 scale per 32 weights |
 | NVFP4 (block=16) | 0.5 | **0.5625** | E4M3 scale per 16 weights |
+| GGUF Q8_0 | 1.0 | **1.06** | 8.5 real bits — whole-file average |
+| GGUF Q4_K_M | 0.5 | **0.61** | 4.9 real bits — mixes Q4_K and Q6_K per tensor |
+| GGUF IQ4_XS | 0.5 | **0.53125** | 4.25 real bits |
 
 When a model in the catalog carries no `hidden_size`/`vocab_size`, the engine falls back to the legacy `total × bytes × 1.02` estimate and the sizing view labels the result approximate. Hugging Face import fills all three fields automatically from `config.json`.
+
+### The GGUF trap
+
+Q4_K_M is **not** 4 bits. It mixes Q4_K and Q6_K tensor by tensor and lands near **4.9 effective bits**; assuming 4.0 undercounts a 70B model by roughly 8 GB. The GGUF figures above are whole-*file* averages measured across a finished checkpoint, and GGUF quantises the embedding layers too — so those quants **skip** the un-quantised-tail term rather than paying it twice:
+
+```
+GGUF weights = total params × effective bytes/param        (no tail term)
+other weights = (total − tail) × bytes/param + tail × 2
+```
+
+Cross-checks against published checkpoints: Llama-3.3-70B Q4_K_M → **43.1 GB**, Llama-3.1-8B Q4_K_M → **4.9 GB**. Both are pinned as acceptance vectors.
+
+GGUF is llama.cpp / Ollama territory; vLLM's support for it is experimental. The GGUF quants exist here because the catalog now includes consumer cards, where they are the dominant format — but note that this tool's overhead model (a 2.5 GiB reserve plus a ~10% paged-server utilisation cap) is tuned for vLLM. llama.cpp runs leaner, so single-card GGUF plans will read more pessimistically here than they behave in practice.
 
 ### Prefill activations
 
@@ -78,6 +94,20 @@ where *active tokens = context length × average utilisation*. The most sessions
 ```
 Max pod concurrency = floor( Free KV space / KV per session )
 ```
+
+### Local & global attention
+
+Not every layer attends over the whole context. Many models alternate **full-attention** layers with **sliding-window** layers that only look back a fixed number of tokens. Windowed layers' KV stops growing once the sequence passes the window:
+
+```
+KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) )
+```
+
+GPT-OSS-120B is the clearest case: 18 of its 36 layers are locally banded at 128 tokens. At 128K context that is **2.7 GiB** per request instead of **5.4 GiB** — and the difference between room for three concurrent requests on one H100 and a plan that looks dangerously tight with room for one. Gemma (one global layer every N) and Mistral v0.1 (every layer windowed) use the same idea with different patterns.
+
+Because the windowed layers stop growing, the per-token KV figure the app reports is an *effective average* over the request rather than a constant marginal rate. It still reconciles exactly: per-token × active tokens = per-request. A model with no window declared is treated as all-full-attention — the safe direction to be wrong in.
+
+`config.json` expresses this three ways, all of which the HF importer handles: `layer_types` (per-layer array), `sliding_window_pattern` (one global every N), or a bare `sliding_window` (every layer windowed).
 
 ## 4. Decode roofline throughput
 
@@ -115,7 +145,7 @@ Pod headroom = (Usable pod memory − Weights − KV per session) / Usable pod m
 Tight        = Pod headroom < 10%
 ```
 
-A tight plan is arithmetically feasible but has no margin for the ±5% weight estimate, allocator fragmentation, or a prompt longer than the modelled average — it is the configuration that passes a spreadsheet and then OOMs on launch. GPT-OSS-120B (MXFP4) on a single H100 at 128K context is the canonical example: ~59.5 GiB of weights against 69.5 GiB usable leaves 6.7% headroom and room for exactly one request.
+A tight plan is arithmetically feasible but has no margin for the ±5% weight estimate, allocator fragmentation, or a prompt longer than the modelled average — it is the configuration that passes a spreadsheet and then OOMs on launch. Qwen3-32B at Q4_K_M on a single RTX 4090 is the canonical example: 18.6 GiB of weights against 19.1 GiB usable leaves **0.9% headroom** at 4K context and room for exactly one request. Push the context to 8K and it needs TP2, where it is comfortable again.
 
 ## Notes
 

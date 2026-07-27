@@ -26,6 +26,9 @@ export const modelSchema = z
     hidden_size: z.number().int().positive().optional(),
     vocab_size: z.number().int().positive().optional(),
     tied_embeddings: z.boolean().optional(),
+    // Local/global attention — optional; both required together to cap KV on windowed layers.
+    sliding_window: z.number().int().positive().optional(),
+    full_attention_layers: z.number().int().min(0).optional(),
   })
   .superRefine((m, ctx) => {
     if (m.active_params_b > m.total_params_b) {
@@ -48,6 +51,14 @@ export const modelSchema = z
       if (tailB >= m.total_params_b) {
         ctx.addIssue({ code: 'custom', path: ['vocab_size'], message: 'embedding tail must be smaller than total_params_b — check hidden_size / vocab_size' });
       }
+    }
+    // Sliding-window geometry is all-or-nothing: a window with no layer split (or vice versa)
+    // cannot be applied, and would silently fall back to all-full-attention KV.
+    if ((m.sliding_window == null) !== (m.full_attention_layers == null)) {
+      ctx.addIssue({ code: 'custom', path: ['sliding_window'], message: 'sliding_window and full_attention_layers must be supplied together' });
+    }
+    if (m.full_attention_layers != null && m.full_attention_layers > m.layers) {
+      ctx.addIssue({ code: 'custom', path: ['full_attention_layers'], message: 'full_attention_layers must be ≤ layers' });
     }
   });
 

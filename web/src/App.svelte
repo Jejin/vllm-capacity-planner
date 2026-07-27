@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -58,6 +58,11 @@
   const kvPer = $derived(R ? (activePer * R.kv_per_request_gb) / R.tp : 0);
   const kvAlloc = $derived(R ? activePer * R.kv_per_request_gb : 0);
   const stacks = $derived(R ? Math.min(R.tp, 8) : 0);
+  // what this model's KV would cost if every layer were full-context — the comparison the
+  // sliding-window banner quotes, computed exactly rather than scaled from the layer ratio
+  const kvNominalGb = $derived(
+    model ? (kvPerTokenBytes(model, kvBytes) * ctx * util) / 2 ** 30 : 0,
+  );
   const pctOf = (n: number) => `${Math.max(0, Math.min(100, (n / (gpu?.mem_gb ?? 1)) * 100)).toFixed(1)}%`;
 
   // Concurrency rubric — sweep target concurrency at the current config (FR-12 / metrics).
@@ -175,12 +180,12 @@
   // ── Admin catalog forms (FR-2/3/4/6/7/8, validated via the shared §F schema) ──
   const QUANTS = ['FP16', 'FP8', 'INT8', 'INT4', 'MXFP4', 'NVFP4'];
   type Err = { path: string; message: string };
-  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false });
+  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '' });
   let mf = $state(blankModel());
   let mfEditing = $state(false);
   let mfErrors = $state<Err[]>([]);
   const errFor = (errs: Err[], p: string) => errs.find((e) => e.path === p)?.message;
-  function editModel(m: Model) { mf = { ...m, tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings } as any; mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
+  function editModel(m: Model) { mf = { ...m, tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '' } as any; mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
   function newModelForm() { mf = blankModel(); mfEditing = false; mfErrors = []; }
   function toggleQuant(q: string) { mf.quants = mf.quants.includes(q) ? mf.quants.filter((x) => x !== q) : [...mf.quants, q]; }
   async function saveModel() {
@@ -189,7 +194,11 @@
     const emb = mf.hidden_size !== '' && mf.vocab_size !== ''
       ? { hidden_size: +mf.hidden_size, vocab_size: +mf.vocab_size, tied_embeddings: !!mf.tied_embeddings }
       : {};
-    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb };
+    // same all-or-nothing rule for the sliding-window pair
+    const win = mf.sliding_window !== '' && mf.full_attention_layers !== ''
+      ? { sliding_window: +mf.sliding_window, full_attention_layers: +mf.full_attention_layers }
+      : {};
+    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...win };
     const r = await fetch(mfEditing ? `/api/v1/models/${mf.id}` : '/api/v1/models', { method: mfEditing ? 'PUT' : 'POST', headers: authH, body: JSON.stringify(body) });
     if (r.ok) { newModelForm(); loadCatalog(); notice = 'Model saved.'; }
     else { const e = await r.json(); mfErrors = e.error?.fields ?? [{ path: '', message: e.error?.message ?? 'Save failed.' }]; }
@@ -223,7 +232,7 @@
       const d = await r.json();
       hfCard = d; hfMissing = d.missing ?? [];
       const m = d.mapped ?? {};
-      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings };
+      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '' };
       mfEditing = false; mfErrors = [];
       notice = `Fetched ${d.model_id}. Review below, complete params / TP / quants (highlighted), then Create model.`;
       document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' });
@@ -285,7 +294,7 @@
     <section class="panel">
       <h2>Deployment inputs</h2>
       <label>Model<select bind:value={modelId}>{#each catalog.models as m}<option value={m.id}>{m.name}</option>{/each}</select></label>
-      <div class="meta">total {model?.total_params_b} B · active {model?.active_params_b} B · layers {model?.layers} · {model?.mla ? 'MLA (latent 576/layer)' : `GQA ${model?.kv_heads} KV-heads × ${model?.head_dim}`} · max ctx {((model?.max_ctx ?? 0) / 1024)}K · TP {`{${model?.tp_options.join(',')}}`}{#if model?.vocab_size && model?.hidden_size} · emb {model.vocab_size.toLocaleString()}×{model.hidden_size}{model.tied_embeddings ? ' (tied)' : ''}{/if}</div>
+      <div class="meta">total {model?.total_params_b} B · active {model?.active_params_b} B · layers {model?.layers} · {model?.mla ? 'MLA (latent 576/layer)' : `GQA ${model?.kv_heads} KV-heads × ${model?.head_dim}`} · max ctx {((model?.max_ctx ?? 0) / 1024)}K · TP {`{${model?.tp_options.join(',')}}`}{#if model?.vocab_size && model?.hidden_size} · emb {model.vocab_size.toLocaleString()}×{model.hidden_size}{model.tied_embeddings ? ' (tied)' : ''}{/if}{#if model?.sliding_window && model?.full_attention_layers != null} · <b>SWA {model.full_attention_layers}/{model.layers} full</b>, {model.sliding_window}-tok window{/if}</div>
       <div class="row"><label>Quantisation<select bind:value={quant}>{#each (model?.quants ?? []) as q}<option value={q}>{q}</option>{/each}</select></label>
         <label>KV dtype<select bind:value={kvBytes}><option value={1}>FP8 (1B)</option><option value={2}>FP16 (2B)</option></select></label></div>
       <div class="row"><label>Max context<select bind:value={ctx}>{#each ctxChoices as c}<option value={c}>{c / 1024}K</option>{/each}</select></label>
@@ -349,7 +358,7 @@
         <div class="panel">
           <h2>Breakdown</h2>
           <div class="li"><span>Weights ({effQuant})</span><b>{fmt(R.weights_gb)} GiB</b></div>
-          <div class="li"><span>KV per token ({kvBytes === 1 ? 'FP8' : 'FP16'})</span><b>{(R.kv_per_token_gb * 1024).toFixed(3)} MB</b></div>
+          <div class="li"><span>KV per token ({kvBytes === 1 ? 'FP8' : 'FP16'}{#if R.kv_windowed}, effective{/if})</span><b>{(R.kv_per_token_gb * 1024).toFixed(3)} MiB</b></div>
           <div class="li"><span>KV per request ({ctx / 1024}K × {Math.round(util * 100)}%)</span><b>{fmt(R.kv_per_request_gb)} GiB</b></div>
           <div class="li"><span>Concurrency per pod</span><b>{R.concurrency_per_pod} req</b></div>
           <div class="li"><span>Pods → GPUs → nodes ({perNode}/node)</span><b>{R.pods} → {R.gpus} → {R.nodes}</b></div>
@@ -385,6 +394,7 @@
           {#if fc?.kind === 'absent'}<div class="state warn"><b>Fleet check.</b> {gpu.name} is not in the defined fleet. Add a pool or switch SKU.</div>{/if}
         {/if}
         {#if R.tight}<div class="state warn"><b>Tight fit — {(R.headroom_fraction * 100).toFixed(1)}% headroom.</b> Weights + one request of KV leave under 10% of the pod's HBM free, so this plan has no margin for the ±5% weight estimate, fragmentation, or a longer prompt than modelled. It will likely OOM on a real vLLM launch. Drop context, quantise the KV cache, or move to the next TP size.</div>{/if}
+        {#if R.kv_windowed}<div class="state ok"><b>Local/global attention applied.</b> {model.full_attention_layers} of {model.layers} layers keep full context; the other {model.layers - (model.full_attention_layers ?? 0)} stop growing at {model.sliding_window} tokens. KV per request is <b>{fmt(R.kv_per_request_gb)} GiB</b> instead of the {fmt(kvNominalGb)} GiB an all-full-attention model of this shape would need — a {(kvNominalGb / R.kv_per_request_gb).toFixed(1)}× saving at this context.</div>{/if}
         {#if R.weights_estimated}<div class="state warn"><b>Weight estimate is approximate.</b> This model carries no embedding geometry, so the weights fall back to a flat overhead factor — optimistic by ~5–15% at INT4/MXFP4, where the 16-bit embedding and lm_head are a large share of the checkpoint. Add <code>hidden_size</code> and <code>vocab_size</code> in the model catalog to sharpen it.</div>{/if}
         {#if R.multi_node}<div class="state warn"><b>TP {R.tp} &gt; {perNode} GPUs/node:</b> this replica spans nodes — needs NVLink/IB fabric; latency &amp; MBU degrade vs single-node TP.</div>{/if}
         {#if util >= 1}<div class="state warn">Sizing at 100% context utilisation buys worst-case memory that mostly sits idle. Size KV at P95 of observed sequence length.</div>{/if}
@@ -502,6 +512,7 @@
             <div><span>TP options</span><b>{m.tp_options.join(', ')}</b></div>
             <div><span>Quants</span><b>{m.quants.join(', ')}</b></div>
             <div><span>Embedding</span><b>{m.vocab_size && m.hidden_size ? `${m.vocab_size.toLocaleString()} × ${m.hidden_size}${m.tied_embeddings ? ' tied' : ''}` : '— (est.)'}</b></div>
+            <div><span>Attention</span><b>{m.sliding_window && m.full_attention_layers != null ? `${m.full_attention_layers}/${m.layers} full · ${m.sliding_window}-tok window` : 'all full-context'}</b></div>
           </div>
           {#if ident.role === 'admin'}<div class="mcard-f"><button class="btn ghost" onclick={() => editModel(m)}>edit</button> <button class="btn ghost danger" onclick={() => deleteModelUi(m.id)}>delete</button></div>{/if}
         </div>
@@ -546,7 +557,14 @@
         <label>Vocab size<small> (config.json)</small><input type="number" bind:value={mf.vocab_size} placeholder="128256" /></label>
         <label style="display:flex;align-items:center;gap:8px;margin-top:24px"><input type="checkbox" style="width:auto" bind:checked={mf.tied_embeddings} />Tied embeddings</label>
       </div>
-      <div class="hint">Optional but recommended: the embedding table and lm_head stay at 16-bit through quantisation. Supplying these sizes the un-quantised tail exactly instead of a flat overhead factor — worth 10%+ of the footprint at INT4/MXFP4.</div>
+      <div class="hint">Optional but recommended: the embedding table and lm_head stay at 16-bit through quantisation. Supplying these sizes the un-quantised tail exactly instead of a flat overhead factor — worth 10%+ of the footprint at INT4/MXFP4. <em>Not used for GGUF quants (Q4_K_M, Q8_0, IQ4_XS), whose published bytes/param already include the embedding layers.</em></div>
+      <div class="row3">
+        <label>Sliding window<small> (tokens)</small><input type="number" bind:value={mf.sliding_window} placeholder="128" /></label>
+        <label>Full-attention layers<small> (rest windowed)</small><input type="number" bind:value={mf.full_attention_layers} placeholder="18" /></label>
+      </div>
+      <div class="hint">Leave both blank for a normal full-context model. If the model alternates local and global attention (GPT-OSS, Gemma, Mistral v0.1), the windowed layers stop accumulating KV at the window — for GPT-OSS-120B at 128K that halves the cache. From <code>config.json</code>: <code>sliding_window</code> plus <code>layer_types</code> or <code>sliding_window_pattern</code>.</div>
+      {#if errFor(mfErrors, 'sliding_window')}<div class="ferr">{errFor(mfErrors, 'sliding_window')}</div>{/if}
+      {#if errFor(mfErrors, 'full_attention_layers')}<div class="ferr">{errFor(mfErrors, 'full_attention_layers')}</div>{/if}
       {#if errFor(mfErrors, 'vocab_size')}<div class="ferr">{errFor(mfErrors, 'vocab_size')}</div>{/if}
       {#if errFor(mfErrors, 'hidden_size')}<div class="ferr">{errFor(mfErrors, 'hidden_size')}</div>{/if}
       <div class="row3">
@@ -604,7 +622,11 @@
       <tr><td>INT4 (grouped, g=128)</td><td class="num">0.5</td><td class="num">0.52</td><td>fp16 scale + int4 zero per 128 weights</td></tr>
       <tr><td>MXFP4 (block=32)</td><td class="num">0.5</td><td class="num">0.53125</td><td>E8M0 scale per 32 weights</td></tr>
       <tr><td>NVFP4 (block=16)</td><td class="num">0.5</td><td class="num">0.5625</td><td>E4M3 scale per 16 weights</td></tr>
+      <tr><td>GGUF Q8_0</td><td class="num">1.0</td><td class="num">1.06</td><td>8.5 real bits — whole-file average</td></tr>
+      <tr><td>GGUF Q4_K_M</td><td class="num">0.5</td><td class="num">0.61</td><td>4.9 real bits — mixes Q4_K and Q6_K per tensor</td></tr>
+      <tr><td>GGUF IQ4_XS</td><td class="num">0.5</td><td class="num">0.53125</td><td>4.25 real bits</td></tr>
     </tbody></table>
+    <p class="note"><b>The GGUF trap.</b> Q4_K_M is not 4 bits. It mixes Q4_K and Q6_K tensor by tensor and lands near <b>4.9 effective bits</b>; assuming 4.0 undercounts a 70B model by about 8 GB. The three GGUF figures are whole-<em>file</em> averages measured across a finished checkpoint — GGUF quantises the embedding layers too, so those quants skip the 16-bit tail term below rather than paying it twice. GGUF is llama.cpp / Ollama territory; vLLM's support for it is experimental.</p>
     <p class="note">Models in the catalog without <code>hidden_size</code>/<code>vocab_size</code> fall back to the legacy <code>total × bytes × 1.02</code> estimate, and the sizing view labels the result approximate. Hugging Face import fills all three fields from <code>config.json</code>.</p>
 
     <h2 class="dh">3 · KV cache &amp; concurrency</h2>
@@ -635,9 +657,15 @@
     <h2 class="dh">6 · Fits · tight · infeasible</h2>
     <p>A plan is <b>infeasible</b> when weights plus <em>one</em> request's KV can't fit even at the largest permitted TP size. Between that and a comfortable fit sits a band worth naming:</p>
     <div class="formula">Pod headroom = <span class="frac"><span class="fnum">Usable pod memory − Weights − KV per session</span><span class="fden">Usable pod memory</span></span> · Tight = headroom &lt; 10%</div>
-    <p>A <b>tight</b> plan is arithmetically feasible but has no margin for the ±5% weight estimate, allocator fragmentation, or a prompt longer than the modelled average — the configuration that passes a spreadsheet and then OOMs on launch. GPT-OSS-120B (MXFP4) on a single H100 at 128K context is the canonical case: ~59.5 GiB of weights against 69.5 GiB usable leaves 6.7% headroom and room for exactly one request.</p>
+    <p>A <b>tight</b> plan is arithmetically feasible but has no margin for the ±5% weight estimate, allocator fragmentation, or a prompt longer than the modelled average — the configuration that passes a spreadsheet and then OOMs on launch. Qwen3-32B at Q4_K_M on a single RTX 4090 is the canonical case: 18.6 GiB of weights against 19.1 GiB usable leaves <b>0.9% headroom</b> at 4K context and room for exactly one request. Push the context to 8K and it needs TP2, where it is comfortable again.</p>
 
-    <h2 class="dh">7 · A note on units</h2>
+    <h2 class="dh">7 · Local &amp; global attention</h2>
+    <p>Not every layer attends over the whole context. Many models alternate <b>full-attention</b> layers with <b>sliding-window</b> layers that only ever look back a fixed number of tokens. The windowed layers' KV stops growing once the sequence passes the window, so long-context KV falls well below the naive all-layers-full figure:</p>
+    <div class="formula">KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) )</div>
+    <p>GPT-OSS-120B is the clearest case in this catalog: 18 of its 36 layers are locally banded at 128 tokens. At 128K context that is the difference between <b>2.7 GiB</b> and <b>5.4 GiB</b> per request — and the difference between a plan with room for three concurrent requests on one H100 and a plan that looks dangerously tight with room for one. Gemma (one global layer every N) and Mistral v0.1 (every layer windowed) use the same trick with different patterns.</p>
+    <p class="note">Because the windowed layers stop growing, the per-token KV figure shown on the Sizing tab is an <em>effective average</em> over the whole request, not a constant marginal rate. It still reconciles exactly: per-token × active tokens = per-request. Models with no window declared are treated as all-full-attention, which is the safe direction to be wrong in.</p>
+
+    <h2 class="dh">8 · A note on units</h2>
     <p>Every memory figure in this tool is <b>GiB = 2³⁰ bytes</b> — the unit <code>nvidia-smi</code> reports and the one <code>gpu_memory_utilization</code> is applied against. Parameter counts are in billions (10⁹), so weights are converted explicitly: <code>params × bytes/param × 10⁹ ÷ 2³⁰</code>. Skipping that conversion (a common shortcut) makes weights read <b>7.4% larger</b> than they are relative to GPU capacity — conservative, but wrong, and it compounds against a KV figure that <em>was</em> converted.</p>
     <p class="note">Bandwidth is the exception: <code>bw_tbs</code> is decimal TB/s (10¹² B/s), as vendors quote it. The roofline therefore converts memory to raw bytes before dividing, rather than mixing the two scales.</p>
 
