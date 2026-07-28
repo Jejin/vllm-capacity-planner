@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { topologyLayout } from '../topology.js';
+import { topologyLayout, topologySvg, escapeSvgText } from '../topology.js';
 import { computeSizing } from '../engine.js';
 import { seedCatalog } from '../seed.js';
 import type { FeasibleSizing } from '../types.js';
@@ -79,5 +79,64 @@ describe('topology layout', () => {
     const one = topologyLayout(size('gptoss-120b', 'h200', { quant: 'MXFP4', selected_ctx: 131072, target_concurrency: 8, gpus_per_node: 8 }), 8);
     expect(one.multi).toBe(false);
     expect(one.storeY - one.switchY).toBeLessThan(56); // no switch band reserved
+  });
+});
+
+describe('topology SVG rendering', () => {
+  const render = (m: string, g: string, per: number, o: any, over: any = {}) => {
+    const r = size(m, g, { gpus_per_node: per, ...o });
+    const t = topologyLayout(r, per);
+    return topologySvg(t, {
+      tp: r.tp, perNode: per, multiNode: r.multi_node,
+      storeLabel: `shared weights · ${r.weights_gb.toFixed(1)} GiB per replica`,
+      desc: 'test', ...over,
+    });
+  };
+
+  it('marks a node-spanning replica and heats the fabric — only when it spans', () => {
+    const spanning = render('kimi-k3', 'h200', 8, { quant: 'MXFP4', selected_ctx: 1048576, target_concurrency: 8 });
+    expect(spanning).toContain('tbox pod spanning');
+    expect(spanning).toContain('tbox sw hot');
+    expect(spanning).toContain('tlink fabric');
+    expect(spanning).toContain('⚠');
+
+    const contained = render('llama33-70b', 'h200', 8, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64 });
+    expect(contained).not.toContain('spanning');
+    expect(contained).not.toContain('sw hot');
+    expect(contained).not.toContain('⚠');
+  });
+
+  it('omits the fabric entirely on a single node', () => {
+    const one = render('gptoss-120b', 'h200', 8, { quant: 'MXFP4', selected_ctx: 131072, target_concurrency: 8 });
+    expect(one).not.toContain('InfiniBand');
+    expect(one).toContain('shared weights');
+  });
+
+  it('escapes text — catalogue labels are admin-editable', () => {
+    expect(escapeSvgText('a & b')).toBe('a &amp; b');
+    expect(escapeSvgText('<script>x</script>')).toBe('&lt;script&gt;x&lt;/script&gt;');
+    const svg = render('llama33-70b', 'h200', 8, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64 },
+      { storeLabel: '<script>alert(1)</script>', desc: 'a & b' });
+    expect(svg).not.toContain('<script>');
+    expect(svg).toContain('&lt;script&gt;');
+    expect(svg).toContain('a &amp; b');
+  });
+
+  it('carries an accessible name and a prose description', () => {
+    const svg = render('llama33-70b', 'h200', 8, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64 });
+    expect(svg).toContain('role="img"');
+    expect(svg).toContain('<title');
+    expect(svg).toContain('<desc');
+    expect(svg).toContain('aria-labelledby');
+  });
+
+  it('is well-formed and sized to the layout', () => {
+    const r = size('llama33-70b', 'h200', { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64, gpus_per_node: 8 });
+    const t = topologyLayout(r, 8);
+    const svg = topologySvg(t, { tp: r.tp, perNode: 8, multiNode: r.multi_node, storeLabel: 'x', desc: 'y' });
+    expect(svg.startsWith('<svg')).toBe(true);
+    expect(svg.endsWith('</svg>')).toBe(true);
+    expect(svg).toContain(`viewBox="0 0 ${t.width} ${t.height}"`);
+    expect((svg.match(/<rect/g) ?? []).length).toBeGreaterThanOrEqual(t.gpus.length);
   });
 });

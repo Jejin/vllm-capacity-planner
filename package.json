@@ -16,6 +16,7 @@
     "build": "npm run build -w domain && npm run build -w server && npm run build -w web",
     "test:domain": "npm run test -w domain",
     "vercel-build": "npm run build -w web",
-    "test:docs": "node scripts/methodology-parity.mjs"
+    "test:docs": "node scripts/methodology-parity.mjs",
+    "preview:topology": "npm run build -w domain --silent && node scripts/preview-topology.mjs"
   }
 }

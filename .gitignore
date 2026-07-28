@@ -10,3 +10,5 @@ server/data/
 *.sqlite-*
 .vercel
 .env*
+# headless render output
+.preview/
