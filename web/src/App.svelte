@@ -60,8 +60,18 @@
 
   // per-replica HBM split (matches the prototype)
   const activePer = $derived(R ? Math.min(R.concurrency_per_pod, Math.ceil(conc / R.pods)) : 0);
+  // Per-GPU HBM, decomposed so the parts sum to the physical card. The old chart drew
+  // "everything that isn't weights or KV" and called it Reserve — silently merging the runtime
+  // reserve, the gpu-memory-utilization headroom, and unallocated KV space. The middle one is
+  // the largest and the only one the operator can reclaim, so hiding it is the worst of three.
   const wPer = $derived(R ? R.weights_gb / R.tp : 0);
   const kvPer = $derived(R ? (activePer * R.kv_per_request_gb) / R.tp : 0);
+  /** Usable-but-unallocated KV space — room for more sessions at this exact config. */
+  const kvFreePer = $derived(R ? Math.max(0, R.free_gb / R.tp - kvPer) : 0);
+  /** vLLM's own overhead: CUDA context, collectives, prefill activations. */
+  const reservePer = $derived(R ? R.runtime_reserve_gb : 0);
+  /** Withheld by gpu-memory-utilization — recoverable by raising it, at OOM risk. */
+  const utilHeadroomPer = $derived(gpu ? gpu.mem_gb * (1 - memUtil) : 0);
   const kvAlloc = $derived(R ? activePer * R.kv_per_request_gb : 0);
   const stacks = $derived(R ? Math.min(R.tp, 8) : 0);
 
@@ -411,15 +421,24 @@
               <div class="gpu">
                 <div class="stack">
                   <div class="seg w" style="height:{pctOf(wPer)}" title="Weights {fmt(wPer)} GiB"></div>
-                  <div class="seg k" style="height:{pctOf(kvPer)}" title="KV {fmt(kvPer)} GiB"></div>
-                  <div class="seg r" style="height:{pctOf(Math.max(0, gpu.mem_gb - wPer - kvPer))}" title="Reserve"></div>
+                  <div class="seg k" style="height:{pctOf(kvPer)}" title="KV in use {fmt(kvPer)} GiB"></div>
+                  <div class="seg kf" style="height:{pctOf(kvFreePer)}" title="KV free {fmt(kvFreePer)} GiB — room for more sessions"></div>
+                  <div class="seg r" style="height:{pctOf(reservePer)}" title="Runtime reserve {fmt(reservePer, 2)} GiB"></div>
+                  <div class="seg u" style="height:{pctOf(utilHeadroomPer)}" title="Withheld by gpu-memory-utilization {fmt(utilHeadroomPer)} GiB"></div>
                 </div>
                 <div class="cap">GPU {i}<br>{gpu.mem_gb} GiB</div>
               </div>
             {/each}
             {#if R.tp > 8}<div class="more">+{R.tp - 8}<br>more</div>{/if}
           </div>
-          <div class="legend"><span><i class="w"></i>Weights {fmt(wPer)} GiB</span><span><i class="k"></i>KV {fmt(kvPer)} GiB</span><span><i class="r"></i>Reserve {fmt(Math.max(0, gpu.mem_gb - wPer - kvPer))} GiB</span></div>
+          <div class="legend">
+            <span><i class="w"></i>Weights {fmt(wPer)} GiB</span>
+            <span><i class="k"></i>KV in use {fmt(kvPer)} GiB</span>
+            <span><i class="kf"></i>KV free {fmt(kvFreePer)} GiB</span>
+            <span><i class="r"></i>Runtime reserve {fmt(reservePer, 2)} GiB</span>
+            <span><i class="u"></i>Withheld by mem-util {fmt(utilHeadroomPer)} GiB</span>
+          </div>
+          <p class="tot">The five segments sum to the card's {gpu.mem_gb} GiB. <b>KV free</b> is usable right now — it is what more concurrency would consume. <b>Withheld by mem-util</b> is the {Math.round((1 - memUtil) * 100)}% this plan never hands to vLLM; raising <code>--gpu-memory-utilization</code> reclaims it, at the cost of the margin that keeps the server off an OOM.</p>
           <p class="replnote">This model runs as <b>{R.pods}</b> identical replica{R.pods > 1 ? 's' : ''} → {R.pods} × TP{R.tp} = <b>{R.gpus}</b> GPUs total{#if R.tp > 8} (showing 8 of {R.tp} GPUs in the replica){/if}.</p>
         </div>
 
@@ -746,6 +765,8 @@
     <h2 class="dh">1 · Hardware memory modelling</h2>
     <p>Start with how much high-bandwidth memory (HBM) the inference engine (e.g. vLLM) may actually use. The <code>gpu_memory_utilization</code> factor caps it; a fixed runtime reserve is subtracted to prevent out-of-memory (OOM) failures.</p>
     <div class="formula">Usable VRAM per GPU = (Physical capacity × Utilisation) − Runtime reserve</div>
+    <p>Every GPU's HBM divides into five parts that sum to the card, and the Sizing tab draws them that way: <b>weights</b> (this replica's shard), <b>KV in use</b> (the sessions actually placed), <b>KV free</b> (usable now — what more concurrency would consume), <b>runtime reserve</b> (vLLM's own overhead), and <b>withheld by mem-util</b> (the slice never handed to vLLM). Only the last is recoverable by changing a flag, and only by giving up the margin that keeps the server off an OOM. Collapsing the last three into one "reserve" figure hides that, and makes a 141 GiB card look like it carries 20 GiB of untouchable overhead when 14 of it is a slider position.</p>
+
     <p>Tensor Parallelism (TP) splits one model replica across several GPUs; their usable memory pools linearly:</p>
     <div class="formula">Usable pod memory = Usable VRAM per GPU × TP size</div>
 
@@ -928,11 +949,17 @@
   .hbm{display:flex;gap:10px;align-items:flex-end;padding:6px 2px 0;overflow-x:auto}
   .gpu{display:flex;flex-direction:column;align-items:center;min-width:52px}
   .stack{width:44px;height:168px;border:1.5px solid var(--ink);border-radius:3px;display:flex;flex-direction:column-reverse;overflow:hidden;background:repeating-linear-gradient(0deg,var(--surface2),var(--surface2) 9px,var(--line2) 9px,var(--line2) 10px)}
-  .seg.w{background:var(--slate)}.seg.k{background:var(--purple)}.seg.r{background:var(--grey)}
+  /* Unused-but-available space is an outline of its own family rather than a new hue: it
+     distinguishes by texture, which survives colour-blindness and greyscale printing. */
+  .seg.w{background:var(--slate)}
+  .seg.k{background:var(--purple)}
+  .seg.kf{background:transparent;box-shadow:inset 0 0 0 1.5px var(--purple)}
+  .seg.r{background:var(--grey)}
+  .seg.u{background:transparent;box-shadow:inset 0 0 0 1.5px var(--line)}
   .gpu .cap{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--ink3);margin-top:5px;text-align:center;line-height:1.3}
   .more{font-size:11px;color:var(--ink3);align-self:center}
   .legend{display:flex;gap:16px;margin-top:10px;font-size:11.5px;color:var(--ink2);flex-wrap:wrap}
-  .legend span{display:inline-flex;align-items:center;gap:6px}.legend i{width:11px;height:11px;border-radius:2px;display:inline-block}.legend i.w{background:var(--slate)}.legend i.k{background:var(--purple)}.legend i.r{background:var(--grey)}
+  .legend span{display:inline-flex;align-items:center;gap:6px}.legend i{width:11px;height:11px;border-radius:2px;display:inline-block}.legend i.w{background:var(--slate)}.legend i.k{background:var(--purple)}.legend i.r{background:var(--grey)}.legend i.kf{background:transparent;box-shadow:inset 0 0 0 1.5px var(--purple)}.legend i.u{background:transparent;box-shadow:inset 0 0 0 1.5px var(--line)}
   .li{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line2);font-size:13px}.li:last-child{border-bottom:none}.li span{color:var(--ink2)}.li b{font-family:'IBM Plex Mono',monospace}
   .state{border-radius:7px;padding:11px 13px;margin-bottom:10px;font-size:12.5px;border:1px solid;line-height:1.5}
   .state.ok{background:var(--okbg);border-color:var(--brand);color:var(--brandink)}.state.warn{background:var(--warnbg);border-color:var(--warnln);color:var(--warn)}.state.err{background:var(--errbg);border-color:var(--errln);color:var(--err)}

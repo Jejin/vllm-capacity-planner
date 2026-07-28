@@ -14,6 +14,18 @@ How much high-bandwidth memory (HBM) the inference engine (e.g. vLLM) may use. T
 Usable VRAM per GPU = (Physical capacity × Utilisation) − Runtime reserve
 ```
 
+Every GPU's HBM therefore divides into five parts that sum to the card, and the sizing view draws them that way:
+
+| slice | what it is |
+|---|---|
+| **Weights** | this replica's shard of the model |
+| **KV in use** | cache for the sessions the plan actually places |
+| **KV free** | usable now — what more concurrency would consume |
+| **Runtime reserve** | vLLM's own overhead: CUDA context, collectives, prefill activations |
+| **Withheld by mem-util** | the `1 − gpu_memory_utilization` slice never handed to vLLM |
+
+Only the last is recoverable by changing a flag, and only at the cost of the margin that keeps the server off an OOM. Collapsing the last three into one "reserve" figure — as this tool originally did — hides that distinction and makes a 141 GiB card look like it has 20 GiB of untouchable overhead when 14 of it is a slider position.
+
 Tensor Parallelism (TP) splits one replica across GPUs; their usable memory pools linearly:
 
 ```

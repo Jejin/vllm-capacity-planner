@@ -278,6 +278,48 @@ describe('§C time to first token (prefill)', () => {
   });
 });
 
+// The per-GPU allocation chart is a part-to-whole composition, so its parts must actually sum
+// to the card. The original chart drew "everything that is not weights or KV" as one segment
+// labelled Reserve, which merged three unrelated quantities and hid the largest.
+describe('§C per-GPU HBM decomposition', () => {
+  const base = {
+    quant: 'FP16' as const, kv_dtype_bytes: 1, selected_ctx: 1048576, avg_context_utilisation: 0.6,
+    target_concurrency: 124, mem_util_fraction: 0.9, gpus_per_node: 8,
+  };
+
+  it('AC-58 — weights + KV + free KV + reserve + withheld = the physical card', () => {
+    const g = gpu('h200');
+    const r = computeSizing(model('glm52'), g, base) as FeasibleSizing;
+    const activePer = Math.min(r.concurrency_per_pod, Math.ceil(base.target_concurrency / r.pods));
+
+    const weights = r.weights_gb / r.tp;
+    const kvInUse = (activePer * r.kv_per_request_gb) / r.tp;
+    const kvFree = r.free_gb / r.tp - kvInUse;
+    const reserve = r.runtime_reserve_gb;
+    const withheld = g.mem_gb * (1 - base.mem_util_fraction);
+
+    expect(kvFree).toBeGreaterThanOrEqual(0);
+    expect(weights + kvInUse + kvFree + reserve + withheld).toBeCloseTo(g.mem_gb, 6);
+  });
+
+  it('AC-59 — the withheld slice tracks gpu-memory-utilization, and is the reclaimable one', () => {
+    const g = gpu('h200');
+    const tight = computeSizing(model('glm52'), g, base) as FeasibleSizing;
+    const loose = computeSizing(model('glm52'), g, { ...base, mem_util_fraction: 0.98 }) as FeasibleSizing;
+    expect(g.mem_gb * (1 - 0.98)).toBeLessThan(g.mem_gb * (1 - 0.9));
+    // reclaiming it turns into usable space, hence more sessions per pod
+    expect(loose.usable_gb).toBeGreaterThan(tight.usable_gb);
+    expect(loose.concurrency_per_pod).toBeGreaterThanOrEqual(tight.concurrency_per_pod);
+  });
+
+  it('AC-60 — the runtime reserve is its own slice, not folded into the leftover', () => {
+    const r = computeSizing(model('glm52'), gpu('h200'), base) as FeasibleSizing;
+    expect(r.runtime_reserve_gb).toBe(RUNTIME_GB); // default chunk => the floor
+    const big = computeSizing(model('glm52'), gpu('h200'), { ...base, max_num_batched_tokens: 65536 }) as FeasibleSizing;
+    expect(big.runtime_reserve_gb).toBeGreaterThan(r.runtime_reserve_gb); // and it moves
+  });
+});
+
 // Mixed-precision checkpoints. Frontier low-bit releases rarely quantise everything: NVIDIA's
 // ModelOpt GLM-5.2 card says "only MoE expert linears are quantized to NVFP4". A single
 // bytes/param cannot express that, so a model may declare its dense remainder.
