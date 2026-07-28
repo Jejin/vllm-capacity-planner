@@ -30,11 +30,13 @@ npm run dev -w web            # (optional) SPA hot-reload on :5173
 - **Validation rules** → `domain/src/schema.ts` (shared by client + server).
 - **A new API endpoint** → `server/src/app.ts` (+ an integration test in `server/src/__tests__/api.test.ts`).
 - **UI** → `web/src/App.svelte`.
+- **Methodology** → **both** `docs/METHODOLOGY.md` and the in-app Methodology tab in `web/src/App.svelte`. `npm test` fails if the two stop documenting the same sections in the same order — see below.
 
 ## Guidelines
 
 - **Keep the engine pure and tested.** Every sizing change ships with a test.
 - **One source of truth.** Don't duplicate a formula or a validation rule between client and server — put it in `domain/`.
+- **Document the methodology in both places.** The methodology exists twice: as `docs/METHODOLOGY.md` and as the in-app tab. They drifted apart once — a section that was §7 in the app was a §3 subsection in the doc, and a cross-reference pointed at a section that had moved. `scripts/methodology-parity.mjs` now asserts they carry the same headings in the same order, with contiguous numbering, and runs as part of `npm test`. It compares structure, not prose; keeping the words in sync is still on you.
 - **Estimates are estimates.** The model is a first-order roofline; if you tighten it, say what it now assumes and keep the ± caveats honest.
 - Run `npm test` and `npm run build -w web` before opening a PR. CI runs both.
 
