@@ -55,6 +55,8 @@
   const result = $derived(computeSizing(model, gpu, sizingInput));
   const R = $derived(result.ok ? (result as FeasibleSizing) : null);
   const fmt = (x: number, d = 1) => (x >= 1000 ? Math.round(x).toLocaleString() : x.toFixed(d));
+  /** TTFT spans milliseconds to tens of seconds; show whichever unit is readable. */
+  const ttftLabel = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
 
   // per-replica HBM split (matches the prototype)
   const activePer = $derived(R ? Math.min(R.concurrency_per_pod, Math.ceil(conc / R.pods)) : 0);
@@ -381,6 +383,7 @@
           <div class="kpi p"><div class="v">{R.pods}<small> × TP{R.tp}</small></div><div class="l">Pods</div></div>
           <div class="kpi a"><div class="v">{fmt(kvAlloc)}<small> GiB</small></div><div class="l">KV cache</div></div>
           <div class="kpi g"><div class="v">~{R.throughput_tokens_per_sec.toLocaleString()}</div><div class="l">Tokens/s</div><div class="cav">±40% · not a commitment</div></div>
+          <div class="kpi t"><div class="v">{ttftLabel(R.ttft_ms)}</div><div class="l">Time to first token</div><div class="cav">±50% · {R.ttft_compute_bound ? 'compute-bound' : 'bandwidth floor'}</div></div>
         </div>
 
         <div class="panel">
@@ -433,7 +436,8 @@
           <div class="li"><span>Runtime reserve / GPU <small>(context {R.runtime_reserve_gb > 2.5 ? '+ prefill activations' : ''})</small></span><b>{fmt(R.runtime_reserve_gb, 2)} GiB{#if R.activation_gb > 0.05}<small> · {fmt(R.activation_gb, 2)} act</small>{/if}</b></div>
           <div class="li"><span>Usable HBM per GPU ({memUtil})</span><b>{fmt(R.usable_gb)} GiB</b></div>
           <div class="li"><span>Pod headroom <small>(free after weights + 1 request)</small></span><b class:tightv={R.tight}>{(R.headroom_fraction * 100).toFixed(1)}%</b></div>
-          <div class="li"><span>Time to first token <small>(indicative, prefill)</small></span><b>~{R.ttft_ms} ms <small>±50%</small></b></div>
+          <div class="li"><span>Time to first token <small>({R.ttft_compute_bound ? 'compute-bound prefill' : 'bandwidth floor'})</small></span><b>~{ttftLabel(R.ttft_ms)} <small>±50%</small></b></div>
+          <div class="li"><span>Prefill work <small>({Math.round(ctx * util).toLocaleString()} tokens)</small></span><b>{R.prefill_pflops.toFixed(2)} PFLOP</b></div>
           <div class="li"><span>Decode throughput / request</span><b>~{R.decode_tps_per_request} tok/s</b></div>
           <div class="li"><span>Aggregate throughput</span><b>~{R.throughput_tokens_per_sec.toLocaleString()} tok/s <small>±40%</small></b></div>
         </div>
@@ -458,7 +462,7 @@
               <tr class:cur={s.concurrency === conc} class:infeasible={!s.feasible}>
                 <td class="num">{s.concurrency}</td>
                 {#if s.feasible}
-                  <td class="num">{s.gpus}{#if s.tight}<span class="badge tightb" title="under 10% pod headroom">tight</span>{/if}</td><td class="num">{s.pods} × TP{s.tp}</td><td class="num">~{s.ttft_ms} ms</td><td class="num">~{s.decode_tps_per_request}</td><td class="num">~{s.throughput_tokens_per_sec.toLocaleString()}</td>
+                  <td class="num">{s.gpus}{#if s.tight}<span class="badge tightb" title="under 10% pod headroom">tight</span>{/if}</td><td class="num">{s.pods} × TP{s.tp}</td><td class="num">~{ttftLabel(s.ttft_ms)}</td><td class="num">~{s.decode_tps_per_request}</td><td class="num">~{s.throughput_tokens_per_sec.toLocaleString()}</td>
                   <td>{#if s.concurrency !== conc}<button class="btn ghost" onclick={() => (conc = s.concurrency)}>use</button>{:else}<span class="badge">current</span>{/if}</td>
                 {:else}
                   <td class="num" colspan="5" style="color:var(--err)">infeasible at this concurrency</td><td></td>
@@ -788,6 +792,13 @@
     <div class="formula">Aggregate throughput (tok/s) = <span class="frac"><span class="fnum">Effective pod bandwidth</span><span class="fden">Data read per step</span></span> × Active sequences</div>
     <p class="note">Effective pod bandwidth = TP size × per-GPU bandwidth × MBU. The calculator also reports <b>time-to-first-token</b> (an indicative prefill estimate) and <b>per-request</b> tokens/s. For MoE models, only the <em>active</em> parameters are read per step.</p>
 
+    <h3 class="dh3">Time to first token is a different problem</h3>
+    <p>Decode is memory-bound; <b>prefill is not</b>. It runs the entire prompt through the network before emitting a token, so TTFT is bounded by arithmetic:</p>
+    <div class="formula">prefill FLOPs = 2 × active params × tokens + 4 × hidden × ( full × tokens² + windowed × tokens × window + linear × tokens )</div>
+    <div class="formula">TTFT = max( prefill FLOPs ÷ (TP × TFLOPS × speedup × MFU) , weight-streaming time )</div>
+    <p>The attention term is not a correction — it is usually the larger half. Llama-3.3-70B prefilling 78,643 tokens spends <b>16.2 PFLOPs on attention against 11.1 on the matmuls</b>. Long-context TTFT is an attention problem, which is why the layer regimes matter here as much as for KV: a sliding-window layer costs <code>tokens × window</code> rather than <code>tokens²</code>, making GPT-OSS-120B's prefill <b>38% cheaper</b> than the same shape with full attention.</p>
+    <p class="note">Prefill MFU is taken as 0.4. Sub-16-bit formats get a 2× tensor-core speedup, capped there even for 4-bit — Blackwell does better, but the catalog does not track GPU generation and under-promising TTFT is the safe direction. A SKU with no FLOPS figure falls back to the weight-streaming floor and is labelled as such rather than presented as a prefill estimate.</p>
+
     <h2 class="dh">5 · Worked example — Llama 3.3 70B</h2>
     <p>Host Llama 3.3 70B Instruct at FP8 · 10 concurrent sessions · 128K context at 60% utilisation · on 2× H200 (TP2). <span class="note-i">Reproduce it on the Sizing tab.</span></p>
     <div class="steps2">
@@ -876,9 +887,9 @@
   .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
   .meta{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink2);background:var(--surface2);border:1px dashed var(--line);border-radius:5px;padding:8px 10px;margin-top:8px;line-height:1.6}
   .full{margin-top:14px;width:100%}
-  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}@media(max-width:620px){.kpis{grid-template-columns:1fr 1fr}}
+  .kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px}@media(max-width:980px){.kpis{grid-template-columns:repeat(3,1fr)}}@media(max-width:620px){.kpis{grid-template-columns:1fr 1fr}}
   .kpi{background:var(--surface);border:1px solid var(--line);border-top:3px solid var(--brand);border-radius:6px;padding:12px 13px;box-shadow:0 1px 2px rgba(21,24,26,.05)}
-  .kpi.p{border-top-color:var(--purple)}.kpi.a{border-top-color:var(--warnln)}.kpi.g{border-top-color:var(--brandink)}
+  .kpi.p{border-top-color:var(--purple)}.kpi.a{border-top-color:var(--warnln)}.kpi.g{border-top-color:var(--brandink)}.kpi.t{border-top-color:var(--slate)}
   .kpi .v{font-family:'IBM Plex Mono',monospace;font-size:23px;font-weight:600;line-height:1.05}.kpi small{font-size:12px;color:var(--ink3);font-weight:500}
   .kpi .l{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink3);margin-top:4px;font-weight:600}.kpi .cav{font-size:9.5px;color:var(--warn);margin-top:2px;font-weight:600}
   .kpi.tight{border-top-color:var(--warnln)}

@@ -175,6 +175,23 @@ Aggregate throughput       = (Effective pod bandwidth / Data read per step) × A
 
 Note the explicit `× 2³⁰`: memory here is GiB but bandwidth is decimal, so both sides go to raw bytes before dividing. **Active weights** is not the same as total weights — only the output head streams every step; the embedding table is a per-token gather. For MoE models only the *active* parameters are read.
 
+### Time to first token is a different problem
+
+Decode is memory-bound; **prefill is not.** It runs the entire prompt through the network before emitting a token, so TTFT is bounded by arithmetic:
+
+```
+prefill FLOPs = 2 × active params × tokens                     (dense matmuls, linear)
+              + 4 × hidden × ( full × tokens²                  (attention, QUADRATIC)
+                             + windowed × tokens × window
+                             + linear × tokens )
+
+TTFT = max( prefill FLOPs / (TP × TFLOPS × speedup × MFU) , weight-streaming time )
+```
+
+The attention term is not a correction — it is usually the larger half. Llama-3.3-70B prefilling 78,643 tokens spends **16.2 PFLOPs on attention against 11.1 on the matmuls**. Long-context TTFT is an attention problem, which is why the layer regimes matter here as much as they do for KV: a sliding-window layer costs `tokens × window` rather than `tokens²`, making GPT-OSS-120B's prefill **38% cheaper** than the same shape withfull attention.
+
+Prefill MFU is taken as 0.4 — a large dense GEMM reaches far better utilisation than decode, but nowhere near peak. Sub-16-bit formats get a 2× tensor-core speedup, capped there even for 4-bit: Blackwell does better, but the catalog does not track GPU generation and under-promising TTFT is the safe direction. A SKU with no `tflops_fp16` falls back to the weight-streaming floor, and the result is flagged as such rather than presented as a prefill estimate.
+
 ## 5. Worked example — Llama 3.3 70B
 
 Host Llama 3.3 70B Instruct at FP8, 10 concurrent sessions, 128K context at 60% utilisation, on H200s at vLLM's default prefill chunk.
@@ -270,6 +287,8 @@ The second set is precisely what a `config.json` never carries, and what the imp
 Recipes also publish a `vram_minimum_gb` per variant, which the import panel shows beside our own weight estimate. Their floor covers weights + KV + overhead, so a ratio near **0.85** is healthy; above 1.00 means one of the two figures is wrong. Across the 20 catalogue models checked against published recipes the median is 0.85, with one outlier flagged in the notes below.
 
 ## Notes
+
+**TTFT was wrong until it was measured against arithmetic.** It was originally modelled as the time to stream the active weights once — which is the *decode* bound. For a 78,643-token prefill that produced **7 ms** where the compute-bound figure is **~8.6 seconds**, a factor of 1,200. The lesson generalises: a bound borrowed from the wrong phase is worse than no estimate, because it carries a plausible error bar.
 
 Outputs are first-order roofline estimates (throughput ±40%, TTFT ±50%). Real numbers depend on kernels, batching, prefix caching and speculative decoding — treat them as planning figures and validate against benchmarks before procurement.
 
