@@ -4,7 +4,7 @@ As LLMs scale, infrastructure planning must move from heuristics to precise mode
 
 Fixed constants: runtime reserve **2.5 GiB**, MBU **0.55**, MLA latent **576**, tight-fit threshold **10%**.
 
-**Units.** Every memory figure here and in the app is **GiB = 2³⁰ bytes** — the unit `nvidia-smi` reports and the one `gpu_memory_utilization` applies against. Parameter counts are in billions (10⁹), so weights convert explicitly: `params × bytes/param × 10⁹ ÷ 2³⁰`. Bandwidth is the exception — `bw_tbs` is decimal TB/s (10¹² B/s) as vendors quote it, so the roofline takes memory to raw bytes before dividing. (A flat weight overhead of ×1.02 is retained only as a fallback for models with no embedding geometry — see §2.)
+All memory is **GiB**; see §7 for why that matters. A flat weight overhead of ×1.02 survives only as a fallback for models with no embedding geometry (§2).
 
 ## 1. Hardware memory modelling
 
@@ -177,7 +177,9 @@ Note the explicit `× 2³⁰`: memory here is GiB but bandwidth is decimal, so b
 
 ## 5. Worked example — Llama 3.3 70B
 
-Host Llama 3.3 70B Instruct at FP8, 10 concurrent sessions, 128K context at 60% utilisation, on 2× H200 (TP2).
+Host Llama 3.3 70B Instruct at FP8, 10 concurrent sessions, 128K context at 60% utilisation, on H200s at vLLM's default prefill chunk.
+
+TP is not assumed — it is selected. At this concurrency TP1 needs 3 GPUs, TP2 needs 2, TP4 needs 4; TP2 wins (§3, *Choosing the tensor-parallel size*).
 
 | Step | Calculation | Result |
 |---|---|---|
@@ -201,11 +203,79 @@ Tight        = Pod headroom < 10%
 
 A tight plan is arithmetically feasible but has no margin for the ±5% weight estimate, allocator fragmentation, or a prompt longer than the modelled average — it is the configuration that passes a spreadsheet and then OOMs on launch. Qwen3-32B at Q4_K_M on a single RTX 4090 is the canonical example: 18.6 GiB of weights against 19.1 GiB usable leaves **0.9% headroom** at 4K context and room for exactly one request. Push the context to 8K and it needs TP2, where it is comfortable again.
 
+## 7. A note on units
+
+Every memory figure here and in the app is **GiB = 2³⁰ bytes** — the unit `nvidia-smi` reports and the one `gpu_memory_utilization` is applied against. Parameter counts are quoted in billions (10⁹), so weights need an explicit conversion:
+
+```
+weights (GiB) = params_b × bytes/param × 10⁹ ÷ 2³⁰
+```
+
+Skipping that conversion — a common shortcut — makes weights read **7.4% larger** than they are relative to GPU capacity. Conservative, but wrong, and it compounds against a KV figure that *was* converted.
+
+Bandwidth is the deliberate exception: `bw_tbs` is decimal TB/s (10¹² B/s) as vendors quote it, so the roofline converts memory to raw bytes before dividing rather than mixing the two scales.
+
+## 8. Concurrency rubric
+
+The rubric re-runs the **entire** sizing at each target concurrency — it is not a scaling of one result. That matters because TP selection depends on the target: the cheapest shard width at 1 concurrent session is rarely the cheapest at 256. A rubric row can therefore change TP, pods and the tight verdict all at once, which a linear extrapolation would hide.
+
+Per-request decode rate falls as concurrency rises (more sessions share the pod's bandwidth) while aggregate throughput and GPU count rise.
+
+## 9. Cost model
+
+Costs are rental-rate arithmetic on an admin-set `$/GPU-hour` per SKU. Nothing is amortised, and power, networking and storage are out of scope.
+
+```
+Run rate ($/hr) = Σ over SKUs ( committed GPUs × $/GPU-hour )
+$/month  = $/hr × 730          $/year = $/hr × 8760
+
+$ per million tokens = ( GPUs × $/GPU-hour × 1,000,000 ) / ( tokens/sec × 3600 )
+```
+
+The per-million-token figure inherits the throughput estimate's ±40% band, so treat it as a comparison tool between configurations rather than a budget line. A configuration that halves GPU count but also halves throughput costs the same per token.
+
+## 10. Fleet reconciliation and the capacity gate
+
+A plan is checked against a declared fleet **per SKU**, on integer bytes:
+
+```
+fleet_bytes     = fleet GPUs     × mem_gb × 2³⁰
+committed_bytes = committed GPUs × mem_gb × 2³⁰
+committed + available = fleet total        (invariant, always)
+```
+
+Two properties are deliberate. Commitments count **whole GPUs** — a replica occupying part of a card still retires the whole card, because vLLM does not share a GPU between deployments. And there is **no cross-SKU masking**: surplus H200s never offset an H100 shortage, so each SKU is reconciled independently and a plan is over-committed if *any* SKU is.
+
+Integer bytes rather than floats keep the browser's live verdict and the server's authoritative one identical at the boundary.
+
+## 11. Launch command
+
+Every feasible plan emits the `vllm serve` command implied by its own numbers — TP size, `--max-model-len`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--max-num-batched-tokens` where it differs from default, and `--max-num-seqs`.
+
+`--max-num-seqs` is the one worth understanding. It is set to the **pod's** KV budget, not the deployment target. Left at vLLM's default the scheduler admits more sequences than the cache can hold and preempts under load — which presents as a throughput problem and is really a sizing one.
+
+The command describes **one replica**. A plan needing *n* pods needs *n* copies of it behind a load balancer; conflating the two is the classic way to under-provision.
+
+## 12. Where catalog numbers come from
+
+Model geometry is not guessed. Two sources, deliberately separated by what each is authoritative for:
+
+| source | supplies |
+|---|---|
+| Hugging Face `config.json` | layers, attention geometry, embedding sizes, sliding-window and linear-attention splits |
+| [recipes.vllm.ai](https://recipes.vllm.ai) | parameter counts, context length, shipped quantisations, TP sizes |
+
+The second set is precisely what a `config.json` never carries, and what the importer would otherwise leave for an admin to type. A recipe has no authority over geometry and is not allowed to set it.
+
+Recipes also publish a `vram_minimum_gb` per variant, which the import panel shows beside our own weight estimate. Their floor covers weights + KV + overhead, so a ratio near **0.85** is healthy; above 1.00 means one of the two figures is wrong. Across the 20 catalogue models checked against published recipes the median is 0.85, with one outlier flagged in the notes below.
+
 ## Notes
 
 Outputs are first-order roofline estimates (throughput ±40%, TTFT ±50%). Real numbers depend on kernels, batching, prefix caching and speculative decoding — treat them as planning figures and validate against benchmarks before procurement.
 
-**Catalog geometry is sourced, not guessed.** Every seeded model's layer count, attention geometry and embedding sizes are taken from its published `config.json`. Three findings came out of that pass worth recording: GPT-OSS's 128-token window applies to exactly half its layers (18/36 and 12/24), and **GLM-5.2 is an MLA model, not GQA** — it ships as `GlmMoeDsaForCausalLM` with `kv_lora_rank: 512` + `qk_rope_head_dim: 64`, the same 576-element latent per layer DeepSeek uses. Sizing it as GQA 8×128 overstated its KV cache by ~3.6×, which is the difference between 8 GPUs and 24 for a 64-user deployment. And Kimi K3 is only 26% attention layers — see below.
+**Catalog geometry is sourced, not guessed.** Every seeded model's layer count, attention geometry and embedding sizes are taken from its published `config.json`. Three findings came out of that pass worth recording: GPT-OSS's 128-token window applies to exactly half its layers (18/36 and 12/24), and **GLM-5.2 is an MLA model, not GQA** — it ships as `GlmMoeDsaForCausalLM` with `kv_lora_rank: 512` + `qk_rope_head_dim: 64`, the same 576-element latent per layer DeepSeek uses. Sizing it as GQA 8×128 overstated its KV cache by ~3.6×, which is the difference between 8 GPUs and 24 for a 64-user deployment. And Kimi K3 keeps a token cache on only 24 of its 93 layers (§3, *Linear & recurrent layers*).
+
+**One unexplained cross-check.** Llama-3.3-70B at NVFP4 computes to 1.02 of its published VRAM floor — physically impossible, so one of the two is wrong. That checkpoint appears to quantise the embedding tail as well, but no published card says so, and fitting a constant to a single data point is how the original NVFP4 error arose. It is left flagged rather than tuned away.
 
 **Sparse attention is not a memory saving.** GLM-5.2's `index_topk: 2048` (DSA) selects which cached tokens each query attends to. It cuts attention *compute*; the KV cache still holds every token. This tool deliberately does not model it as a cache reduction — treating token-selection sparsity as eviction would under-size the deployment.
 

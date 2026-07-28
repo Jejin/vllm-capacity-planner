@@ -744,7 +744,8 @@
       <tr><td>GGUF Q4_K_M</td><td class="num">0.5</td><td class="num">0.61</td><td>4.9 real bits — mixes Q4_K and Q6_K per tensor</td></tr>
       <tr><td>GGUF IQ4_XS</td><td class="num">0.5</td><td class="num">0.53125</td><td>4.25 real bits</td></tr>
     </tbody></table>
-    <p class="note"><b>The GGUF trap.</b> Q4_K_M is not 4 bits. It mixes Q4_K and Q6_K tensor by tensor and lands near <b>4.9 effective bits</b>; assuming 4.0 undercounts a 70B model by about 8 GB. The three GGUF figures are whole-<em>file</em> averages measured across a finished checkpoint — GGUF quantises the embedding layers too, so those quants skip the 16-bit tail term below rather than paying it twice. GGUF is llama.cpp / Ollama territory; vLLM's support for it is experimental.</p>
+    <h3 class="dh3">The GGUF trap</h3>
+    <p class="note">Q4_K_M is not 4 bits. It mixes Q4_K and Q6_K tensor by tensor and lands near <b>4.9 effective bits</b>; assuming 4.0 undercounts a 70B model by about 8 GB. The three GGUF figures are whole-<em>file</em> averages measured across a finished checkpoint — GGUF quantises the embedding layers too, so those quants skip the 16-bit tail term below rather than paying it twice. GGUF is llama.cpp / Ollama territory; vLLM's support for it is experimental.</p>
     <p class="note">Models in the catalog without <code>hidden_size</code>/<code>vocab_size</code> fall back to the legacy <code>total × bytes × 1.02</code> estimate, and the sizing view labels the result approximate. Hugging Face import fills all three fields from <code>config.json</code>.</p>
 
     <h3 class="dh3">Mixed-precision checkpoints</h3>
@@ -769,6 +770,18 @@
     <p>The obvious rule — smallest TP that holds the weights plus one request — <b>over-recommends hardware</b>. A bigger shard leaves proportionally more room for KV and packs far more sessions per replica, and what you pay for is <code>pods × TP</code>, not <code>TP</code>. Llama-3.3-70B at FP8, 128K/60%, 64 concurrent on H200: TP1 needs 16 GPUs, TP2 needs 10, TP4 and TP8 need <b>8</b>.</p>
     <p class="note">The engine evaluates every TP in the model's ladder and takes the cheapest total, breaking ties toward the <em>smaller</em> shard — same GPU count, less collective traffic. That makes this a cost/throughput objective; a latency-oriented planner would bias toward larger shards.</p>
 
+    <h3 class="dh3">Local &amp; global attention</h3>
+    <p>Not every layer attends over the whole context. Many models alternate <b>full-attention</b> layers with <b>sliding-window</b> layers that only ever look back a fixed number of tokens. The windowed layers' KV stops growing once the sequence passes the window, so long-context KV falls well below the naive all-layers-full figure:</p>
+    <div class="formula">KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) )</div>
+    <p>GPT-OSS-120B is the clearest case in this catalog: 18 of its 36 layers are locally banded at 128 tokens. At 128K context that is the difference between <b>2.7 GiB</b> and <b>5.4 GiB</b> per request — and the difference between a plan with room for three concurrent requests on one H100 and a plan that looks dangerously tight with room for one. Gemma (one global layer every N) and Mistral v0.1 (every layer windowed) use the same trick with different patterns.</p>
+    <p class="note">Because the windowed layers stop growing, the per-token KV figure shown on the Sizing tab is an <em>effective average</em> over the whole request, not a constant marginal rate. It still reconciles exactly: per-token × active tokens = per-request. Models with no window declared are treated as all-full-attention, which is the safe direction to be wrong in.</p>
+    <h3 class="dh3">Linear &amp; recurrent layers</h3>
+    <p>A third regime is spreading fast. Hybrid models replace most attention layers with a <b>recurrent</b> form — Kimi K3's KDA, Qwen3-Next, MiniMax — whose state is a fixed-size matrix per layer. It does not grow with the sequence <em>at all</em>:</p>
+    <div class="formula">KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) ) + linear × constant</div>
+    <p>Qwen3.6-27B is 64 layers with only <b>16</b> cached — 4.9 GiB of KV at 256K instead of 19.2. Kimi K3 is 93 layers, of which only <b>24</b> keep a token-indexed cache; the other 69 are KDA, costing a flat ~414 MB per request whether the context is 1K or 1M. At its full 1M window that is <b>8.5 GiB</b> of KV instead of the 31.4 GiB an all-93-layer sizing would claim — the difference between fitting one 8×B300 node and not. The constant term dominates at short context and vanishes at long; both ends matter, so it is modelled rather than dropped.</p>
+
+    <p class="note"><b>Sparse attention is not a memory saving.</b> Schemes like GLM-5.2's DSA (<code>index_topk: 2048</code>) choose which cached tokens each query attends to. That cuts attention <em>compute</em> — the KV cache still holds every token. Treating token-selection sparsity as eviction would under-size the deployment, so this tool does not model it as one.</p>
+
     <h2 class="dh">4 · Decode roofline throughput</h2>
     <p>For every token generated, the weights and active KV cache must be read from memory to the compute cores — so generation speed is bounded by achievable memory bandwidth (with a Memory-Bandwidth-Utilisation penalty, here 55%).</p>
     <div class="formula">Data read per step = Weight memory + (Active sequences × KV per session)</div>
@@ -791,21 +804,37 @@
     <div class="formula">Pod headroom = <span class="frac"><span class="fnum">Usable pod memory − Weights − KV per session</span><span class="fden">Usable pod memory</span></span> · Tight = headroom &lt; 10%</div>
     <p>A <b>tight</b> plan is arithmetically feasible but has no margin for the ±5% weight estimate, allocator fragmentation, or a prompt longer than the modelled average — the configuration that passes a spreadsheet and then OOMs on launch. Qwen3-32B at Q4_K_M on a single RTX 4090 is the canonical case: 18.6 GiB of weights against 19.1 GiB usable leaves <b>0.9% headroom</b> at 4K context and room for exactly one request. Push the context to 8K and it needs TP2, where it is comfortable again.</p>
 
-    <h2 class="dh">7 · Local &amp; global attention</h2>
-    <p>Not every layer attends over the whole context. Many models alternate <b>full-attention</b> layers with <b>sliding-window</b> layers that only ever look back a fixed number of tokens. The windowed layers' KV stops growing once the sequence passes the window, so long-context KV falls well below the naive all-layers-full figure:</p>
-    <div class="formula">KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) )</div>
-    <p>GPT-OSS-120B is the clearest case in this catalog: 18 of its 36 layers are locally banded at 128 tokens. At 128K context that is the difference between <b>2.7 GiB</b> and <b>5.4 GiB</b> per request — and the difference between a plan with room for three concurrent requests on one H100 and a plan that looks dangerously tight with room for one. Gemma (one global layer every N) and Mistral v0.1 (every layer windowed) use the same trick with different patterns.</p>
-    <p class="note">Because the windowed layers stop growing, the per-token KV figure shown on the Sizing tab is an <em>effective average</em> over the whole request, not a constant marginal rate. It still reconciles exactly: per-token × active tokens = per-request. Models with no window declared are treated as all-full-attention, which is the safe direction to be wrong in.</p>
-    <h3 class="dh3">Linear &amp; recurrent layers</h3>
-    <p>A third regime is spreading fast. Hybrid models replace most attention layers with a <b>recurrent</b> form — Kimi K3's KDA, Qwen3-Next, MiniMax — whose state is a fixed-size matrix per layer. It does not grow with the sequence <em>at all</em>:</p>
-    <div class="formula">KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) ) + linear × constant</div>
-    <p>Qwen3.6-27B is 64 layers with only <b>16</b> cached — 4.9 GiB of KV at 256K instead of 19.2. Kimi K3 is 93 layers, of which only <b>24</b> keep a token-indexed cache; the other 69 are KDA, costing a flat ~414 MB per request whether the context is 1K or 1M. At its full 1M window that is <b>8.5 GiB</b> of KV instead of the 31.4 GiB an all-93-layer sizing would claim — the difference between fitting one 8×B300 node and not. The constant term dominates at short context and vanishes at long; both ends matter, so it is modelled rather than dropped.</p>
-
-    <p class="note"><b>Sparse attention is not a memory saving.</b> Schemes like GLM-5.2's DSA (<code>index_topk: 2048</code>) choose which cached tokens each query attends to. That cuts attention <em>compute</em> — the KV cache still holds every token. Treating token-selection sparsity as eviction would under-size the deployment, so this tool does not model it as one.</p>
-
-    <h2 class="dh">8 · A note on units</h2>
+    <h2 class="dh">7 · A note on units</h2>
     <p>Every memory figure in this tool is <b>GiB = 2³⁰ bytes</b> — the unit <code>nvidia-smi</code> reports and the one <code>gpu_memory_utilization</code> is applied against. Parameter counts are in billions (10⁹), so weights are converted explicitly: <code>params × bytes/param × 10⁹ ÷ 2³⁰</code>. Skipping that conversion (a common shortcut) makes weights read <b>7.4% larger</b> than they are relative to GPU capacity — conservative, but wrong, and it compounds against a KV figure that <em>was</em> converted.</p>
     <p class="note">Bandwidth is the exception: <code>bw_tbs</code> is decimal TB/s (10¹² B/s), as vendors quote it. The roofline therefore converts memory to raw bytes before dividing, rather than mixing the two scales.</p>
+
+    <h2 class="dh">8 · Concurrency rubric</h2>
+    <p>The rubric re-runs the <b>entire</b> sizing at each target concurrency — it is not a scaling of one result. TP selection depends on the target, so the cheapest shard width at 1 session is rarely the cheapest at 256. A row can change TP, pods and the tight verdict all at once, which a linear extrapolation would hide.</p>
+    <p class="note">Per-request decode rate falls as concurrency rises (more sessions share the pod's bandwidth) while aggregate throughput and GPU count rise.</p>
+
+    <h2 class="dh">9 · Cost model</h2>
+    <p>Rental-rate arithmetic on an admin-set <code>$/GPU-hour</code> per SKU. Nothing is amortised; power, networking and storage are out of scope.</p>
+    <div class="formula">Run rate ($/hr) = Σ<sub>SKU</sub> ( committed GPUs × $/GPU-hour ) · month = ×730 · year = ×8760</div>
+    <div class="formula">$ per million tokens = <span class="frac"><span class="fnum">GPUs × $/GPU-hour × 1,000,000</span><span class="fden">tokens/sec × 3600</span></span></div>
+    <p class="note">The per-million figure inherits the throughput estimate's ±40% band — a comparison tool between configurations, not a budget line. A config that halves GPU count but also halves throughput costs the same per token.</p>
+
+    <h2 class="dh">10 · Fleet reconciliation and the capacity gate</h2>
+    <p>A plan is checked against a declared fleet <b>per SKU</b>, on integer bytes:</p>
+    <div class="formula">committed_bytes + available_bytes = fleet_bytes &nbsp;(invariant, per SKU)</div>
+    <p>Two properties are deliberate. Commitments count <b>whole GPUs</b> — a replica occupying part of a card still retires the whole card, because vLLM does not share a GPU between deployments. And there is <b>no cross-SKU masking</b>: surplus H200s never offset an H100 shortage, so a plan is over-committed if <em>any</em> SKU is.</p>
+    <p class="note">Integer bytes rather than floats keep this browser's live verdict and the server's authoritative one identical at the boundary.</p>
+
+    <h2 class="dh">11 · Launch command</h2>
+    <p>Every feasible plan emits the <code>vllm serve</code> command implied by its own numbers. <code>--max-num-seqs</code> is the one worth understanding: it is set to the <b>pod's</b> KV budget, not the deployment target. Left at vLLM's default the scheduler admits more sequences than the cache holds and preempts under load — which presents as a throughput problem and is really a sizing one.</p>
+    <p class="note">The command describes <b>one replica</b>. A plan needing <em>n</em> pods needs <em>n</em> copies behind a load balancer; conflating the two is the classic way to under-provision.</p>
+
+    <h2 class="dh">12 · Where catalog numbers come from</h2>
+    <p>Model geometry is not guessed. Two sources, separated by what each is authoritative for:</p>
+    <table class="qtab"><thead><tr><th>Source</th><th>Supplies</th></tr></thead><tbody>
+      <tr><td>Hugging Face <code>config.json</code></td><td>layers, attention geometry, embedding sizes, sliding-window and linear splits</td></tr>
+      <tr><td>recipes.vllm.ai</td><td>parameter counts, context length, shipped quantisations, TP sizes</td></tr>
+    </tbody></table>
+    <p class="note">The second set is precisely what a <code>config.json</code> never carries. A recipe has no authority over geometry and is not allowed to set it. Recipes also publish a <code>vram_minimum_gb</code> per variant, shown beside our own estimate on import — their floor covers weights + KV + overhead, so a ratio near <b>0.85</b> is healthy and above 1.00 means one of the two is wrong.</p>
 
     <h2 class="dh">Frequently asked</h2>
     <div class="faq">
