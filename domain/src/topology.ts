@@ -133,3 +133,101 @@ export function topologyLayout(
     hiddenNodes: Math.max(0, sizing.nodes - shown),
   };
 }
+
+// ── Rendering ────────────────────────────────────────────────────────────────────────────────
+// The SVG is a pure function of the layout plus a handful of label strings, so the app and the
+// headless preview harness render from ONE source. Duplicating the markup in a preview script
+// makes the preview drift, at which point it stops being evidence about the real component.
+
+export interface TopologyRenderOptions {
+  tp: number;
+  perNode: number;
+  /** At least one replica crosses a node boundary — drives the warning treatment. */
+  multiNode: boolean;
+  /** Caption on the shared-storage box, e.g. "shared weights · 67.7 GiB per replica". */
+  storeLabel: string;
+  /** Prose equivalent of the picture, for screen readers. */
+  desc: string;
+  titleId?: string;
+  descId?: string;
+}
+
+/** Escape text bound into SVG. Model names are admin-editable, so this is not optional. */
+export function escapeSvgText(s: string): string {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** ~6.2px per character at 10px/700 Manrope — enough to size a box to its own caption. */
+export function labelWidth(text: string): number {
+  return text.length * 6.2 + 24;
+}
+
+export function topologySvg(t: TopologyLayout, o: TopologyRenderOptions): string {
+  const esc = escapeSvgText;
+  const titleId = o.titleId ?? 'topotitle';
+  const descId = o.descId ?? 'topodesc';
+  const cx = t.contentW / 2;
+  const storeW = Math.max(180, labelWidth(o.storeLabel));
+  const warn = o.multiNode;
+  const out: string[] = [];
+
+  out.push(
+    `<svg class="topo2" viewBox="0 0 ${t.width} ${t.height}" width="${t.width}" height="${t.height}" ` +
+      `role="img" aria-labelledby="${titleId} ${descId}">`,
+    `<title id="${titleId}">Deployment topology diagram</title>`,
+    `<desc id="${descId}">${esc(o.desc)}</desc>`,
+  );
+
+  // logical layer
+  out.push(
+    `<rect x="${cx - 80}" y="0" width="160" height="26" rx="6" class="tbox router"/>`,
+    `<text x="${cx}" y="17" class="tlabel mid">router · llm-d</text>`,
+  );
+  for (const pod of t.pods) {
+    const mid = (pod.x0 + pod.x1) / 2;
+    out.push(
+      `<line x1="${cx}" y1="26" x2="${mid}" y2="48" class="tlink"/>`,
+      `<rect x="${pod.x0}" y="48" width="${pod.x1 - pod.x0}" height="22" rx="5" class="tbox pod${pod.spans ? ' spanning' : ''}"/>`,
+      `<text x="${pod.labelInside ? mid : pod.x1 + 6}" y="63" class="tlabel${pod.labelInside ? ' mid' : ''}">` +
+        `${pod.spans ? '⚠ ' : ''}replica ${pod.p + 1} · TP${o.tp}</text>`,
+    );
+  }
+
+  // physical layer
+  for (let n = 0; n < t.shown; n++) {
+    const nx = n * (t.nodeW + t.nodeGap);
+    out.push(
+      `<rect x="${nx}" y="${t.nodeY}" width="${t.nodeW}" height="${t.nodeH}" rx="7" class="tbox node"/>`,
+      `<text x="${nx + t.nodePad}" y="${t.nodeY + 14}" class="tlabel">node ${n + 1}${t.nodeLabelFull ? ` · ${o.perNode} GPU` : ''}</text>`,
+    );
+    for (const g of t.gpus.filter((x) => x.n === n)) {
+      out.push(
+        `<rect x="${g.x}" y="${t.nodeY + t.labelH}" width="${t.cell}" height="${t.cell}" rx="4" class="tgpu${g.used ? ' used' : ''}"/>`,
+        `<text x="${g.x + t.cell / 2}" y="${t.nodeY + t.labelH + 17}" class="tgpulabel mid">${g.used ? g.g : ''}</text>`,
+      );
+    }
+    out.push(
+      `<line x1="${nx + t.nodeW / 2}" y1="${t.nodeY + t.nodeH}" x2="${nx + t.nodeW / 2}" ` +
+        `y2="${t.multi ? t.switchY : t.storeY}" class="tlink${t.multi && warn ? ' fabric' : ''}"/>`,
+    );
+  }
+
+  if (t.multi) {
+    out.push(
+      `<rect x="${cx - 92}" y="${t.switchY}" width="184" height="26" rx="6" class="tbox sw${warn ? ' hot' : ''}"/>`,
+      `<text x="${cx}" y="${t.switchY + 17}" class="tlabel mid">${warn ? '⚠ ' : ''}InfiniBand / RoCE fabric</text>`,
+      `<line x1="${cx}" y1="${t.switchY + 26}" x2="${cx}" y2="${t.storeY}" class="tlink"/>`,
+    );
+  }
+
+  out.push(
+    `<rect x="${cx - storeW / 2}" y="${t.storeY}" width="${storeW}" height="26" rx="6" class="tbox store"/>`,
+    `<text x="${cx}" y="${t.storeY + 17}" class="tlabel mid">${esc(o.storeLabel)}</text>`,
+    `</svg>`,
+  );
+  return out.join('');
+}

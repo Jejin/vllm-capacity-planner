@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, serveCommand, topologyLayout, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, serveCommand, topologyLayout, topologySvg, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -69,10 +69,17 @@
   // Geometry lives in the domain package so it can be unit-tested and rendered headlessly;
   // a diagram whose layout only exists in a template can only be checked by eye, in a browser.
   const topo = $derived(R ? topologyLayout(R, perNode) : null);
-  const storeLabel = $derived(R ? `shared weights · ${fmt(R.weights_gb)} GiB per replica` : '');
-  // ~6.2px per char at 10px/700 Manrope; sizing the box to the string beats a fixed width that
-  // the four-digit models overflow
-  const storeW = $derived(Math.max(180, storeLabel.length * 6.2 + 24));
+  const topoSvg = $derived(
+    topo && R
+      ? topologySvg(topo, {
+          tp: R.tp,
+          perNode,
+          multiNode: R.multi_node,
+          storeLabel: `shared weights · ${fmt(R.weights_gb)} GiB per replica`,
+          desc: `${R.pods} serving replica${R.pods > 1 ? 's' : ''}, each sharded across ${R.tp} GPUs, placed on ${R.nodes} node${R.nodes > 1 ? 's' : ''} of ${perNode} GPUs. ${R.multi_node ? 'At least one replica spans a node boundary, so its tensor-parallel collective crosses the inter-node fabric.' : 'Every replica fits inside a single node.'}`,
+        })
+      : '',
+  );
 
   // launch command for ONE replica of the current plan
   let cmdDocker = $state(false);
@@ -420,53 +427,9 @@
           <div class="panel">
             <h2>Deployment topology — {R.pods} replica{R.pods > 1 ? 's' : ''} × TP{R.tp} on {R.nodes} node{R.nodes > 1 ? 's' : ''}</h2>
             <div class="topowrap">
-              <svg class="topo2" viewBox="0 0 {topo.width} {topo.height}" width={topo.width} height={topo.height}
-                   role="img" aria-labelledby="topotitle topodesc">
-                <title id="topotitle">Deployment topology diagram</title>
-                <desc id="topodesc">{R.pods} serving replicas, each sharded across {R.tp} GPUs, placed on {R.nodes} nodes of {perNode} GPUs. {R.multi_node ? 'At least one replica spans a node boundary, so its tensor-parallel collective crosses the inter-node fabric.' : 'Every replica fits inside a single node.'}</desc>
-
-                <!-- logical layer: one entry point fanning out to replicas -->
-                <rect x={topo.contentW / 2 - 80} y="0" width="160" height="26" rx="6" class="tbox router" />
-                <text x={topo.contentW / 2} y="17" class="tlabel mid">router · llm-d</text>
-                {#each topo.pods as pod}
-                  <line x1={topo.contentW / 2} y1="26" x2={(pod.x0 + pod.x1) / 2} y2="48" class="tlink" />
-                  <rect x={pod.x0} y="48" width={pod.x1 - pod.x0} height="22" rx="5"
-                        class="tbox pod" class:spanning={pod.spans} />
-                  <text x={pod.labelInside ? (pod.x0 + pod.x1) / 2 : pod.x1 + 6} y="63"
-                        class="tlabel" class:mid={pod.labelInside}>
-                    {pod.spans ? '⚠ ' : ''}replica {pod.p + 1} · TP{R.tp}
-                  </text>
-                {/each}
-
-                <!-- physical layer -->
-                {#each Array(topo.shown) as _, n}
-                  {@const nx = n * (topo.nodeW + topo.nodeGap)}
-                  <rect x={nx} y={topo.nodeY} width={topo.nodeW} height={topo.nodeH} rx="7" class="tbox node" />
-                  <text x={nx + topo.nodePad} y={topo.nodeY + 14} class="tlabel">node {n + 1}{topo.nodeLabelFull ? ` · ${perNode} GPU` : ''}</text>
-                  {#each topo.gpus.filter((g) => g.n === n) as g}
-                    <rect x={g.x} y={topo.nodeY + topo.labelH} width={topo.cell} height={topo.cell} rx="4"
-                          class="tgpu" class:used={g.used} />
-                    <text x={g.x + topo.cell / 2} y={topo.nodeY + topo.labelH + 17} class="tgpulabel mid">
-                      {g.used ? g.g : ''}
-                    </text>
-                  {/each}
-                  <line x1={nx + topo.nodeW / 2} y1={topo.nodeY + topo.nodeH}
-                        x2={nx + topo.nodeW / 2} y2={topo.multi ? topo.switchY : topo.storeY}
-                        class="tlink" class:fabric={topo.multi && R.multi_node} />
-                {/each}
-
-                {#if topo.multi}
-                  <rect x={topo.contentW / 2 - 92} y={topo.switchY} width="184" height="26" rx="6"
-                        class="tbox sw" class:hot={R.multi_node} />
-                  <text x={topo.contentW / 2} y={topo.switchY + 17} class="tlabel mid">
-                    {R.multi_node ? '⚠ ' : ''}InfiniBand / RoCE fabric
-                  </text>
-                  <line x1={topo.contentW / 2} y1={topo.switchY + 26} x2={topo.contentW / 2} y2={topo.storeY} class="tlink" />
-                {/if}
-
-                <rect x={topo.contentW / 2 - storeW / 2} y={topo.storeY} width={storeW} height="26" rx="6" class="tbox store" />
-                <text x={topo.contentW / 2} y={topo.storeY + 17} class="tlabel mid">{storeLabel}</text>
-              </svg>
+              <!-- markup comes from the domain renderer so `npm run preview:topology`
+                   screenshots the same SVG this component ships -->
+              {@html topoSvg}
             </div>
 
             <div class="topolegend">
@@ -993,22 +956,24 @@
      same selection rather than an inverted copy. Status colour is reserved for the fabric
      crossing and always ships with a glyph and a label, never colour alone. */
   .topowrap{overflow-x:auto;padding:4px 0 2px}
-  .topo2{display:block;min-width:100%}
-  .topo2 .tbox{fill:var(--surface2);stroke:var(--line);stroke-width:1.5}
-  .topo2 .tbox.router{fill:var(--wash);stroke:var(--brand)}
-  .topo2 .tbox.pod{fill:var(--surface);stroke:var(--purple);stroke-width:2}
-  .topo2 .tbox.pod.spanning{fill:var(--warnbg);stroke:var(--warnln);stroke-dasharray:5 3}
-  .topo2 .tbox.node{fill:none;stroke:var(--line);stroke-dasharray:4 3}
-  .topo2 .tbox.sw{fill:var(--surface2);stroke:var(--slate)}
-  .topo2 .tbox.sw.hot{fill:var(--warnbg);stroke:var(--warnln);stroke-width:2}
-  .topo2 .tbox.store{fill:var(--surface2);stroke:var(--grey)}
-  .topo2 .tgpu{fill:var(--bg);stroke:var(--line);stroke-width:1.5}
-  .topo2 .tgpu.used{fill:var(--wash);stroke:var(--brand)}
-  .topo2 .tlink{stroke:var(--line);stroke-width:1.5;fill:none}
-  .topo2 .tlink.fabric{stroke:var(--warnln);stroke-dasharray:4 3}
-  .topo2 .tlabel{font-family:Manrope,system-ui,sans-serif;font-size:10px;font-weight:700;fill:var(--ink2)}
-  .topo2 .tgpulabel{font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:600;fill:var(--ink3)}
-  .topo2 .mid{text-anchor:middle}
+  /* the SVG comes from {@html}, so Svelte's scoper cannot see these selectors and would strip
+     them as unused — they are globalised, but still anchored to the component's own wrapper */
+  .topowrap :global(.topo2){display:block;min-width:100%}
+  .topowrap :global(.tbox){fill:var(--surface2);stroke:var(--line);stroke-width:1.5}
+  .topowrap :global(.tbox.router){fill:var(--wash);stroke:var(--brand)}
+  .topowrap :global(.tbox.pod){fill:var(--surface);stroke:var(--purple);stroke-width:2}
+  .topowrap :global(.tbox.pod.spanning){fill:var(--warnbg);stroke:var(--warnln);stroke-dasharray:5 3}
+  .topowrap :global(.tbox.node){fill:none;stroke:var(--line);stroke-dasharray:4 3}
+  .topowrap :global(.tbox.sw){fill:var(--surface2);stroke:var(--slate)}
+  .topowrap :global(.tbox.sw.hot){fill:var(--warnbg);stroke:var(--warnln);stroke-width:2}
+  .topowrap :global(.tbox.store){fill:var(--surface2);stroke:var(--grey)}
+  .topowrap :global(.tgpu){fill:var(--bg);stroke:var(--line);stroke-width:1.5}
+  .topowrap :global(.tgpu.used){fill:var(--wash);stroke:var(--brand)}
+  .topowrap :global(.tlink){stroke:var(--line);stroke-width:1.5;fill:none}
+  .topowrap :global(.tlink.fabric){stroke:var(--warnln);stroke-dasharray:4 3}
+  .topowrap :global(.tlabel){font-family:Manrope,system-ui,sans-serif;font-size:10px;font-weight:700;fill:var(--ink2)}
+  .topowrap :global(.tgpulabel){font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:600;fill:var(--ink3)}
+  .topowrap :global(.mid){text-anchor:middle}
   .topolegend{display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--ink2);margin-top:10px}
   .topolegend span{display:flex;align-items:center;gap:5px}
   .topolegend i{width:11px;height:11px;border-radius:3px;display:inline-block;border:1.5px solid var(--line)}
