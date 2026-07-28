@@ -62,27 +62,29 @@ export const SEED_MODELS: Model[] = [
   { id: 'kimi-k3', name: 'Kimi K3 2.8T-A60B (MoE·MLA+KDA)', total_params_b: 2800, active_params_b: 60, layers: 93, kv_heads: 0, head_dim: 0, mla: true, max_ctx: 1048576, tp_options: [8, 16], quants: ['MXFP4'], hidden_size: 7168, vocab_size: 163840, tied_embeddings: false, full_attention_layers: 24, linear_attention_layers: 69, linear_state_bytes_per_layer: 6291456, dense_params_b: 20.8 },
 ];
 
+// tflops_fp16: DENSE (non-sparse) FP16 tensor throughput, driving the compute-bound TTFT
+// estimate. [VERIFY] against vendor datasheets — like the bandwidths, these are indicative.
 // price_per_gpu_hour: INDICATIVE market rental rates ($/GPU-hour) — [VERIFY] against your
 // contracts. Admin-editable; the cost estimate uses these.
 export const SEED_GPUS: GpuSku[] = [
   // --- NVIDIA datacenter ---
-  { id: 'l4', name: 'L4 24 GB', mem_gb: 24, bw_tbs: 0.3, price_per_gpu_hour: 0.35 },
-  { id: 'l40s', name: 'L40S 48 GB', mem_gb: 48, bw_tbs: 0.86, price_per_gpu_hour: 0.8 },
-  { id: 'a100p', name: 'A100 80 GB PCIe', mem_gb: 80, bw_tbs: 1.94, price_per_gpu_hour: 1.5 },
-  { id: 'a100s', name: 'A100 80 GB SXM', mem_gb: 80, bw_tbs: 2.04, price_per_gpu_hour: 1.8 },
-  { id: 'h100', name: 'H100 80 GB SXM', mem_gb: 80, bw_tbs: 3.35, price_per_gpu_hour: 2.9 },
-  { id: 'h100n', name: 'H100 NVL 94 GB', mem_gb: 94, bw_tbs: 3.9, price_per_gpu_hour: 3.2 },
-  { id: 'h200', name: 'H200 141 GB (SXM/NVL)', mem_gb: 141, bw_tbs: 4.8, price_per_gpu_hour: 4.5 },
-  { id: 'b200', name: 'B200 180 GB SXM', mem_gb: 180, bw_tbs: 8.0, price_per_gpu_hour: 6.5 },
-  { id: 'b300', name: 'B300 288 GB (Blackwell Ultra)', mem_gb: 288, bw_tbs: 8.0, price_per_gpu_hour: 8.5 },
+  { id: 'l4', name: 'L4 24 GB', mem_gb: 24, bw_tbs: 0.3, tflops_fp16: 121, price_per_gpu_hour: 0.35 },
+  { id: 'l40s', name: 'L40S 48 GB', mem_gb: 48, bw_tbs: 0.86, tflops_fp16: 362, price_per_gpu_hour: 0.8 },
+  { id: 'a100p', name: 'A100 80 GB PCIe', mem_gb: 80, bw_tbs: 1.94, tflops_fp16: 312, price_per_gpu_hour: 1.5 },
+  { id: 'a100s', name: 'A100 80 GB SXM', mem_gb: 80, bw_tbs: 2.04, tflops_fp16: 312, price_per_gpu_hour: 1.8 },
+  { id: 'h100', name: 'H100 80 GB SXM', mem_gb: 80, bw_tbs: 3.35, tflops_fp16: 989, price_per_gpu_hour: 2.9 },
+  { id: 'h100n', name: 'H100 NVL 94 GB', mem_gb: 94, bw_tbs: 3.9, tflops_fp16: 835, price_per_gpu_hour: 3.2 },
+  { id: 'h200', name: 'H200 141 GB (SXM/NVL)', mem_gb: 141, bw_tbs: 4.8, tflops_fp16: 989, price_per_gpu_hour: 4.5 },
+  { id: 'b200', name: 'B200 180 GB SXM', mem_gb: 180, bw_tbs: 8.0, tflops_fp16: 2250, price_per_gpu_hour: 6.5 },
+  { id: 'b300', name: 'B300 288 GB (Blackwell Ultra)', mem_gb: 288, bw_tbs: 8.0, tflops_fp16: 2500, price_per_gpu_hour: 8.5 },
   // --- AMD Instinct (ROCm vLLM) ---
-  { id: 'mi300x', name: 'MI300X 192 GB', mem_gb: 192, bw_tbs: 5.3, price_per_gpu_hour: 2.0 },
-  { id: 'mi325x', name: 'MI325X 256 GB', mem_gb: 256, bw_tbs: 6.0, price_per_gpu_hour: 2.5 },
-  { id: 'mi355x', name: 'MI355X 288 GB', mem_gb: 288, bw_tbs: 8.0, price_per_gpu_hour: 4.0 },
+  { id: 'mi300x', name: 'MI300X 192 GB', mem_gb: 192, bw_tbs: 5.3, tflops_fp16: 1307, price_per_gpu_hour: 2.0 },
+  { id: 'mi325x', name: 'MI325X 256 GB', mem_gb: 256, bw_tbs: 6.0, tflops_fp16: 1307, price_per_gpu_hour: 2.5 },
+  { id: 'mi355x', name: 'MI355X 288 GB', mem_gb: 288, bw_tbs: 8.0, tflops_fp16: 2300, price_per_gpu_hour: 4.0 },
   // --- Workstation / consumer (single-box self-hosting; no NVLink, TP over PCIe) ---
-  { id: 'rtxpro6000', name: 'RTX PRO 6000 Blackwell 96 GB', mem_gb: 96, bw_tbs: 1.79, price_per_gpu_hour: 1.8 },
-  { id: 'rtx5090', name: 'RTX 5090 32 GB', mem_gb: 32, bw_tbs: 1.79, price_per_gpu_hour: 0.7 },
-  { id: 'rtx4090', name: 'RTX 4090 24 GB', mem_gb: 24, bw_tbs: 1.01, price_per_gpu_hour: 0.4 },
+  { id: 'rtxpro6000', name: 'RTX PRO 6000 Blackwell 96 GB', mem_gb: 96, bw_tbs: 1.79, tflops_fp16: 503, price_per_gpu_hour: 1.8 },
+  { id: 'rtx5090', name: 'RTX 5090 32 GB', mem_gb: 32, bw_tbs: 1.79, tflops_fp16: 210, price_per_gpu_hour: 0.7 },
+  { id: 'rtx4090', name: 'RTX 4090 24 GB', mem_gb: 24, bw_tbs: 1.01, tflops_fp16: 165, price_per_gpu_hour: 0.4 },
 ];
 
 export function seedCatalog(): { models: Model[]; gpus: GpuSku[] } {

@@ -60,6 +60,12 @@ export interface GpuSku {
   name: string;
   mem_gb: number;
   bw_tbs: number; // per-GPU HBM aggregate bandwidth (TB/s)
+  /**
+   * Dense (non-sparse) FP16 tensor throughput in TFLOPS. Drives the prefill/TTFT estimate,
+   * which is compute-bound — bandwidth alone under-states it by orders of magnitude at long
+   * context. Absent => TTFT falls back to the bandwidth floor and is flagged as such.
+   */
+  tflops_fp16?: number;
   price_per_gpu_hour?: number; // admin-set rental rate ($/GPU-hour) for cost estimates
 }
 
@@ -103,7 +109,11 @@ export interface FeasibleSizing {
   activation_gb: number;
   throughput_tokens_per_sec: number; // aggregate decode throughput across the deployment, ±40%
   decode_tps_per_request: number; // per-request decode tokens/sec (1 / step time), ±40%
-  ttft_ms: number; // indicative time-to-first-token (prefill, bandwidth floor), ±50%
+  ttft_ms: number; // indicative time-to-first-token (prefill), ±50%
+  /** True when TTFT is set by prefill arithmetic rather than by streaming the weights once. */
+  ttft_compute_bound: boolean;
+  /** Total prefill work for one request, in PFLOPs — the thing TTFT is actually bounded by. */
+  prefill_pflops: number;
   step_time_ms: number; // per-decode-step time for the in-flight batch
   /** integer bytes per GPU committed by this replica's weights+KV — used by the capacity gate (AD-2c). */
   committed_bytes_per_gpu: bigint;

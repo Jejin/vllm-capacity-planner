@@ -5,7 +5,7 @@
 // and GpuSku.mem_gb. Vectors were re-pinned when the engine stopped mixing 1e9-byte GB (weights)
 // with 2^30-byte GiB (KV, capacity), which had inflated weights ~7.4% against GPU capacity.
 import { describe, it, expect } from 'vitest';
-import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
+import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
 import { crossCheckVram } from '../recipes.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema, gpuSkuSchema } from '../schema.js';
@@ -219,6 +219,65 @@ describe('§C low-bit weight vectors (un-quantised embedding/lm_head tail)', () 
   });
 });
 
+// Time to first token. Prefill runs the whole prompt through the network before emitting a
+// token, so it is COMPUTE-bound. Sizing it as "stream the weights once" — the decode bound —
+// understated a 78k-token prefill by three orders of magnitude.
+describe('§C time to first token (prefill)', () => {
+  const base = {
+    quant: 'FP8' as const, kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
+    target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
+  };
+
+  it('AC-52 — a 78k-token prefill takes seconds, not milliseconds', () => {
+    const r = computeSizing(model('llama33-70b'), gpu('h200'), base) as FeasibleSizing;
+    expect(r.ttft_compute_bound).toBe(true);
+    expect(r.ttft_ms).toBeGreaterThan(5000);
+    expect(near(r.ttft_ms, 8632, 0.1)).toBe(true);
+    // the old bandwidth-only model produced ~7 ms for this exact case
+    const weightStreamMs = (activeWeightsGb(model('llama33-70b'), 'FP8') * GIB) / (r.tp * gpu('h200').bw_tbs * 1e12 * 0.55) * 1000;
+    expect(r.ttft_ms / weightStreamMs).toBeGreaterThan(100);
+  });
+
+  it('AC-53 — attention dominates prefill at long context', () => {
+    const m = model('llama33-70b');
+    const T = 131072 * 0.6;
+    const total = prefillFlops(m, T);
+    const denseOnly = 2 * m.active_params_b * 1e9 * T;
+    expect(total - denseOnly).toBeGreaterThan(denseOnly); // the T^2 term is the larger half
+    expect(near(total / 1e15, 27.3, 0.05)).toBe(true);
+  });
+
+  it('AC-54 — prefill cost is quadratic in prompt length on full-attention layers', () => {
+    const m = model('llama33-70b');
+    const a = prefillFlops(m, 10_000);
+    const b = prefillFlops(m, 20_000);
+    expect(b / a).toBeGreaterThan(2); // super-linear
+    expect(b / a).toBeLessThan(4); // but not purely quadratic — the matmuls are linear
+  });
+
+  it('AC-55 — sliding-window layers make prefill cheaper too, not just the KV cache', () => {
+    const m = model('gptoss-120b');
+    const naive = { ...m, sliding_window: undefined, full_attention_layers: undefined };
+    const T = 131072 * 0.6;
+    expect(prefillFlops(m, T)).toBeLessThan(prefillFlops(naive, T));
+    expect(near(prefillFlops(m, T) / 1e15, 2.09, 0.05)).toBe(true);
+  });
+
+  it('AC-56 — with no FLOPS figure, TTFT falls back to the bandwidth floor and says so', () => {
+    const g = { ...gpu('h200'), tflops_fp16: undefined };
+    const r = computeSizing(model('llama33-70b'), g, base) as FeasibleSizing;
+    expect(r.ttft_compute_bound).toBe(false);
+    expect(r.ttft_ms).toBeLessThan(100); // the old, wrong answer — but now flagged as a floor
+  });
+
+  it('AC-57 — more GPUs prefill proportionally faster', () => {
+    const narrow = computeSizing({ ...model('llama33-70b'), tp_options: [2] }, gpu('h200'), base) as FeasibleSizing;
+    const wide = computeSizing({ ...model('llama33-70b'), tp_options: [8] }, gpu('h200'), base) as FeasibleSizing;
+    expect(wide.ttft_ms).toBeLessThan(narrow.ttft_ms);
+    expect(narrow.ttft_ms / wide.ttft_ms).toBeCloseTo(4, 0); // TP2 -> TP8
+  });
+});
+
 // Mixed-precision checkpoints. Frontier low-bit releases rarely quantise everything: NVIDIA's
 // ModelOpt GLM-5.2 card says "only MoE expert linears are quantized to NVFP4". A single
 // bytes/param cannot express that, so a model may declare its dense remainder.
@@ -365,7 +424,8 @@ describe('§C unit consistency (GiB throughout)', () => {
     const stepBytes = (activeGib + 10 * r.kv_per_request_gb) * GIB;
     const bytesPerSec = r.tp * g.bw_tbs * 1e12 * 0.55;
     expect(r.step_time_ms).toBeCloseTo(Math.round((stepBytes / bytesPerSec) * 1e5) / 100, 2);
-    expect(r.ttft_ms).toBe(Math.round(((activeGib * GIB) / bytesPerSec) * 1000));
+    // TTFT is no longer this quantity — weight-streaming is only its floor (see AC-52..AC-56)
+    expect(r.ttft_ms).toBeGreaterThanOrEqual(Math.round(((activeGib * GIB) / bytesPerSec) * 1000));
   });
 });
 

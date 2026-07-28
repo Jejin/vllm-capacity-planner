@@ -35,6 +35,18 @@ export const DEFAULT_BATCHED_TOKENS = 2048;
  * those into one multiple over `hidden_size` at 2-byte activations. Order-of-magnitude, not exact.
  */
 export const ACT_BYTES_PER_TOKEN_HIDDEN = 12;
+/**
+ * Model FLOPs Utilisation achieved during prefill. Prefill is a big dense GEMM and reaches far
+ * better utilisation than decode, but nowhere near peak once attention, norms and the scheduler
+ * are counted. Distinct from MBU, which bounds the memory-bound decode phase.
+ */
+export const PREFILL_MFU = 0.4;
+/**
+ * Tensor-core speedup for sub-16-bit compute, relative to the SKU's FP16 figure. Capped at 2x
+ * (FP8-class) even for 4-bit formats: Blackwell does better, but we do not track GPU generation
+ * and under-promising TTFT is the safe direction.
+ */
+const LOW_PRECISION_SPEEDUP = 2;
 /** Legacy flat overhead factor — used ONLY when a model carries no embedding geometry. */
 export const WEIGHT_OVERHEAD = 1.02;
 export const MBU = 0.55; // model bandwidth utilisation (decode roofline)
@@ -219,6 +231,27 @@ export function activeWeightsGb(model: Model, quant: Quant): number {
 }
 
 /**
+ * FLOPs to prefill one request of `tokens`, which is what TTFT is actually bounded by.
+ *
+ *   dense matmuls : 2 x active_params x tokens          (linear in sequence length)
+ *   attention     : 4 x hidden x per-layer sequence work (QUADRATIC on full-attention layers)
+ *
+ * The attention term is not a rounding error. Llama-3.3-70B prefilling 78k tokens spends 16.2
+ * PFLOPs on attention against 11.1 on the matmuls — long-context TTFT is an attention problem.
+ * That also makes the layer regimes matter enormously: a sliding-window layer costs
+ * tokens x window instead of tokens^2, and a linear layer is linear in tokens.
+ */
+export function prefillFlops(model: Model, tokens: number): number {
+  const dense = 2 * model.active_params_b * 1e9 * tokens;
+  const hidden = model.hidden_size;
+  if (!hidden) return dense; // no geometry to size attention with; matmuls only
+  const { full, windowed, linear } = layerSplit(model);
+  const windowTokens = model.sliding_window ? Math.min(tokens, model.sliding_window) : tokens;
+  const seqWork = full * tokens * tokens + windowed * tokens * windowTokens + linear * tokens;
+  return dense + 4 * hidden * seqWork;
+}
+
+/**
  * Compute a full sizing (FR-10). Pure function of (model, gpu, input).
  * The same inputs against the same geometry recompute identically (AD-2a, FR-10).
  */
@@ -308,9 +341,22 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   );
   // per-request decode rate = one token per step, from that request's share of the batch.
   const decode_tps_per_request = active_per_replica > 0 ? Math.round(1 / step_time_sec) : 0;
-  // Indicative TTFT (prefill): bandwidth floor to stream the active weights once before the
-  // first token. Compute-bound prefill needs FLOPS for precision (out of Phase-1 scope) — ±50%.
-  const ttft_ms = Math.round(((active_gib * GIB) / pod_bytes_per_sec) * 1000);
+  // Indicative TTFT. Prefill is COMPUTE-bound: it must run the whole prompt through the network
+  // before emitting a token. Sizing it as "stream the weights once" — the decode bound — under-
+  // states a 78k-token prefill by three orders of magnitude. The weight-streaming time survives
+  // only as a floor, for the short prompts where it genuinely dominates.
+  const prefill_flops = prefillFlops(model, active_tokens);
+  const weight_stream_sec = (active_gib * GIB) / pod_bytes_per_sec;
+  let ttft_sec = weight_stream_sec;
+  let ttft_compute_bound = false;
+  if (gpu.tflops_fp16 && gpu.tflops_fp16 > 0) {
+    const speedup = QB[quant] <= 1 ? LOW_PRECISION_SPEEDUP : 1;
+    const pod_flops_per_sec = tp * gpu.tflops_fp16 * 1e12 * speedup * PREFILL_MFU;
+    const compute_sec = prefill_flops / pod_flops_per_sec;
+    ttft_compute_bound = compute_sec > weight_stream_sec;
+    ttft_sec = Math.max(compute_sec, weight_stream_sec);
+  }
+  const ttft_ms = Math.round(ttft_sec * 1000);
 
   const result: FeasibleSizing = {
     ok: true,
@@ -334,6 +380,8 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     throughput_tokens_per_sec,
     decode_tps_per_request,
     ttft_ms,
+    ttft_compute_bound,
+    prefill_pflops: prefill_flops / 1e15,
     step_time_ms: Math.round(step_time_sec * 1000 * 100) / 100,
     committed_bytes_per_gpu: committedBytesPerGpu(gpu),
   };
