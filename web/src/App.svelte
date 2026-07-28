@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, serveCommand, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, serveCommand, topologyLayout, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -64,6 +64,16 @@
   const kvPer = $derived(R ? (activePer * R.kv_per_request_gb) / R.tp : 0);
   const kvAlloc = $derived(R ? activePer * R.kv_per_request_gb : 0);
   const stacks = $derived(R ? Math.min(R.tp, 8) : 0);
+
+  // ── Deployment topology ──
+  // Geometry lives in the domain package so it can be unit-tested and rendered headlessly;
+  // a diagram whose layout only exists in a template can only be checked by eye, in a browser.
+  const topo = $derived(R ? topologyLayout(R, perNode) : null);
+  const storeLabel = $derived(R ? `shared weights · ${fmt(R.weights_gb)} GiB per replica` : '');
+  // ~6.2px per char at 10px/700 Manrope; sizing the box to the string beats a fixed width that
+  // the four-digit models overflow
+  const storeW = $derived(Math.max(180, storeLabel.length * 6.2 + 24));
+
   // launch command for ONE replica of the current plan
   let cmdDocker = $state(false);
   let cmdCopied = $state(false);
@@ -82,6 +92,7 @@
   const kvNominalGb = $derived(
     model ? (kvPerTokenBytes(model, kvBytes) * ctx * util) / 2 ** 30 : 0,
   );
+
   const pctOf = (n: number) => `${Math.max(0, Math.min(100, (n / (gpu?.mem_gb ?? 1)) * 100)).toFixed(1)}%`;
 
   // Concurrency rubric — sweep target concurrency at the current config (FR-12 / metrics).
@@ -405,24 +416,72 @@
           <p class="replnote">This model runs as <b>{R.pods}</b> identical replica{R.pods > 1 ? 's' : ''} → {R.pods} × TP{R.tp} = <b>{R.gpus}</b> GPUs total{#if R.tp > 8} (showing 8 of {R.tp} GPUs in the replica){/if}.</p>
         </div>
 
-        {#if R.tp > 1}
+        {#if topo}
           <div class="panel">
-            <h2>Tensor-parallel topology — one replica across {R.tp} GPUs{#if tpNodes > 1} · {tpNodes} nodes{/if}</h2>
-            <div class="topo">
-              {#each Array(tpNodes) as _, n}
-                <div class="node">
-                  <span class="nl">Node {n + 1}</span>
-                  <div class="gcells">
-                    {#each Array(perNode) as _, j}
-                      {@const idx = n * perNode + j}
-                      <div class="gcell" class:used={idx < R.tp}>{idx < R.tp ? 'G' + idx : ''}</div>
-                    {/each}
-                  </div>
-                </div>
-                {#if n < tpNodes - 1}<span class="tpspan">TP{R.tp} →</span>{/if}
-              {/each}
+            <h2>Deployment topology — {R.pods} replica{R.pods > 1 ? 's' : ''} × TP{R.tp} on {R.nodes} node{R.nodes > 1 ? 's' : ''}</h2>
+            <div class="topowrap">
+              <svg class="topo2" viewBox="0 0 {topo.width} {topo.height}" width={topo.width} height={topo.height}
+                   role="img" aria-labelledby="topotitle topodesc">
+                <title id="topotitle">Deployment topology diagram</title>
+                <desc id="topodesc">{R.pods} serving replicas, each sharded across {R.tp} GPUs, placed on {R.nodes} nodes of {perNode} GPUs. {R.multi_node ? 'At least one replica spans a node boundary, so its tensor-parallel collective crosses the inter-node fabric.' : 'Every replica fits inside a single node.'}</desc>
+
+                <!-- logical layer: one entry point fanning out to replicas -->
+                <rect x={topo.contentW / 2 - 80} y="0" width="160" height="26" rx="6" class="tbox router" />
+                <text x={topo.contentW / 2} y="17" class="tlabel mid">router · llm-d</text>
+                {#each topo.pods as pod}
+                  <line x1={topo.contentW / 2} y1="26" x2={(pod.x0 + pod.x1) / 2} y2="48" class="tlink" />
+                  <rect x={pod.x0} y="48" width={pod.x1 - pod.x0} height="22" rx="5"
+                        class="tbox pod" class:spanning={pod.spans} />
+                  <text x={pod.labelInside ? (pod.x0 + pod.x1) / 2 : pod.x1 + 6} y="63"
+                        class="tlabel" class:mid={pod.labelInside}>
+                    {pod.spans ? '⚠ ' : ''}replica {pod.p + 1} · TP{R.tp}
+                  </text>
+                {/each}
+
+                <!-- physical layer -->
+                {#each Array(topo.shown) as _, n}
+                  {@const nx = n * (topo.nodeW + topo.nodeGap)}
+                  <rect x={nx} y={topo.nodeY} width={topo.nodeW} height={topo.nodeH} rx="7" class="tbox node" />
+                  <text x={nx + topo.nodePad} y={topo.nodeY + 14} class="tlabel">node {n + 1}{topo.nodeLabelFull ? ` · ${perNode} GPU` : ''}</text>
+                  {#each topo.gpus.filter((g) => g.n === n) as g}
+                    <rect x={g.x} y={topo.nodeY + topo.labelH} width={topo.cell} height={topo.cell} rx="4"
+                          class="tgpu" class:used={g.used} />
+                    <text x={g.x + topo.cell / 2} y={topo.nodeY + topo.labelH + 17} class="tgpulabel mid">
+                      {g.used ? g.g : ''}
+                    </text>
+                  {/each}
+                  <line x1={nx + topo.nodeW / 2} y1={topo.nodeY + topo.nodeH}
+                        x2={nx + topo.nodeW / 2} y2={topo.multi ? topo.switchY : topo.storeY}
+                        class="tlink" class:fabric={topo.multi && R.multi_node} />
+                {/each}
+
+                {#if topo.multi}
+                  <rect x={topo.contentW / 2 - 92} y={topo.switchY} width="184" height="26" rx="6"
+                        class="tbox sw" class:hot={R.multi_node} />
+                  <text x={topo.contentW / 2} y={topo.switchY + 17} class="tlabel mid">
+                    {R.multi_node ? '⚠ ' : ''}InfiniBand / RoCE fabric
+                  </text>
+                  <line x1={topo.contentW / 2} y1={topo.switchY + 26} x2={topo.contentW / 2} y2={topo.storeY} class="tlink" />
+                {/if}
+
+                <rect x={topo.contentW / 2 - storeW / 2} y={topo.storeY} width={storeW} height="26" rx="6" class="tbox store" />
+                <text x={topo.contentW / 2} y={topo.storeY + 17} class="tlabel mid">{storeLabel}</text>
+              </svg>
             </div>
-            <p class="tot">One serving replica splits weights + compute across <b>{R.tp}</b> GPUs{#if R.multi_node}, spanning {tpNodes} nodes — requires NVLink/IB fabric; latency &amp; MBU degrade vs single-node{/if}. The plan runs <b>{R.pods}</b> such replica{R.pods > 1 ? 's' : ''} = {R.gpus} GPUs total.</p>
+
+            <div class="topolegend">
+              <span><i class="sw-used"></i>GPU in this plan</span>
+              <span><i class="sw-idle"></i>idle GPU in the node</span>
+              <span><i class="sw-pod"></i>replica (TP group)</span>
+              {#if R.multi_node}<span class="warnitem">⚠ crosses the fabric</span>{/if}
+            </div>
+
+            {#if R.multi_node}
+              <p class="tot"><b>TP{R.tp} does not fit in a {perNode}-GPU node.</b> Each replica's tensor-parallel collective — an all-reduce on every layer, on every token — leaves the node and crosses the fabric shown above. Inside a node that traffic rides NVLink at multiple TB/s; between nodes it rides InfiniBand or RoCE at a fraction of that, and it is on the critical path of every forward pass. Expect materially worse latency and MBU than the throughput figures here assume, and treat a non-NVLink fabric as a hard prerequisite rather than a detail.</p>
+            {:else}
+              <p class="tot">Every replica sits inside one node, so its tensor-parallel collective stays on NVLink and never touches the inter-node fabric. Replicas are independent — they share only the weights on storage and the router in front, so scaling out adds throughput without adding collective traffic.</p>
+            {/if}
+            {#if topo.truncated}<p class="tot">Showing {topo.shown} of {R.nodes} nodes; the remaining {topo.hiddenNodes} repeat the same pattern.</p>{/if}
           </div>
         {/if}
 
@@ -774,6 +833,10 @@
     <p>The obvious rule — smallest TP that holds the weights plus one request — <b>over-recommends hardware</b>. A bigger shard leaves proportionally more room for KV and packs far more sessions per replica, and what you pay for is <code>pods × TP</code>, not <code>TP</code>. Llama-3.3-70B at FP8, 128K/60%, 64 concurrent on H200: TP1 needs 16 GPUs, TP2 needs 10, TP4 and TP8 need <b>8</b>.</p>
     <p class="note">The engine evaluates every TP in the model's ladder and takes the cheapest total, breaking ties toward the <em>smaller</em> shard — same GPU count, less collective traffic. That makes this a cost/throughput objective; a latency-oriented planner would bias toward larger shards.</p>
 
+    <h3 class="dh3">What crossing a node boundary costs</h3>
+    <p>TP is not free at any width, but the price jumps at the node boundary. A tensor-parallel group performs an <b>all-reduce on every layer, for every token</b> — inside a node that rides NVLink at multiple TB/s; between nodes it rides InfiniBand or RoCE at a fraction of that, on the critical path of every forward pass. The throughput and TTFT figures here assume the collective is not the bottleneck, which stops being true once a replica spans nodes.</p>
+    <p class="note">The Sizing tab draws this rather than asserting it: every GPU on one axis, grouped into node boxes, each replica a bar above them. A replica that fits inside a node is a bar inside one box; one that does not visibly spans the gap where the fabric sits. Replicas are independent — they share only the weights on storage and the router in front — so scaling <em>out</em> adds throughput without adding collective traffic, while scaling <em>up</em> past the node boundary adds both.</p>
+
     <h3 class="dh3">Local &amp; global attention</h3>
     <p>Not every layer attends over the whole context. Many models alternate <b>full-attention</b> layers with <b>sliding-window</b> layers that only ever look back a fixed number of tokens. The windowed layers' KV stops growing once the sequence passes the window, so long-context KV falls well below the naive all-layers-full figure:</p>
     <div class="formula">KV per request = perLayer × ( full × tokens + windowed × min(tokens, window) )</div>
@@ -926,12 +989,33 @@
   .ctxactions{display:flex;gap:8px;align-items:center}.ctxactions select{width:auto;font-size:12px;padding:6px 8px}
   /* TP topology */
   .topo{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:4px 0}
-  .node{border:1px dashed var(--line);border-radius:7px;padding:9px;background:var(--surface2)}
-  .node .nl{font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.08em;display:block;margin-bottom:6px;font-weight:700}
-  .gcells{display:flex;gap:5px}
-  .gcell{width:34px;height:34px;border-radius:5px;border:1.5px solid var(--line);background:var(--bg);display:grid;place-items:center;font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;color:var(--ink3)}
-  .gcell.used{background:var(--wash);border-color:var(--brand);color:var(--brandink)}
-  .tpspan{font-size:10px;color:var(--ink3);font-family:'IBM Plex Mono',monospace}
+  /* deployment topology — colours come from the app's own tokens, so dark mode is the
+     same selection rather than an inverted copy. Status colour is reserved for the fabric
+     crossing and always ships with a glyph and a label, never colour alone. */
+  .topowrap{overflow-x:auto;padding:4px 0 2px}
+  .topo2{display:block;min-width:100%}
+  .topo2 .tbox{fill:var(--surface2);stroke:var(--line);stroke-width:1.5}
+  .topo2 .tbox.router{fill:var(--wash);stroke:var(--brand)}
+  .topo2 .tbox.pod{fill:var(--surface);stroke:var(--purple);stroke-width:2}
+  .topo2 .tbox.pod.spanning{fill:var(--warnbg);stroke:var(--warnln);stroke-dasharray:5 3}
+  .topo2 .tbox.node{fill:none;stroke:var(--line);stroke-dasharray:4 3}
+  .topo2 .tbox.sw{fill:var(--surface2);stroke:var(--slate)}
+  .topo2 .tbox.sw.hot{fill:var(--warnbg);stroke:var(--warnln);stroke-width:2}
+  .topo2 .tbox.store{fill:var(--surface2);stroke:var(--grey)}
+  .topo2 .tgpu{fill:var(--bg);stroke:var(--line);stroke-width:1.5}
+  .topo2 .tgpu.used{fill:var(--wash);stroke:var(--brand)}
+  .topo2 .tlink{stroke:var(--line);stroke-width:1.5;fill:none}
+  .topo2 .tlink.fabric{stroke:var(--warnln);stroke-dasharray:4 3}
+  .topo2 .tlabel{font-family:Manrope,system-ui,sans-serif;font-size:10px;font-weight:700;fill:var(--ink2)}
+  .topo2 .tgpulabel{font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:600;fill:var(--ink3)}
+  .topo2 .mid{text-anchor:middle}
+  .topolegend{display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--ink2);margin-top:10px}
+  .topolegend span{display:flex;align-items:center;gap:5px}
+  .topolegend i{width:11px;height:11px;border-radius:3px;display:inline-block;border:1.5px solid var(--line)}
+  .topolegend .sw-used{background:var(--wash);border-color:var(--brand)}
+  .topolegend .sw-idle{background:var(--bg)}
+  .topolegend .sw-pod{background:var(--surface);border-color:var(--purple)}
+  .topolegend .warnitem{color:var(--warn);font-weight:700}
   /* admin catalog forms */
   .quants{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
   .qbtn{border:1px solid var(--line);background:var(--surface2);color:var(--ink2);border-radius:5px;padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;font-family:'IBM Plex Mono',monospace}

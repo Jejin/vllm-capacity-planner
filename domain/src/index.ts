@@ -7,4 +7,5 @@ export * from './seed.js';
 export * from './hf.js';
 export * from './recipes.js';
 export * from './serve.js';
+export * from './topology.js';
 export * from './reconcile.js';

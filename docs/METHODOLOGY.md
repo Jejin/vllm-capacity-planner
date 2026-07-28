@@ -132,6 +132,12 @@ Llama-3.3-70B at FP8, 128K/60%, 64 concurrent, on H200:
 
 The engine evaluates every TP in the model's ladder and takes the cheapest total, breaking ties toward the **smaller** shard (same GPU count, less collective traffic). That makes this a cost/throughput objective; a latency-oriented planner would bias toward larger shards instead.
 
+### What crossing a node boundary costs
+
+TP is not free at any width, but the price jumps at the node boundary. A tensor-parallel group performs an **all-reduce on every layer, for every token** — inside a node that traffic rides NVLink at multiple TB/s; between nodes it rides InfiniBand or RoCE at a fraction of that, and it sits on the critical path of every forward pass. The throughput and TTFT figures here assume the collective is not the bottleneck, which stops being true once a replica spans nodes.
+
+The sizing view draws this rather than asserting it: every GPU on one axis, grouped into node boxes, with each replica as a bar above them. A replica that fits inside a node is a bar inside one box; one that does not is a bar visibly spanning the gap where the fabric is drawn. Replicas are independent of each other — they share only the weights on storage and the router in front — so scaling *out* adds throughput without adding collective traffic, while scaling *up* past the node boundary adds both.
+
 This is also why `tp_options` should be generous. Listing extra small sizes is harmless — infeasible ones are skipped — but listing too few silently forces more hardware than the model needs.
 
 ### Local & global attention
