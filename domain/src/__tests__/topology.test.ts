@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { topologyLayout, topologySvg, escapeSvgText } from '../topology.js';
+import { topologyLayout, topologySvg, escapeSvgText, truncLabels } from '../topology.js';
 import { computeSizing } from '../engine.js';
 import { seedCatalog } from '../seed.js';
 import type { FeasibleSizing } from '../types.js';
@@ -66,6 +66,46 @@ describe('topology layout', () => {
     expect(t.hiddenNodes).toBe(r.nodes - 4);
   });
 
+  // The heading counts the whole deployment, so the drawing has to account for the replicas it
+  // leaves out too — "8 replicas on 16 nodes" over a picture of two replicas reads as a bug.
+  it('counts the replicas left out, not just the nodes', () => {
+    const r = size('llama33-70b', 'h100', { quant: 'FP8', selected_ctx: 131072, target_concurrency: 512, gpus_per_node: 6 });
+    expect(r.nodes).toBeGreaterThan(4);
+    const t = topologyLayout(r, 6);
+    expect(t.shownPods).toBe(t.pods.length);
+    expect(t.shownPods).toBeLessThan(r.pods);
+    expect(t.shownPods + t.hiddenPods).toBe(r.pods);
+    expect(t.truncX).not.toBeNull();
+    expect(t.truncX!).toBeGreaterThanOrEqual(t.contentW);
+  });
+
+  it('claims no hidden replicas when every replica is drawn', () => {
+    const r = size('llama33-70b', 'h200', { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64, gpus_per_node: 8 });
+    const t = topologyLayout(r, 8);
+    expect(t.truncated).toBe(false);
+    expect(t.hiddenPods).toBe(0);
+    expect(t.hiddenNodes).toBe(0);
+    expect(t.truncX).toBeNull();
+    expect(t.pods.every((p) => p.gpusShown === r.tp)).toBe(true);
+  });
+
+  it('records how much of a replica the node cap actually drew', () => {
+    // 3 GPUs/node with TP8: four node boxes hold 12 GPUs, so the second bar stops mid-replica.
+    const r = size('llama33-70b', 'h100', { quant: 'FP8', selected_ctx: 131072, target_concurrency: 512, gpus_per_node: 3 });
+    const t = topologyLayout(r, 3);
+    expect(t.truncated).toBe(true);
+    const last = t.pods[t.pods.length - 1];
+    expect(last.gpusShown).toBeLessThan(r.tp);
+    expect(t.pods.slice(0, -1).every((p) => p.gpusShown === r.tp)).toBe(true);
+  });
+
+  it('reserves viewBox width for the truncation marker', () => {
+    const r = size('llama33-70b', 'h100', { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64, gpus_per_node: 2 });
+    const t = topologyLayout(r, 2);
+    const longest = Math.max(...truncLabels(t.hiddenNodes, t.hiddenPods).map((s) => s.length));
+    expect(t.width - t.truncX!).toBeGreaterThan(longest * 6.2);
+  });
+
   it('leaves slack past the drawing area so right-hand labels are not clipped', () => {
     const r = size('llama33-70b', 'h200', { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64, gpus_per_node: 8 });
     const t = topologyLayout(r, 8);
@@ -104,6 +144,26 @@ describe('topology SVG rendering', () => {
     expect(contained).not.toContain('spanning');
     expect(contained).not.toContain('sw hot');
     expect(contained).not.toContain('⚠');
+  });
+
+  it('draws what it left out, naming replicas and nodes', () => {
+    const truncated = render('llama33-70b', 'h100', 6, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 512 });
+    expect(truncated).toContain('more replicas');
+    expect(truncated).toContain('more nodes');
+    expect(truncated).toContain('⋯');
+
+    const whole = render('llama33-70b', 'h200', 8, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64 });
+    expect(whole).not.toContain('more replica');
+    expect(whole).not.toContain('⋯');
+  });
+
+  it('leaves a half-drawn replica bar open on the right instead of closing it', () => {
+    const cut = render('llama33-70b', 'h100', 3, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 512 });
+    expect(cut).toMatch(/class="tbox pod(?: spanning)? cut"/);
+    expect(cut).toMatch(/<path d="M [\d.]+ 48 H/); // open-ended, not a closed rect
+    const whole = render('llama33-70b', 'h200', 8, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64 });
+    expect(whole).not.toContain('cut');
+    expect(whole).not.toContain('<path');
   });
 
   it('omits the fabric entirely on a single node', () => {

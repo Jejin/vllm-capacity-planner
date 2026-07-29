@@ -33,6 +33,10 @@ const SCENARIOS = [
     { quant: 'MXFP4', selected_ctx: 1048576, target_concurrency: 8 }],
   ['Narrow nodes — 2 GPU/node, more nodes than are drawn', 'llama33-70b', 'h100', 2,
     { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64 }],
+  ['TRUNCATED — 8 replicas on 16 nodes, only 2 and 4 of them drawn', 'glm52', 'h200', 8,
+    { quant: 'FP8', selected_ctx: 1048576, target_concurrency: 256, avg_context_utilisation: 0.8 }],
+  ['TRUNCATED mid-replica — 3 GPU/node cuts the last TP8 bar in half', 'llama33-70b', 'h100', 3,
+    { quant: 'FP8', selected_ctx: 131072, target_concurrency: 512 }],
   ['Wide replica — TP8 across a full node', 'glm45', 'h200', 8,
     { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64 }],
 ];
@@ -116,7 +120,9 @@ if (!chrome) {
 for (const theme of ['light', 'dark']) {
   execFileSync(chrome, [
     '--headless', '--no-sandbox', '--disable-gpu', '--hide-scrollbars',
-    '--window-size=1200,1700',
+    // wide and tall enough for every scenario at full size — a diagram clipped by the window
+    // is exactly the kind of thing this harness exists to catch, so it must not clip it itself
+    '--window-size=1800,3400',
     `--screenshot=${join(outDir, `topology-${theme}.png`)}`,
     join(outDir, `topology-${theme}.html`),
   ], { stdio: 'ignore' });

@@ -48,6 +48,11 @@ export interface TopoPod {
    * centring text on it pushes half the string off-canvas, so narrow bars label to the right.
    */
   labelInside: boolean;
+  /**
+   * GPUs of this replica that fall inside the drawn nodes. Below `tp` when the node cap cuts
+   * a replica in half, and the bar must then say so rather than pass for a whole TP group.
+   */
+  gpusShown: number;
 }
 
 export interface TopologyLayout {
@@ -74,6 +79,12 @@ export interface TopologyLayout {
   pods: TopoPod[];
   truncated: boolean;
   hiddenNodes: number;
+  /** Replicas with a bar in the drawing — `pods.length`, named for the render side. */
+  shownPods: number;
+  /** Replicas the node cap left out entirely. */
+  hiddenPods: number;
+  /** x of the "more of the same" marker, or null when nothing is left out. */
+  truncX: number | null;
 }
 
 export function topologyLayout(
@@ -90,7 +101,6 @@ export function topologyLayout(
   const shown = Math.max(1, Math.min(sizing.nodes, maxNodes));
   const nodeW = perNode * cell + (perNode - 1) * cellGap + nodePad * 2;
   const contentW = shown * nodeW + (shown - 1) * nodeGap;
-  const width = contentW + padRight;
   const nodeY = 92;
   const nodeH = labelH + cell + nodePad;
 
@@ -118,20 +128,50 @@ export function topologyLayout(
     const last = mine[mine.length - 1];
     const x0 = first.x;
     const x1 = last.x + cell;
-    pods.push({ p, x0, x1, spans: first.n !== last.n, labelInside: x1 - x0 >= minPodLabelW });
+    pods.push({
+      p, x0, x1,
+      spans: first.n !== last.n,
+      labelInside: x1 - x0 >= minPodLabelW,
+      gpusShown: mine.length,
+    });
   }
 
   const multi = shown > 1;
   const switchY = nodeY + nodeH + 34;
   const storeY = switchY + (multi ? 56 : 30);
 
+  // The heading counts the whole deployment while the drawing stops at `maxNodes`; without a
+  // marker in the picture itself, "8 replicas on 16 nodes" sits directly above two replicas on
+  // four nodes and reads as a bug. Reserve the width the marker needs before sizing the viewBox.
+  const truncated = sizing.nodes > shown;
+  const hiddenNodes = Math.max(0, sizing.nodes - shown);
+  const hiddenPods = Math.max(0, sizing.pods - pods.length);
+  const truncGap = 14;
+  const truncW = truncated
+    ? truncGap + Math.max(...truncLabels(hiddenNodes, hiddenPods).map(labelWidth))
+    : 0;
+
   return {
     shown, perNode, cell, nodePad, nodeW, nodeGap, labelH, nodeH,
-    width, contentW, height: storeY + 40, nodeY, switchY, storeY, multi, gpus, pods,
+    contentW, width: contentW + Math.max(padRight, truncW),
+    height: storeY + 40, nodeY, switchY, storeY, multi, gpus, pods,
     nodeLabelFull: nodeW >= minNodeLabelW,
-    truncated: sizing.nodes > shown,
-    hiddenNodes: Math.max(0, sizing.nodes - shown),
+    truncated, hiddenNodes, hiddenPods,
+    shownPods: pods.length,
+    truncX: truncated ? contentW + truncGap : null,
   };
+}
+
+/**
+ * Caption for the elided part of the deployment, one line per thing being elided. Shared by the
+ * layout (which sizes the viewBox to it) and the renderer (which draws it), so they cannot
+ * disagree about how much room the marker takes.
+ */
+export function truncLabels(hiddenNodes: number, hiddenPods: number): string[] {
+  const lines: string[] = [];
+  if (hiddenPods > 0) lines.push(`+${hiddenPods} more replica${hiddenPods > 1 ? 's' : ''}`);
+  if (hiddenNodes > 0) lines.push(`on +${hiddenNodes} more node${hiddenNodes > 1 ? 's' : ''}`);
+  return lines.length ? lines : ['…'];
 }
 
 // ── Rendering ────────────────────────────────────────────────────────────────────────────────
@@ -189,9 +229,24 @@ export function topologySvg(t: TopologyLayout, o: TopologyRenderOptions): string
   );
   for (const pod of t.pods) {
     const mid = (pod.x0 + pod.x1) / 2;
+    const cls = `tbox pod${pod.spans ? ' spanning' : ''}`;
+    out.push(`<line x1="${cx}" y1="26" x2="${mid}" y2="48" class="tlink"/>`);
+    if (pod.gpusShown < o.tp) {
+      // The node cap ended mid-replica. A closed bar over half a TP group asserts the group is
+      // that size, so this one runs off the right edge open — the shape says "continues", which
+      // is the truth, and it needs no label text that a four-cell bar could not hold.
+      const r = 5;
+      const xe = pod.x1 + 12;
+      out.push(
+        `<path d="M ${xe} 48 H ${pod.x0 + r} A ${r} ${r} 0 0 0 ${pod.x0} ${48 + r} V ${70 - r} ` +
+          `A ${r} ${r} 0 0 0 ${pod.x0 + r} 70 H ${xe}" class="${cls} cut"/>`,
+      );
+    } else {
+      out.push(
+        `<rect x="${pod.x0}" y="48" width="${pod.x1 - pod.x0}" height="22" rx="5" class="${cls}"/>`,
+      );
+    }
     out.push(
-      `<line x1="${cx}" y1="26" x2="${mid}" y2="48" class="tlink"/>`,
-      `<rect x="${pod.x0}" y="48" width="${pod.x1 - pod.x0}" height="22" rx="5" class="tbox pod${pod.spans ? ' spanning' : ''}"/>`,
       `<text x="${pod.labelInside ? mid : pod.x1 + 6}" y="63" class="tlabel${pod.labelInside ? ' mid' : ''}">` +
         `${pod.spans ? '⚠ ' : ''}replica ${pod.p + 1} · TP${o.tp}</text>`,
     );
@@ -213,6 +268,19 @@ export function topologySvg(t: TopologyLayout, o: TopologyRenderOptions): string
     out.push(
       `<line x1="${nx + t.nodeW / 2}" y1="${t.nodeY + t.nodeH}" x2="${nx + t.nodeW / 2}" ` +
         `y2="${t.multi ? t.switchY : t.storeY}" class="tlink${t.multi && warn ? ' fabric' : ''}"/>`,
+    );
+  }
+
+  // What the node cap left out, drawn where the drawing stops rather than only stated in prose
+  // under it. Ellipses on both rows so the elision reads as "and so on", not "and that's all".
+  if (t.truncX !== null) {
+    const lines = truncLabels(t.hiddenNodes, t.hiddenPods);
+    const midY = t.nodeY + t.labelH + t.cell / 2;
+    const y0 = midY - ((lines.length - 1) * 12) / 2 + 3;
+    if (t.pods.length) out.push(`<text x="${t.truncX}" y="63" class="tlabel more">⋯</text>`);
+    out.push(`<text x="${t.truncX}" y="${midY + 4}" class="tlabel more">⋯</text>`);
+    lines.forEach((s, i) =>
+      out.push(`<text x="${t.truncX! + 16}" y="${y0 + i * 12}" class="tlabel more">${esc(s)}</text>`),
     );
   }
 
