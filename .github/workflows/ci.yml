@@ -9,4 +9,6 @@ jobs:
         with: { node-version: '24' }
       - run: npm install
       - run: npm test
-      - run: npm run build -w web
+      # the whole build, not just the web workspace: CI only ever ran `-w web`, so `npm run
+      # build` was free to call a script the server workspace does not have and nothing noticed
+      - run: npm run build

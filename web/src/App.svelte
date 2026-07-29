@@ -79,6 +79,8 @@
   // Geometry lives in the domain package so it can be unit-tested and rendered headlessly;
   // a diagram whose layout only exists in a template can only be checked by eye, in a browser.
   const topo = $derived(R ? topologyLayout(R, perNode) : null);
+  /** The node cut-off landed inside a TP group, so one bar is drawn open-ended. */
+  const topoCut = $derived(!!topo && !!R && topo.pods.some((p) => p.gpusShown < R.tp));
   const topoSvg = $derived(
     topo && R
       ? topologySvg(topo, {
@@ -86,7 +88,7 @@
           perNode,
           multiNode: R.multi_node,
           storeLabel: `shared weights · ${fmt(R.weights_gb)} GiB per replica`,
-          desc: `${R.pods} serving replica${R.pods > 1 ? 's' : ''}, each sharded across ${R.tp} GPUs, placed on ${R.nodes} node${R.nodes > 1 ? 's' : ''} of ${perNode} GPUs. ${R.multi_node ? 'At least one replica spans a node boundary, so its tensor-parallel collective crosses the inter-node fabric.' : 'Every replica fits inside a single node.'}`,
+          desc: `${R.pods} serving replica${R.pods > 1 ? 's' : ''}, each sharded across ${R.tp} GPUs, placed on ${R.nodes} node${R.nodes > 1 ? 's' : ''} of ${perNode} GPUs. ${R.multi_node ? 'At least one replica spans a node boundary, so its tensor-parallel collective crosses the inter-node fabric.' : 'Every replica fits inside a single node.'}${topo.truncated ? ` The diagram draws only the first ${topo.shown} nodes and ${topo.shownPods} replicas; the rest repeat the same pattern.` : ''}`,
         })
       : '',
   );
@@ -444,7 +446,9 @@
 
         {#if topo}
           <div class="panel">
-            <h2>Deployment topology — {R.pods} replica{R.pods > 1 ? 's' : ''} × TP{R.tp} on {R.nodes} node{R.nodes > 1 ? 's' : ''}</h2>
+            <!-- the heading counts the whole deployment; when the drawing is capped it has to say
+                 so here, because the marker inside the SVG can sit past the horizontal scroll -->
+            <h2>Deployment topology — {R.pods} replica{R.pods > 1 ? 's' : ''} × TP{R.tp} on {R.nodes} node{R.nodes > 1 ? 's' : ''}{#if topo.truncated}<small> · drawing {topo.shownPods} on {topo.shown}</small>{/if}</h2>
             <div class="topowrap">
               <!-- markup comes from the domain renderer so `npm run preview:topology`
                    screenshots the same SVG this component ships -->
@@ -463,7 +467,7 @@
             {:else}
               <p class="tot">Every replica sits inside one node, so its tensor-parallel collective stays on NVLink and never touches the inter-node fabric. Replicas are independent — they share only the weights on storage and the router in front, so scaling out adds throughput without adding collective traffic.</p>
             {/if}
-            {#if topo.truncated}<p class="tot">Showing {topo.shown} of {R.nodes} nodes; the remaining {topo.hiddenNodes} repeat the same pattern.</p>{/if}
+            {#if topo.truncated}<p class="tot">The heading counts the whole deployment; the drawing stops at {topo.shown} of {R.nodes} nodes, so it shows {topo.shownPods} of {R.pods} replicas. The remaining {topo.hiddenPods} replica{topo.hiddenPods > 1 ? 's' : ''} repeat{topo.hiddenPods > 1 ? '' : 's'} the same pattern across the other {topo.hiddenNodes} node{topo.hiddenNodes > 1 ? 's' : ''}.{#if topoCut} The last replica bar is left open on the right because the node cut-off falls inside its TP group — it continues past the edge of the drawing.{/if}</p>{/if}
           </div>
         {/if}
 
@@ -928,6 +932,7 @@
   .grid{display:grid;grid-template-columns:340px 1fr;gap:18px}@media(max-width:860px){.grid{grid-template-columns:1fr}}
   .panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:16px;box-shadow:0 1px 2px rgba(21,24,26,.05)}
   h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink2);margin:0 0 12px;font-weight:700}
+  h2 small{color:var(--ink3);font-weight:600;text-transform:none;letter-spacing:0}
   label{display:block;font-size:11px;font-weight:600;color:var(--ink2);text-transform:uppercase;letter-spacing:.03em;margin:11px 0 4px}
   select,input{width:100%;padding:8px 9px;border:1px solid var(--line);background:var(--surface2);color:var(--ink);border-radius:5px;font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:13px}
   select:focus,input:focus{outline:2px solid var(--brand);outline-offset:-1px}
@@ -1001,6 +1006,7 @@
   .topowrap :global(.tlabel){font-family:Manrope,system-ui,sans-serif;font-size:10px;font-weight:700;fill:var(--ink2)}
   .topowrap :global(.tgpulabel){font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:600;fill:var(--ink3)}
   .topowrap :global(.mid){text-anchor:middle}
+  .topowrap :global(.tlabel.more){fill:var(--ink3);font-weight:600}
   .topolegend{display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--ink2);margin-top:10px}
   .topolegend span{display:flex;align-items:center;gap:5px}
   .topolegend i{width:11px;height:11px;border-radius:3px;display:inline-block;border:1.5px solid var(--line)}

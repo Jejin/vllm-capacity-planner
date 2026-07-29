@@ -38,8 +38,8 @@ npm run dev -w web            # (optional) SPA hot-reload on :5173
 - **One source of truth.** Don't duplicate a formula or a validation rule between client and server — put it in `domain/`.
 - **Document the methodology in both places.** The methodology exists twice: as `docs/METHODOLOGY.md` and as the in-app tab. They drifted apart once — a section that was §7 in the app was a §3 subsection in the doc, and a cross-reference pointed at a section that had moved. `scripts/methodology-parity.mjs` now asserts they carry the same headings in the same order, with contiguous numbering, and runs as part of `npm test`. It compares structure, not prose; keeping the words in sync is still on you.
 - **Estimates are estimates.** The model is a first-order roofline; if you tighten it, say what it now assumes and keep the ± caveats honest.
-- **Look at anything visual.** `npm run preview:topology` renders the deployment topology across five layout edge cases, in light and dark, and screenshots them to `.preview/`. Three real layout bugs — an off-canvas label, a clipped caption, an overflowing box — shipped past a clean build, a clean type-check and a full test suite. Correctness checks do not catch geometry.
-- Run `npm test` and `npm run build -w web` before opening a PR. CI runs both.
+- **Look at anything visual.** `npm run preview:topology` renders the deployment topology across seven layout edge cases, in light and dark, and screenshots them to `.preview/`. Three real layout bugs — an off-canvas label, a clipped caption, an overflowing box — shipped past a clean build, a clean type-check and a full test suite. Correctness checks do not catch geometry.
+- Run `npm test` and `npm run build` before opening a PR. CI runs both. `npm run build` compiles `domain/` (the preview harness imports its `dist`), type-checks `server/` — it ships as source and runs under `tsx`, so there is nothing to emit — and builds the SPA.
 
 ## Reporting issues
 
