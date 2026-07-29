@@ -410,6 +410,7 @@
       {#if R}
         <div class="kpis">
           <div class="kpi" class:tight={R.tight}><div class="v">{R.gpus}</div><div class="l">GPUs</div><div class="verdict" class:t={R.tight}>{R.tight ? `Tight · ${(R.headroom_fraction * 100).toFixed(1)}% free` : `Fits · ${(R.headroom_fraction * 100).toFixed(0)}% free`}</div></div>
+          <div class="kpi n"><div class="v">{R.nodes}<small> × {perNode} GPU</small></div><div class="l">Nodes</div>{#if R.multi_node}<div class="cav">a replica spans nodes</div>{/if}</div>
           <div class="kpi p"><div class="v">{R.pods}<small> × TP{R.tp}</small></div><div class="l">Pods</div></div>
           <div class="kpi a"><div class="v">{fmt(kvAlloc)}<small> GiB</small></div><div class="l">KV cache</div></div>
           <div class="kpi g"><div class="v">~{R.throughput_tokens_per_sec.toLocaleString()}</div><div class="l">Tokens/s</div><div class="cav">±40% · not a commitment</div></div>
@@ -929,7 +930,11 @@
   .tab.active{color:var(--ink);border-bottom-color:var(--brand)}.tab i{font-size:9px;background:var(--wash);color:var(--brandink);padding:1px 5px;border-radius:8px;margin-left:5px;font-style:normal}
   .banner{background:var(--wash);color:var(--brandink);padding:9px 22px;font-size:13px;cursor:pointer;display:flex;justify-content:space-between;font-weight:600}
   main{max-width:1120px;margin:18px auto;padding:0 20px 60px}
-  .grid{display:grid;grid-template-columns:340px 1fr;gap:18px}@media(max-width:860px){.grid{grid-template-columns:1fr}}
+  /* minmax(0,1fr), not 1fr: a grid track's default minimum is min-content, so one wide child —
+     the topology SVG on a TP16 plan — stretches this column past `main` and drags every panel
+     in it, the KPI row included, off the right of the page. Capping the minimum at 0 lets
+     .topowrap's own overflow-x scroll the diagram instead of the whole layout. */
+  .grid{display:grid;grid-template-columns:340px minmax(0,1fr);gap:18px}@media(max-width:860px){.grid{grid-template-columns:minmax(0,1fr)}}
   .panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:16px;box-shadow:0 1px 2px rgba(21,24,26,.05)}
   h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink2);margin:0 0 12px;font-weight:700}
   h2 small{color:var(--ink3);font-weight:600;text-transform:none;letter-spacing:0}
@@ -939,9 +944,12 @@
   .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
   .meta{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink2);background:var(--surface2);border:1px dashed var(--line);border-radius:5px;padding:8px 10px;margin-top:8px;line-height:1.6}
   .full{margin-top:14px;width:100%}
-  .kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px}@media(max-width:980px){.kpis{grid-template-columns:repeat(3,1fr)}}@media(max-width:620px){.kpis{grid-template-columns:1fr 1fr}}
+  /* auto-fit rather than a fixed count: main is capped at 1120px, so this row gets ~720px whatever
+     the window does. Six tiles at 1fr is ~110px each and "time to first token" wraps; 200px
+     minimum lands them 3 x 2 with room for the labels, and still reflows on a narrow screen */
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
   .kpi{background:var(--surface);border:1px solid var(--line);border-top:3px solid var(--brand);border-radius:6px;padding:12px 13px;box-shadow:0 1px 2px rgba(21,24,26,.05)}
-  .kpi.p{border-top-color:var(--purple)}.kpi.a{border-top-color:var(--warnln)}.kpi.g{border-top-color:var(--brandink)}.kpi.t{border-top-color:var(--slate)}
+  .kpi.p{border-top-color:var(--purple)}.kpi.a{border-top-color:var(--warnln)}.kpi.g{border-top-color:var(--brandink)}.kpi.t{border-top-color:var(--slate)}.kpi.n{border-top-color:var(--grey)}
   .kpi .v{font-family:'IBM Plex Mono',monospace;font-size:23px;font-weight:600;line-height:1.05}.kpi small{font-size:12px;color:var(--ink3);font-weight:500}
   .kpi .l{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink3);margin-top:4px;font-weight:600}.kpi .cav{font-size:9.5px;color:var(--warn);margin-top:2px;font-weight:600}
   .kpi.tight{border-top-color:var(--warnln)}
