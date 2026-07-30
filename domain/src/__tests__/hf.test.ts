@@ -163,18 +163,36 @@ describe('HF config.json → §F mapping (AD-11)', () => {
     expect(mapped.intermediate_size).toBe(28672);
   });
 
-  it('prefers the MoE pair, because intermediate_size describes the dense layers', () => {
-    // DeepSeek-V3 style: dense layers are 18432 wide, but a routed token sees 8 x 2048
+  it('prefers the MoE fields, because intermediate_size describes the dense layers', () => {
+    // DeepSeek-V3's published config: 8 routed experts of 2048 plus 1 always-on shared expert
     const cfg = {
       num_hidden_layers: 61, num_attention_heads: 128, hidden_size: 7168, kv_lora_rank: 512,
       intermediate_size: 18432, moe_intermediate_size: 2048, num_experts_per_tok: 8,
-      vocab_size: 129280, max_position_embeddings: 131072,
+      n_shared_experts: 1, vocab_size: 129280, max_position_embeddings: 131072,
     };
-    expect(perTokenFfnWidth(cfg)).toBe(16384);
-    expect(hfConfigToModel('deepseek-ai/DeepSeek-V3', cfg).mapped.intermediate_size).toBe(16384);
+    expect(perTokenFfnWidth(cfg)).toBe(18432); // (8 + 1) x 2048
+    expect(hfConfigToModel('deepseek-ai/DeepSeek-V3', cfg).mapped.intermediate_size).toBe(18432);
+    // the shared expert is an eighth of the total here, not a rounding error
+    expect(perTokenFfnWidth({ ...cfg, n_shared_experts: 0 })).toBe(16384);
     // an incomplete MoE pair falls back rather than guessing a top-k
     expect(perTokenFfnWidth({ ...cfg, num_experts_per_tok: undefined })).toBe(18432);
     expect(perTokenFfnWidth({ hidden_size: 4096 })).toBeUndefined();
+  });
+
+  it('reads the field spellings the MoE families actually ship', () => {
+    // Kimi K3: num_experts_per_token / num_shared_experts
+    expect(perTokenFfnWidth({
+      hidden_size: 7168, moe_intermediate_size: 3072, num_experts_per_token: 16, num_shared_experts: 2,
+    })).toBe(55296); // (16 + 2) x 3072
+    // Qwen2-MoE: the shared expert as a WIDTH rather than a count
+    expect(perTokenFfnWidth({
+      hidden_size: 3584, moe_intermediate_size: 2560, num_experts_per_tok: 4,
+      shared_expert_intermediate_size: 20480,
+    })).toBe(30720); // 4 x 2560 + 20480
+    // Qwen3-MoE dropped the shared expert entirely
+    expect(perTokenFfnWidth({
+      hidden_size: 4096, moe_intermediate_size: 1536, num_experts_per_tok: 8,
+    })).toBe(12288);
   });
 
   it('leaves linear fields unset for a normal model', () => {

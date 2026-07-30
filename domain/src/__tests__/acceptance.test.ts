@@ -449,10 +449,10 @@ describe('§C prefill activation reserve', () => {
     expect(dense.intermediate_size).toBe(28672);
     expect(activationElemsPerToken(dense, 1)).toBe(3 * 8192 + (3 * 28672 + 8192));
 
-    // MoE declares the width a token actually traverses — experts-per-token x expert width —
-    // which is far narrower than a dense FFN at the same hidden size
-    const moe = model('dsv3'); // hidden 7168, 8 x 2048
-    expect(moe.intermediate_size).toBe(16384);
+    // MoE declares the width a token actually traverses: routed experts plus the always-on
+    // shared one, which is still narrower than the 3.5x a dense model of this hidden size implies
+    const moe = model('dsv3'); // hidden 7168, 2048 x (8 routed + 1 shared)
+    expect(moe.intermediate_size).toBe(18432);
     expect(moe.intermediate_size!).toBeLessThan(DEFAULT_INTERMEDIATE_RATIO * moe.hidden_size!);
 
     // undeclared: the ratio, so the term is never silently zero
