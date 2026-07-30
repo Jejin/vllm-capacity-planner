@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, serveCommand, topologyLayout, topologySvg, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, serveCommand, topologyLayout, topologySvg, reserveFloorChunk, RUNTIME_GB, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -39,7 +39,10 @@
     }
   });
 
-  let batchTokens = $state(2048); // vLLM --max-num-batched-tokens; drives the activation reserve
+  // vLLM's own default is 2048, which it documents as the ITL-friendly choice; its tuning guide
+  // asks for >8192 for throughput, and throughput is what this planner sizes for. Starting here
+  // makes the emitted serve command carry the flag explicitly rather than imply 2048.
+  let batchTokens = $state(8192); // --max-num-batched-tokens; drives the activation reserve
   const model = $derived<Model>(catalog.models.find((m: Model) => m.id === modelId) ?? catalog.models[0]);
   const gpu = $derived<GpuSku>(catalog.gpus.find((g: GpuSku) => g.id === gpuId) ?? catalog.gpus[0]);
   const ctxChoices = $derived(CTXS.filter((c) => c <= (model?.max_ctx ?? 0)));
@@ -55,6 +58,17 @@
   const result = $derived(computeSizing(model, gpu, sizingInput));
   const R = $derived(result.ok ? (result as FeasibleSizing) : null);
   const fmt = (x: number, d = 1) => (x >= 1000 ? Math.round(x).toLocaleString() : x.toFixed(d));
+  /** Chunk at which the reserve leaves its flat floor — below it, raising the chunk is free. */
+  const floorChunk = $derived(model ? reserveFloorChunk(model) : null);
+  /** What this one deployment costs to run, from the SKU's $/GPU-hour. */
+  const rate = $derived(gpu?.price_per_gpu_hour ?? 0);
+  const runHr = $derived(R && rate > 0 ? R.gpus * rate : 0);
+  /** $ per million output tokens — the figure that compares plans across SKUs, not just GPUs. */
+  const perMtok = $derived(
+    R && runHr > 0 && R.throughput_tokens_per_sec > 0
+      ? (runHr * 1e6) / (R.throughput_tokens_per_sec * 3600)
+      : 0,
+  );
   /** TTFT spans milliseconds to tens of seconds; show whichever unit is readable. */
   const ttftLabel = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
 
@@ -259,11 +273,11 @@
   }
   async function deleteModelUi(id: string) { if (!confirm(`Delete model "${id}"?`)) return; const r = await fetch(`/api/v1/models/${id}`, { method: 'DELETE', headers: authH }); if (r.ok) { loadCatalog(); notice = 'Model deleted.'; } else notice = (await r.json()).error?.message ?? 'Delete failed.'; }
 
-  const blankGpu = () => ({ id: '', name: '', mem_gb: 80, bw_tbs: 3, price_per_gpu_hour: 2.5 });
+  const blankGpu = () => ({ id: '', name: '', mem_gb: 80, bw_tbs: 3, tflops_fp16: 989, price_per_gpu_hour: 2.5 });
   let gf = $state(blankGpu());
   let gfErrors = $state<Err[]>([]);
   async function saveGpu() {
-    const body = { id: gf.id, name: gf.name, mem_gb: +gf.mem_gb, bw_tbs: +gf.bw_tbs, price_per_gpu_hour: +gf.price_per_gpu_hour };
+    const body = { id: gf.id, name: gf.name, mem_gb: +gf.mem_gb, bw_tbs: +gf.bw_tbs, tflops_fp16: +gf.tflops_fp16 || undefined, price_per_gpu_hour: +gf.price_per_gpu_hour };
     const r = await fetch('/api/v1/gpus', { method: 'POST', headers: authH, body: JSON.stringify(body) });
     if (r.ok) { gf = blankGpu(); gfErrors = []; loadCatalog(); notice = 'GPU SKU saved.'; }
     else { const e = await r.json(); gfErrors = e.error?.fields ?? [{ path: '', message: e.error?.message ?? 'Save failed.' }]; }
@@ -403,6 +417,7 @@
         <label>GPUs / node<input type="number" bind:value={perNode} /></label></div>
       <div class="row"><label>Prefill chunk<small> (--max-num-batched-tokens)</small><input type="number" min="256" step="256" bind:value={batchTokens} /></label>
         <label>Runtime reserve<small> (derived)</small><input type="text" value={R ? `${R.runtime_reserve_gb.toFixed(2)} GiB` : '—'} disabled /></label></div>
+      {#if floorChunk}<p class="hint">The reserve is flat at {RUNTIME_GB.toFixed(2)} GiB up to a {floorChunk.toLocaleString()}-token chunk on this model — below that, raising the chunk costs no memory. It scales as 1/hidden_size, so a wider model leaves the floor sooner.</p>{/if}
       {#if R}<button class="btn primary full" onclick={addToPlan}>+ Add to cluster plan</button>{/if}
     </section>
 
@@ -415,6 +430,7 @@
           <div class="kpi a"><div class="v">{fmt(kvAlloc)}<small> GiB</small></div><div class="l">KV cache</div></div>
           <div class="kpi g"><div class="v">~{R.throughput_tokens_per_sec.toLocaleString()}</div><div class="l">Tokens/s</div><div class="cav">±40% · not a commitment</div></div>
           <div class="kpi t"><div class="v">{ttftLabel(R.ttft_ms)}</div><div class="l">Time to first token</div><div class="cav">±50% · {R.ttft_compute_bound ? 'compute-bound' : 'bandwidth floor'}</div></div>
+          <div class="kpi c"><div class="v">{runHr > 0 ? money(runHr) : '—'}<small>/hr</small></div><div class="l">Run rate</div>{#if runHr > 0}<div class="note">{money(runHr * 730)}/mo · {money(rate)}/GPU-hr</div>{/if}</div>
         </div>
 
         <div class="panel">
@@ -486,6 +502,9 @@
           <div class="li"><span>Prefill work <small>({Math.round(ctx * util).toLocaleString()} tokens)</small></span><b>{R.prefill_pflops.toFixed(2)} PFLOP</b></div>
           <div class="li"><span>Decode throughput / request</span><b>~{R.decode_tps_per_request} tok/s</b></div>
           <div class="li"><span>Aggregate throughput</span><b>~{R.throughput_tokens_per_sec.toLocaleString()} tok/s <small>±40%</small></b></div>
+          <div class="li"><span>Run rate <small>({R.gpus} × {money(rate)}/GPU-hr)</small></span><b>{runHr > 0 ? `${money(runHr)}/hr` : '—'}</b></div>
+          <div class="li"><span>Monthly <small>(730 h)</small></span><b>{runHr > 0 ? `${money(runHr * 730)}/mo` : '—'}</b></div>
+          <div class="li"><span>Cost per million tokens <small>(at the throughput above)</small></span><b>{perMtok > 0 ? money(perMtok) : '—'}</b></div>
         </div>
 
         {#if serveCmd}
@@ -750,16 +769,18 @@
   {#if ident.role === 'admin'}
     <section class="panel"><h2>New GPU SKU</h2>
       <div class="row"><label>ID<input bind:value={gf.id} placeholder="b300" /></label><label>Name<input bind:value={gf.name} placeholder="B300 288 GB" /></label></div>
-      <div class="row3"><label>Memory (GiB)<small> as nvidia-smi reports</small><input type="number" bind:value={gf.mem_gb} /></label><label>Bandwidth (TB/s)<input type="number" step="0.1" bind:value={gf.bw_tbs} /></label><label>Price ($/GPU-hr)<input type="number" step="0.1" bind:value={gf.price_per_gpu_hour} /></label></div>
+      <div class="row3"><label>Memory (GiB)<small> as nvidia-smi reports</small><input type="number" bind:value={gf.mem_gb} /></label><label>Bandwidth (TB/s)<input type="number" step="0.1" bind:value={gf.bw_tbs} /></label><label>FP16 TFLOPS<small> dense, no sparsity</small><input type="number" step="1" bind:value={gf.tflops_fp16} /></label></div>
+      <div class="row3"><label>Price ($/GPU-hr)<input type="number" step="0.1" bind:value={gf.price_per_gpu_hour} /></label></div>
       {#if gfErrors.length}<div class="ferr">{gfErrors[0].message}</div>{/if}
       <button class="btn primary" style="margin-top:12px" onclick={saveGpu}>Add / update GPU SKU</button>
     </section>
   {/if}
   <section class="panel"><h2>GPU SKUs</h2>
-    <table><thead><tr><th>SKU</th><th class="num">HBM (GiB)</th><th class="num">BW (TB/s)</th><th class="num">$/GPU-hr</th>{#if ident.role === 'admin'}<th></th>{/if}</tr></thead><tbody>
-      {#each catalog.gpus as g}<tr><td>{g.name}</td><td class="num">{g.mem_gb}</td><td class="num">{g.bw_tbs}</td><td class="num">{g.price_per_gpu_hour != null ? money(g.price_per_gpu_hour) : '—'}</td>{#if ident.role === 'admin'}<td><button class="btn ghost danger" onclick={() => deleteGpuUi(g.id)}>del</button></td>{/if}</tr>{/each}
+    <table><thead><tr><th>SKU</th><th class="num">HBM (GiB)</th><th class="num">BW (TB/s)</th><th class="num">FP16 TFLOPS</th><th class="num">$/GPU-hr</th>{#if ident.role === 'admin'}<th></th>{/if}</tr></thead><tbody>
+      {#each catalog.gpus as g}<tr><td>{g.name}</td><td class="num">{g.mem_gb}</td><td class="num">{g.bw_tbs}</td><td class="num">{g.tflops_fp16 != null ? g.tflops_fp16.toLocaleString() : '—'}</td><td class="num">{g.price_per_gpu_hour != null ? money(g.price_per_gpu_hour) : '—'}</td>{#if ident.role === 'admin'}<td><button class="btn ghost danger" onclick={() => deleteGpuUi(g.id)}>del</button></td>{/if}</tr>{/each}
     </tbody></table>
     <p class="tot">{catalog.gpus.length} GPU SKUs</p>
+    <div class="hint">Each column drives a different number, and the two easily-confused ones drive opposite halves of the plan. <b>Bandwidth</b> sets throughput: decode is memory-bound, so tok/s comes from TB/s × MBU, never from TFLOPS. <b>FP16 TFLOPS</b> sets time-to-first-token: prefill is a dense GEMM, so TTFT comes from FLOPS × MFU, with sub-16-bit weights assumed to run up to 2× faster. A SKU with no TFLOPS figure falls back to a weight-streaming floor for TTFT, which is optimistic — the KPI says "bandwidth floor" when that happens. Figures are dense, no-sparsity, and indicative.</div>
   </section>
 
 {:else if tab === 'methodology'}
@@ -809,6 +830,8 @@
     <p>The runtime reserve is <b>not a constant</b>. A prefill chunk materialises activations for every token in it at once, so the peak scales with <code>chunk × hidden_size</code>:</p>
     <div class="formula">reserve = max( 2.5 GiB , 1.5 GiB context + chunk × hidden_size × 12 bytes )</div>
     <p>At vLLM's default chunk of 2048 this floors at the historical 2.5 GiB, so default plans size exactly as before. Raise it and it bites: Llama-3.3-70B (hidden 8192) needs 3.0 GiB at 16K, 4.5 GiB at 32K, <b>7.5 GiB at 64K</b> — memory no longer available for KV cache. A narrow model like GPT-OSS-120B (hidden 2880) stays floor-bound at the same chunk.</p>
+    <p>The chunk at which the floor stops binding is <code>1 GiB / (hidden_size × 12)</code> — ~10.9K tokens at hidden 8192, ~21.8K at 4096, ~31K at 2880. On most of the catalogue the activation term is therefore invisible at any chunk you would plausibly set. The planner shows this figure next to the derived reserve rather than leaving it to be found by experiment.</p>
+    <p>Two defaults stay distinct: vLLM's own chunk default is <b>2048</b>, its latency-tuned choice, and the launch command only names the flag when the plan differs from it. The planner starts at <b>8192</b>, which vLLM's tuning guide recommends for throughput. That changes no plan — no catalogue model leaves the 2.5 GiB floor at 8192 tokens — but it makes the command state the chunk rather than imply the latency-tuned one.</p>
     <p class="note">The 12-bytes figure folds qkv, MLP up/gate and residual copies into one multiple at 2-byte activations. Order-of-magnitude, not kernel-accurate — but it moves in the right direction, which a flat reserve does not.</p>
 
     <h2 class="dh">3 · KV cache &amp; concurrency</h2>
@@ -880,6 +903,7 @@
     <div class="formula">Run rate ($/hr) = Σ<sub>SKU</sub> ( committed GPUs × $/GPU-hour ) · month = ×730 · year = ×8760</div>
     <div class="formula">$ per million tokens = <span class="frac"><span class="fnum">GPUs × $/GPU-hour × 1,000,000</span><span class="fden">tokens/sec × 3600</span></span></div>
     <p class="note">The per-million figure inherits the throughput estimate's ±40% band — a comparison tool between configurations, not a budget line. A config that halves GPU count but also halves throughput costs the same per token.</p>
+    <p class="note">The same arithmetic runs on a single deployment, so the sizing view reports its own run rate, monthly figure and cost per million tokens without waiting for the plan to be added to a cluster.</p>
 
     <h2 class="dh">10 · Fleet reconciliation and the capacity gate</h2>
     <p>A plan is checked against a declared fleet <b>per SKU</b>, on integer bytes:</p>
@@ -949,9 +973,9 @@
      minimum lands them 3 x 2 with room for the labels, and still reflows on a narrow screen */
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
   .kpi{background:var(--surface);border:1px solid var(--line);border-top:3px solid var(--brand);border-radius:6px;padding:12px 13px;box-shadow:0 1px 2px rgba(21,24,26,.05)}
-  .kpi.p{border-top-color:var(--purple)}.kpi.a{border-top-color:var(--warnln)}.kpi.g{border-top-color:var(--brandink)}.kpi.t{border-top-color:var(--slate)}.kpi.n{border-top-color:var(--grey)}
+  .kpi.p{border-top-color:var(--purple)}.kpi.a{border-top-color:var(--warnln)}.kpi.g{border-top-color:var(--brandink)}.kpi.t{border-top-color:var(--slate)}.kpi.n{border-top-color:var(--grey)}.kpi.c{border-top-color:var(--ink2)}
   .kpi .v{font-family:'IBM Plex Mono',monospace;font-size:23px;font-weight:600;line-height:1.05}.kpi small{font-size:12px;color:var(--ink3);font-weight:500}
-  .kpi .l{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink3);margin-top:4px;font-weight:600}.kpi .cav{font-size:9.5px;color:var(--warn);margin-top:2px;font-weight:600}
+  .kpi .l{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink3);margin-top:4px;font-weight:600}.kpi .cav{font-size:9.5px;color:var(--warn);margin-top:2px;font-weight:600}.kpi .note{font-size:9.5px;color:var(--ink3);margin-top:2px;font-weight:600}
   .kpi.tight{border-top-color:var(--warnln)}
   .kpi .verdict{font-size:9.5px;color:var(--brandink);margin-top:2px;font-weight:700}.kpi .verdict.t{color:var(--warn)}
   .tightv{color:var(--warn)}

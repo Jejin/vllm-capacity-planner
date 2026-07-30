@@ -101,6 +101,10 @@ export const gpuSkuSchema = z.object({
   name: z.string().min(1).max(128),
   mem_gb: z.number().int().positive(),
   bw_tbs: z.number().positive(),
+  // Dense FP16/BF16 TFLOPS. Drives the compute-bound TTFT estimate; without it the engine falls
+  // back to a weight-streaming floor. Omitted here, Zod stripped it on every upsert and catalog
+  // import, so editing a seeded SKU silently downgraded its own TTFT to that floor.
+  tflops_fp16: z.number().positive().optional(),
   price_per_gpu_hour: z.number().nonnegative().optional(), // $/GPU-hour for cost estimates
 });
 
