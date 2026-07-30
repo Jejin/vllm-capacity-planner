@@ -5,7 +5,7 @@
 // and GpuSku.mem_gb. Vectors were re-pinned when the engine stopped mixing 1e9-byte GB (weights)
 // with 2^30-byte GiB (KV, capacity), which had inflated weights ~7.4% against GPU capacity.
 import { describe, it, expect } from 'vitest';
-import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
+import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, activationElemsPerToken, DEFAULT_INTERMEDIATE_RATIO, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
 import { crossCheckVram } from '../recipes.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema, gpuSkuSchema } from '../schema.js';
@@ -393,8 +393,10 @@ describe('§C prefill activation reserve', () => {
     const m = model('llama33-70b');
     const r = [2048, 8192, 16384, 32768, 65536].map((c) => runtimeReserveGib(m, c).total);
     for (let i = 1; i < r.length; i++) expect(r[i]).toBeGreaterThanOrEqual(r[i - 1]);
-    expect(near(runtimeReserveGib(m, 32768).total, 4.5, 0.02)).toBe(true);
-    expect(runtimeReserveGib(m, 65536).total).toBeGreaterThan(RUNTIME_GB * 2);
+    // hidden 8192, FFN 28672, unsharded: 3x8192 + 3x28672 + 8192 = 118,784 elems/token at 2 B
+    // => 32768 x 237,568 B = 7.25 GiB of activations on top of the 1.5 GiB context
+    expect(near(runtimeReserveGib(m, 32768, 1).total, 8.75, 0.02)).toBe(true);
+    expect(runtimeReserveGib(m, 65536, 1).total).toBeGreaterThan(RUNTIME_GB * 2);
   });
 
   // Where the floor gives out is worth stating: it is the answer to "why did raising the chunk
@@ -412,17 +414,86 @@ describe('§C prefill activation reserve', () => {
     expect(reserveFloorChunk({ ...model('llama33-70b'), hidden_size: undefined } as any)).toBeNull();
   });
 
-  // The planner starts at vLLM's throughput recommendation rather than its 2048 default, which
-  // is only safe because no catalogue model is wide enough to leave the floor at that chunk.
-  it('AC-48c — an 8192-token chunk still floors for every model in the catalogue', () => {
-    for (const m of models) expect(runtimeReserveGib(m, 8192).total).toBe(RUNTIME_GB);
+  // The planner starts at vLLM's throughput recommendation of 8192 rather than its own 2048
+  // default. Only the widest FFNs leave the floor there, and only unsharded — so the starting
+  // point stays honest for the catalogue rather than quietly inflating every plan.
+  it('AC-48c — at an 8192-token chunk, sharding puts every model back on the floor', () => {
+    const unsharded = models.filter((m) => runtimeReserveGib(m, 8192, 1).total === RUNTIME_GB).length;
+    const sharded = models.filter((m) => runtimeReserveGib(m, 8192, 8).total === RUNTIME_GB).length;
+    expect(unsharded).toBeLessThan(models.length); // unsharded, the wider FFNs do leave it
+    expect(sharded).toBe(models.length); // sharded eight ways, every one is back on the floor
+    // Mistral-Small-24B: hidden 5120 with a 32768 FFN, the widest ratio in the catalogue
+    expect(runtimeReserveGib(model('mistral-s24'), 8192, 1).total).toBeGreaterThan(RUNTIME_GB);
+    expect(runtimeReserveGib(model('mistral-s24'), 8192, 4).total).toBe(RUNTIME_GB);
   });
 
-  it('AC-49 — it scales with hidden_size, so small models barely move', () => {
-    const wide = runtimeReserveGib(model('llama33-70b'), 32768).total; // hidden 8192
-    const narrow = runtimeReserveGib(model('gptoss-120b'), 32768).total; // hidden 2880
+  // Tensor parallelism shards the FFN, so the activation peak per GPU falls with the shard width.
+  // A TP-blind reserve is wrong in BOTH directions, which is what these two bounds pin down.
+  it('AC-50 — activations shard with TP: the replicated part is the floor, not zero', () => {
+    const m = model('llama33-70b'); // hidden 8192, FFN 28672
+    const at = (tp: number) => runtimeReserveGib(m, 32768, tp).activations;
+    for (const tp of [2, 4, 8, 16]) expect(at(tp)).toBeLessThan(at(tp / 2));
+    // it converges on the replicated term rather than to zero — 3 x hidden per token, always
+    const floor = (32768 * 3 * 8192 * 2) / GIB;
+    expect(at(1024)).toBeGreaterThan(floor);
+    expect(at(1024)).toBeCloseTo(floor, 1);
+    // the old TP-blind figure sat between TP2 and TP8: it under-reserved narrow shards and
+    // over-reserved wide ones, which is precisely the error being removed here
+    const old = (32768 * 8192 * 12) / GIB;
+    expect(at(2)).toBeGreaterThan(old);
+    expect(at(8)).toBeLessThan(old);
+  });
+
+  it('AC-51 — a declared FFN width is used; without one, the ratio stands in', () => {
+    const dense = model('llama33-70b');
+    expect(dense.intermediate_size).toBe(28672);
+    expect(activationElemsPerToken(dense, 1)).toBe(3 * 8192 + (3 * 28672 + 8192));
+
+    // MoE declares the width a token actually traverses — experts-per-token x expert width —
+    // which is far narrower than a dense FFN at the same hidden size
+    const moe = model('dsv3'); // hidden 7168, 8 x 2048
+    expect(moe.intermediate_size).toBe(16384);
+    expect(moe.intermediate_size!).toBeLessThan(DEFAULT_INTERMEDIATE_RATIO * moe.hidden_size!);
+
+    // undeclared: the ratio, so the term is never silently zero
+    const bare = { ...dense, intermediate_size: undefined };
+    expect(activationElemsPerToken(bare, 1)).toBe(3 * 8192 + (3 * 3.5 * 8192 + 8192));
+    expect(activationElemsPerToken({ ...bare, hidden_size: undefined }, 1)).toBe(0);
+  });
+
+  it('AC-52 — TP selection sees the reserve it will actually pay at that width', () => {
+    const m = model('llama33-70b');
+    const input = {
+      quant: 'FP8' as const, kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
+      target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8, max_num_batched_tokens: 65536,
+    };
+    const r = computeSizing(m, gpu('h200'), input) as FeasibleSizing;
+    expect(r.ok).toBe(true);
+    // the reported reserve is the CHOSEN shard's reserve, not a TP1 figure charged to every candidate
+    expect(r.runtime_reserve_gb).toBeCloseTo(runtimeReserveGib(m, 65536, r.tp).total, 6);
+    // and the five HBM segments still sum to the physical card at the new reserve
+    const per = gpu('h200').mem_gb;
+    const withheld = per * (1 - 0.9);
+    expect(r.weights_gb / r.tp + r.free_gb / r.tp + r.runtime_reserve_gb + withheld).toBeCloseTo(per, 6);
+  });
+
+  it('AC-53 — a reserve that eats the whole card says so, and names the lever', () => {
+    const r = computeSizing(model('mistral-s24'), gpu('rtx4090'), {
+      quant: 'INT4', kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
+      target_concurrency: 8, mem_util_fraction: 0.9, gpus_per_node: 8, max_num_batched_tokens: 1_048_576,
+    });
+    expect(r.ok).toBe(false);
+    expect((r as any).reason).toMatch(/runtime reserve alone/);
+    expect((r as any).reason).toMatch(/max-num-batched-tokens/);
+  });
+
+  it('AC-49 — it scales with hidden_size AND FFN width, so narrow models barely move', () => {
+    const wide = runtimeReserveGib(model('llama33-70b'), 32768, 1).total; // hidden 8192, FFN 28672
+    const narrow = runtimeReserveGib(model('gptoss-120b'), 32768, 1).total; // hidden 2880, FFN 11520
     expect(wide).toBeGreaterThan(narrow);
-    expect(narrow).toBeCloseTo(RUNTIME_GB, 0); // still floor-bound
+    expect(wide / narrow).toBeGreaterThan(2); // ~2.6x on the two widths together
+    // the narrow one is still floored at the chunk the planner actually starts from
+    expect(runtimeReserveGib(model('gptoss-120b'), 8192, 1).total).toBe(RUNTIME_GB);
   });
 
   it('AC-50 — the bigger reserve really does cost usable HBM and concurrency', () => {

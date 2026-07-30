@@ -26,6 +26,9 @@ export const modelSchema = z
     hidden_size: z.number().int().positive().optional(),
     vocab_size: z.number().int().positive().optional(),
     tied_embeddings: z.boolean().optional(),
+    // FFN width one token traverses per layer (MoE: per-expert width x experts per token).
+    // Drives the sharded half of the prefill activation reserve.
+    intermediate_size: z.number().int().positive().optional(),
     // Local/global attention — optional; both required together to cap KV on windowed layers.
     sliding_window: z.number().int().positive().optional(),
     full_attention_layers: z.number().int().min(0).optional(),

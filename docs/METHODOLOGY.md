@@ -99,25 +99,36 @@ GLM-5.2's dense block is 16.5 B parameters. Sizing its NVFP4 checkpoint as unifo
 
 ### Prefill activations
 
-The runtime reserve is **not a constant.** A prefill chunk materialises activations for every token in it simultaneously, so the peak scales with `chunk × hidden_size`:
+The runtime reserve is **not a constant, and not the same on every GPU of a replica.** A prefill chunk materialises activations for every token in it simultaneously, and tensor parallelism shards most of them:
 
 ```
-reserve = max( 2.5 GiB , 1.5 GiB CUDA context + chunk × hidden_size × 12 bytes )
+elems/token/GPU = 3 × hidden            (replicated: residual in, residual out, one temp)
+                + ( 3 × FFN_width + hidden ) / TP     (sharded: gate, up, their product, qkv)
+
+reserve = max( 2.5 GiB , 1.5 GiB CUDA context + chunk × elems/token/GPU × 2 bytes )
 ```
 
-At vLLM's default `--max-num-batched-tokens` of 2048 this floors at the historical 2.5 GiB, so default-configured plans size exactly as before. Raise the chunk and it bites: Llama-3.3-70B (hidden 8192) needs 3.0 GiB at 16K, 4.5 GiB at 32K, 7.5 GiB at 64K — memory that is no longer available for KV cache. It scales with `hidden_size` too, so a narrow model like GPT-OSS-120B (hidden 2880) stays floor-bound at the same chunk.
+Two properties matter. The **sharded term** dominates — gate and up are column-parallel, so a rank holds 1/TP of the widest tensors in the layer. The **replicated term does not shrink**, so the reserve converges on `3 × hidden × chunk × 2` rather than on zero: a TP64 plan still reserves something. Peak is **one layer's worth**, not the whole stack, because activations are freed as the forward pass advances — layer count does not appear.
+
+`FFN_width` is the width one token traverses in one layer. For a dense model that is `intermediate_size`; for MoE it is `moe_intermediate_size × num_experts_per_tok`, because a routed token materialises activations inside every expert it visits. DeepSeek-V3 is 8 × 2048 = 16,384 per token, not the 18,432 its dense layers use. Models that declare neither fall back to **3.5 × hidden_size**, the SwiGLU convention — which over-reserves for MoE, whose per-token width is typically far narrower, and is the safe direction to be wrong in.
+
+Because the reserve depends on TP, it is evaluated **per candidate shard width inside the TP search**, not once up front. Hoisting it out would charge every candidate the TP1 activation peak and bias the selection toward wide shards for the wrong reason.
+
+Llama-3.3-70B (hidden 8192, FFN 28,672) at a 32K chunk shows the spread: **8.75 GiB at TP1, 5.88 at TP2, 4.44 at TP4, 3.72 at TP8.** The flat `chunk × hidden × 12 bytes` model this replaces answered 4.50 GiB at every width — it under-reserved narrow shards by nearly 2× and over-reserved wide ones, which is exactly the error being removed.
 
 The chunk at which the floor stops binding is worth stating outright, because otherwise it is only findable by bisecting the input by hand:
 
 ```
-floor chunk = 1 GiB / ( hidden_size × 12 bytes )
+floor chunk = 1 GiB / ( elems/token/GPU × 2 bytes )
 ```
 
-That is ~10.9K tokens at hidden 8192, ~14.6K at 6144, ~21.8K at 4096 and ~31K at 2880 — so on most of the catalogue the whole activation term is invisible at any chunk you would plausibly set, and the reserve is the flat floor. The planner surfaces this figure next to the derived reserve.
+That is ~11.2K tokens for Llama-3.3-70B at TP4 and ~4.5K for Mistral-Small-24B at TP1, whose 32,768-wide FFN over hidden 5120 is the steepest ratio in the catalogue. The planner shows the figure for the shard width the plan actually chose, next to the derived reserve.
 
-Two defaults are therefore distinct, and the tool keeps them distinct. vLLM's own default chunk is **2048**, which its tuning guide presents as the inter-token-latency choice, and the emitted `vllm serve` command only names the flag when the plan differs from it. The planner's own starting point is **8192**, because vLLM recommends `> 8192` for throughput and throughput is what this tool sizes for. Starting there changes no plan — no catalogue model is wide enough to leave the 2.5 GiB floor at 8192 tokens — but it does make the launch command state the chunk instead of implying the latency-tuned one.
+Two defaults are distinct, and the tool keeps them distinct. vLLM's own default chunk is **2048**, which its tuning guide presents as the inter-token-latency choice, and the emitted `vllm serve` command only names the flag when the plan differs from it. The planner's own starting point is **8192**, because vLLM recommends `> 8192` for throughput and throughput is what this tool sizes for. At that chunk every catalogue model is back on the 2.5 GiB floor once sharded eight ways; unsharded, the widest FFNs do leave it.
 
-The 12-bytes-per-token-per-hidden-unit figure folds qkv, the MLP up/gate projections and residual copies into one multiple at 2-byte activations. It is an order-of-magnitude model, not a kernel-accurate one — but it moves in the right direction, which a flat reserve does not. Models with no `hidden_size` fall back to the flat figure.
+A reserve can now exhaust the card on its own — a large enough chunk on a small enough GPU leaves nothing for weights. That is reported as its own infeasibility, naming `--max-num-batched-tokens`, rather than being folded into the "weights do not fit" message that would send the reader to the wrong lever.
+
+The multiples (3 replicated, 3 sharded at FFN width, 1 sharded at hidden) fold qkv, the gate/up projections, their SiLU product and the residual copies into whole numbers at 2-byte activations. It is a structural model, not a kernel-accurate one: it tracks what tensor parallelism does and does not divide, which a flat reserve cannot, but it does not model fusion, recomputation or an always-on shared expert. Models with no `hidden_size` fall back to the flat 2.5 GiB.
 
 ## 3. KV cache & concurrency
 

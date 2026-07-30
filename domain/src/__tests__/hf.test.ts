@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { hfConfigToModel, concurrencySweep, bucketLayerTypes } from '../hf.js';
+import { hfConfigToModel, concurrencySweep, bucketLayerTypes, perTokenFfnWidth } from '../hf.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema } from '../schema.js';
 
@@ -152,6 +152,29 @@ describe('HF config.json → §F mapping (AD-11)', () => {
     expect(bucketLayerTypes(['mamba', 'recurrent', 'local_attention']))
       .toEqual({ full: 0, sliding: 1, linear: 2 });
     expect(bucketLayerTypes(['something_new'])).toEqual({ full: 1, sliding: 0, linear: 0 });
+  });
+
+  // The reserve shards the FFN, so the import has to supply the width a token actually traverses.
+  it('maps the dense FFN width straight through', () => {
+    const { mapped } = hfConfigToModel('meta-llama/Llama-3.3-70B-Instruct', {
+      num_hidden_layers: 80, num_attention_heads: 64, num_key_value_heads: 8, head_dim: 128,
+      hidden_size: 8192, intermediate_size: 28672, vocab_size: 128256, max_position_embeddings: 131072,
+    });
+    expect(mapped.intermediate_size).toBe(28672);
+  });
+
+  it('prefers the MoE pair, because intermediate_size describes the dense layers', () => {
+    // DeepSeek-V3 style: dense layers are 18432 wide, but a routed token sees 8 x 2048
+    const cfg = {
+      num_hidden_layers: 61, num_attention_heads: 128, hidden_size: 7168, kv_lora_rank: 512,
+      intermediate_size: 18432, moe_intermediate_size: 2048, num_experts_per_tok: 8,
+      vocab_size: 129280, max_position_embeddings: 131072,
+    };
+    expect(perTokenFfnWidth(cfg)).toBe(16384);
+    expect(hfConfigToModel('deepseek-ai/DeepSeek-V3', cfg).mapped.intermediate_size).toBe(16384);
+    // an incomplete MoE pair falls back rather than guessing a top-k
+    expect(perTokenFfnWidth({ ...cfg, num_experts_per_tok: undefined })).toBe(18432);
+    expect(perTokenFfnWidth({ hidden_size: 4096 })).toBeUndefined();
   });
 
   it('leaves linear fields unset for a normal model', () => {

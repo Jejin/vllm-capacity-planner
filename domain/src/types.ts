@@ -28,6 +28,14 @@ export interface Model {
   hidden_size?: number;
   vocab_size?: number;
   tied_embeddings?: boolean; // true => one shared table, false/undefined => embedding + lm_head
+  // --- FFN width (optional; drives the sharded half of the prefill activation reserve) ---
+  // The FFN width ONE token passes through in ONE layer:
+  //   dense : config.json `intermediate_size`
+  //   MoE   : `moe_intermediate_size` x `num_experts_per_tok`, because a routed token
+  //           materialises activations inside every expert it is sent to
+  // Absent, the engine assumes DEFAULT_INTERMEDIATE_RATIO x hidden_size, which over-reserves for
+  // MoE (whose per-token width is typically far narrower than a dense FFN of the same hidden).
+  intermediate_size?: number;
   // --- local/global attention (optional; caps KV on the windowed layers) ---
   // Many models (GPT-OSS, Gemma, Mistral-v0.1) run most layers over a fixed sliding window
   // instead of the full context. Those layers' KV stops growing at the window, cutting
