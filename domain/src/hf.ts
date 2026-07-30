@@ -75,6 +75,14 @@ export interface HfConfig {
   moe_intermediate_size?: number;
   /** MoE: experts each token is routed to (top-k). */
   num_experts_per_tok?: number;
+  /** Kimi's spelling of the same field. */
+  num_experts_per_token?: number;
+  /** DeepSeek/GLM: COUNT of always-on shared experts, each moe_intermediate_size wide. */
+  n_shared_experts?: number;
+  /** Kimi's spelling of the same count. */
+  num_shared_experts?: number;
+  /** Qwen2-MoE style: the shared expert's WIDTH directly, rather than a count. */
+  shared_expert_intermediate_size?: number;
   max_position_embeddings?: number;
   sliding_window?: number | null;
   /** MLA marker: compressed KV projection rank. Present only on latent-attention models. */
@@ -147,18 +155,27 @@ function slug(id: string): string {
  * FFN width one token traverses in one layer.
  *
  * On an MoE config, `intermediate_size` describes the dense layers and is the WRONG number to
- * reserve activations against — a routed token visits `num_experts_per_tok` experts of
- * `moe_intermediate_size` each, which for DeepSeek-V3 is 8 x 2048 = 16384 rather than the 18432
- * its dense layers use. Prefer the MoE pair whenever the config carries it.
+ * reserve activations against — a token visits `num_experts_per_tok` routed experts of
+ * `moe_intermediate_size` each. Prefer the MoE fields whenever the config carries them.
  *
- * The always-on shared expert some MoE models add is not counted; it is one expert's width
- * against top-k, so it moves the total a few percent.
+ * Shared experts ARE counted. They run on every token, not a routed subset, so they add their
+ * full width to every token's path: at DeepSeek-V3's 1 shared against top-8 that is an eighth of
+ * the total, and at Kimi K3's 2 against top-16 the same again — not the rounding error an earlier
+ * version of this assumed. Counting them gives DeepSeek-V3 9 x 2048 = 18432, which is exactly the
+ * `intermediate_size` its own dense layers use; that the two agree is a good sign the model is
+ * right rather than a coincidence.
+ *
+ * Field spellings differ between families, so both are read: `num_experts_per_tok` and Kimi's
+ * `num_experts_per_token`; `n_shared_experts` / `num_shared_experts` as a COUNT, or Qwen2-MoE's
+ * `shared_expert_intermediate_size` as a width.
  */
 export function perTokenFfnWidth(cfg: HfConfig): number | undefined {
-  if (cfg.moe_intermediate_size && cfg.num_experts_per_tok) {
-    return cfg.moe_intermediate_size * cfg.num_experts_per_tok;
-  }
-  return cfg.intermediate_size;
+  const expert = cfg.moe_intermediate_size;
+  const topK = cfg.num_experts_per_tok ?? cfg.num_experts_per_token;
+  if (!expert || !topK) return cfg.intermediate_size;
+  const sharedCount = cfg.n_shared_experts ?? cfg.num_shared_experts ?? 0;
+  const shared = cfg.shared_expert_intermediate_size ?? sharedCount * expert;
+  return expert * topK + shared;
 }
 
 /** Map a HF model id + its config.json to a partial §F Model (AD-11). */
