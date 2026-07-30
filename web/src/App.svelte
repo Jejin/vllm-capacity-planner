@@ -468,7 +468,7 @@
             {:else}
               <p class="tot">Every replica sits inside one node, so its tensor-parallel collective stays on NVLink and never touches the inter-node fabric. Replicas are independent — they share only the weights on storage and the router in front, so scaling out adds throughput without adding collective traffic.</p>
             {/if}
-            {#if topo.truncated}<p class="tot">The heading counts the whole deployment; the drawing stops at {topo.shown} of {R.nodes} nodes, so it shows {topo.shownPods} of {R.pods} replicas. The remaining {topo.hiddenPods} replica{topo.hiddenPods > 1 ? 's' : ''} repeat{topo.hiddenPods > 1 ? '' : 's'} the same pattern across the other {topo.hiddenNodes} node{topo.hiddenNodes > 1 ? 's' : ''}.{#if topoCut} The last replica bar is left open on the right because the node cut-off falls inside its TP group — it continues past the edge of the drawing.{/if}</p>{/if}
+            {#if topo.truncated}<p class="tot">The heading counts the whole deployment; the drawing stops at {topo.shown} of {R.nodes} nodes, so it shows {topo.shownPods} of {R.pods} replicas. The remaining {topo.hiddenPods} replica{topo.hiddenPods > 1 ? 's' : ''} repeat{topo.hiddenPods > 1 ? '' : 's'} the same pattern across the other {topo.hiddenNodes} node{topo.hiddenNodes > 1 ? 's' : ''}.{#if topoCut} The last replica bar is left open at the bottom because the node cut-off falls inside its TP group — it continues past the edge of the drawing.{/if}</p>{/if}
           </div>
         {/if}
 
@@ -1015,6 +1015,10 @@
   .topowrap :global(.tgpulabel){font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:600;fill:var(--ink3)}
   .topowrap :global(.mid){text-anchor:middle}
   .topowrap :global(.tlabel.more){fill:var(--ink3);font-weight:600}
+  /* the rule under a node's cells that says which replica owns them — the grouping a stacked
+     node column would otherwise lose, since the bars no longer sit directly above their GPUs */
+  .topowrap :global(.tunder){fill:var(--purple)}
+  .topowrap :global(.tunder.spanning){fill:var(--warnln)}
   .topolegend{display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--ink2);margin-top:10px}
   .topolegend span{display:flex;align-items:center;gap:5px}
   .topolegend i{width:11px;height:11px;border-radius:3px;display:inline-block;border:1.5px solid var(--line)}

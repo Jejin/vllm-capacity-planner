@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { topologyLayout, topologySvg, escapeSvgText, truncLabels } from '../topology.js';
+import { topologyLayout, topologySvg, escapeSvgText, truncLabels, podLabel } from '../topology.js';
 import { computeSizing } from '../engine.js';
 import { seedCatalog } from '../seed.js';
 import type { FeasibleSizing } from '../types.js';
@@ -31,24 +31,70 @@ describe('topology layout', () => {
     }
   });
 
-  it('flags a replica that straddles a node boundary — and only then', () => {
-    const single = size('llama33-70b', 'h200', { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64, gpus_per_node: 8 });
-    expect(single.multi_node).toBe(false);
-    expect(topologyLayout(single, 8).pods.some((p) => p.spans)).toBe(false);
-
-    const spanning = size('kimi-k3', 'h200', { quant: 'MXFP4', selected_ctx: 1048576, target_concurrency: 8, gpus_per_node: 8 });
-    expect(spanning.multi_node).toBe(true);
-    const t = topologyLayout(spanning, 8);
-    expect(t.pods.some((p) => p.spans)).toBe(true);
-    expect(t.multi).toBe(true); // a fabric is drawn
+  // The layout reads left to right and stacks the nodes, so a wide plan grows down the page
+  // rather than off the side of the panel.
+  it('runs router → replicas → nodes across, and stacks the nodes down', () => {
+    const r = size('kimi-k3', 'h200', { quant: 'MXFP4', selected_ctx: 1048576, target_concurrency: 8, gpus_per_node: 8 });
+    const t = topologyLayout(r, 8);
+    expect(t.routerW).toBeLessThanOrEqual(t.podX);
+    expect(t.podX + t.podW).toBeLessThanOrEqual(t.nodeX);
+    expect(t.nodes.length).toBeGreaterThan(1);
+    for (let i = 1; i < t.nodes.length; i++) {
+      expect(t.nodes[i].y).toBeGreaterThan(t.nodes[i - 1].y); // stacked, not side by side
+    }
+    // every node's GPUs share one x range — the columns line up down the stack
+    const xs = (n: number) => t.gpus.filter((g) => g.n === n).map((g) => g.x).join(',');
+    expect(xs(1)).toBe(xs(0));
   });
 
-  it('a narrow bar labels outside itself rather than overflowing', () => {
-    const r = size('gptoss-120b', 'h200', { quant: 'MXFP4', selected_ctx: 131072, target_concurrency: 8, gpus_per_node: 8 });
-    expect(r.tp).toBe(1);
+  it('keeps a wide plan inside a panel that used to need a scrollbar', () => {
+    const r = size('glm52', 'h200', { quant: 'FP8', selected_ctx: 1048576, target_concurrency: 256, gpus_per_node: 8, avg_context_utilisation: 0.8 });
+    expect(r.tp).toBe(16);
+    expect(r.nodes).toBe(16);
+    // the sizing panel is ~720px wide at main's 1120px cap
+    expect(topologyLayout(r, 8).width).toBeLessThan(700);
+  });
+
+  it('spans a replica bar across the node rows it lands on', () => {
+    const r = size('kimi-k3', 'h200', { quant: 'MXFP4', selected_ctx: 1048576, target_concurrency: 8, gpus_per_node: 8 });
+    expect(r.multi_node).toBe(true);
     const t = topologyLayout(r, 8);
-    expect(t.pods[0].x1 - t.pods[0].x0).toBe(t.cell); // one cell wide
-    expect(t.pods[0].labelInside).toBe(false);
+    const spanning = t.pods.filter((p) => p.spans);
+    expect(spanning.length).toBeGreaterThan(0);
+    for (const pod of spanning) {
+      expect(pod.segs.length).toBeGreaterThan(1);
+      // the bar covers the gap between the two node boxes it straddles
+      expect(pod.y0).toBeLessThan(t.nodes[1].y);
+      expect(pod.y1).toBeGreaterThan(t.nodes[1].y);
+    }
+  });
+
+  it('gives each replica in a shared node its own slot, without overlap', () => {
+    const r = size('llama33-70b', 'h200', { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64, gpus_per_node: 8 });
+    expect(r.tp).toBeLessThan(8); // several replicas per node
+    const t = topologyLayout(r, 8);
+    expect(t.pods.length).toBeGreaterThan(1);
+    const sorted = [...t.pods].sort((a, b) => a.y0 - b.y0);
+    for (let i = 1; i < sorted.length; i++) {
+      expect(sorted[i].y0).toBeGreaterThanOrEqual(sorted[i - 1].y1);
+    }
+    expect(t.pods.every((p) => p.labelInside)).toBe(true);
+  });
+
+  it('trades node boxes for height when a node holds many replicas', () => {
+    const many = size('gptoss-120b', 'h200', { quant: 'MXFP4', selected_ctx: 131072, target_concurrency: 256, gpus_per_node: 8 });
+    expect(many.tp).toBeLessThanOrEqual(2); // four or more replicas share a node
+    const t = topologyLayout(many, 8);
+    expect(t.bandH).toBeGreaterThan(t.cell); // the band grew to hold the slots
+    expect(t.stackH).toBeLessThanOrEqual(420); // ...and the stack did not run away
+  });
+
+  it('sizes the replica column to the labels it will draw', () => {
+    const r = size('kimi-k3', 'h200', { quant: 'MXFP4', selected_ctx: 1048576, target_concurrency: 8, gpus_per_node: 8 });
+    const t = topologyLayout(r, 8);
+    for (const pod of t.pods) {
+      expect(t.podW).toBeGreaterThan(podLabel(pod.p, r.tp, pod.spans).length * 6.2);
+    }
   });
 
   it('drops the GPU-count caption when node boxes are too narrow for it', () => {
@@ -75,8 +121,9 @@ describe('topology layout', () => {
     expect(t.shownPods).toBe(t.pods.length);
     expect(t.shownPods).toBeLessThan(r.pods);
     expect(t.shownPods + t.hiddenPods).toBe(r.pods);
-    expect(t.truncX).not.toBeNull();
-    expect(t.truncX!).toBeGreaterThanOrEqual(t.contentW);
+    expect(t.truncY).not.toBeNull();
+    expect(t.truncY!).toBeGreaterThanOrEqual(t.stackH);
+    expect(t.height).toBeGreaterThan(t.truncY!); // the marker is inside the viewBox
   });
 
   it('claims no hidden replicas when every replica is drawn', () => {
@@ -85,7 +132,7 @@ describe('topology layout', () => {
     expect(t.truncated).toBe(false);
     expect(t.hiddenPods).toBe(0);
     expect(t.hiddenNodes).toBe(0);
-    expect(t.truncX).toBeNull();
+    expect(t.truncY).toBeNull();
     expect(t.pods.every((p) => p.gpusShown === r.tp)).toBe(true);
   });
 
@@ -99,26 +146,27 @@ describe('topology layout', () => {
     expect(t.pods.slice(0, -1).every((p) => p.gpusShown === r.tp)).toBe(true);
   });
 
-  it('reserves viewBox width for the truncation marker', () => {
-    const r = size('llama33-70b', 'h100', { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64, gpus_per_node: 2 });
-    const t = topologyLayout(r, 2);
-    const longest = Math.max(...truncLabels(t.hiddenNodes, t.hiddenPods).map((s) => s.length));
-    expect(t.width - t.truncX!).toBeGreaterThan(longest * 6.2);
-  });
-
-  it('leaves slack past the drawing area so right-hand labels are not clipped', () => {
+  it('leaves slack past the drawing so right-hand labels are not clipped', () => {
     const r = size('llama33-70b', 'h200', { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64, gpus_per_node: 8 });
     const t = topologyLayout(r, 8);
     expect(t.width).toBeGreaterThan(t.contentW);
     // every drawn element stays inside the viewBox
-    for (const g of t.gpus) expect(g.x + t.cell).toBeLessThanOrEqual(t.width);
-    for (const p of t.pods) expect(p.x1).toBeLessThanOrEqual(t.width);
+    for (const g of t.gpus) {
+      expect(g.x + t.cell).toBeLessThanOrEqual(t.width);
+      expect(g.y + t.cell).toBeLessThanOrEqual(t.height);
+    }
+    for (const p of t.pods) expect(p.y1).toBeLessThanOrEqual(t.height);
+    expect(t.storeY + 26).toBeLessThanOrEqual(t.height);
   });
 
   it('stacks the fabric only when there is more than one node', () => {
     const one = topologyLayout(size('gptoss-120b', 'h200', { quant: 'MXFP4', selected_ctx: 131072, target_concurrency: 8, gpus_per_node: 8 }), 8);
     expect(one.multi).toBe(false);
-    expect(one.storeY - one.switchY).toBeLessThan(56); // no switch band reserved
+    expect(one.spineX).toBeNull();
+
+    const two = topologyLayout(size('kimi-k3', 'h200', { quant: 'MXFP4', selected_ctx: 1048576, target_concurrency: 8, gpus_per_node: 8 }), 8);
+    expect(two.multi).toBe(true);
+    expect(two.spineX!).toBeGreaterThan(two.nodeX + two.nodeW); // clear of the node boxes
   });
 });
 
@@ -146,6 +194,11 @@ describe('topology SVG rendering', () => {
     expect(contained).not.toContain('⚠');
   });
 
+  it('rules the cells of each replica so a stacked node still shows the grouping', () => {
+    const svg = render('llama33-70b', 'h200', 8, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64 });
+    expect((svg.match(/class="tunder/g) ?? []).length).toBeGreaterThanOrEqual(2); // one per replica
+  });
+
   it('draws what it left out, naming replicas and nodes', () => {
     const truncated = render('llama33-70b', 'h100', 6, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 512 });
     expect(truncated).toContain('more replicas');
@@ -157,10 +210,10 @@ describe('topology SVG rendering', () => {
     expect(whole).not.toContain('⋯');
   });
 
-  it('leaves a half-drawn replica bar open on the right instead of closing it', () => {
+  it('leaves a half-drawn replica bar open at the bottom instead of closing it', () => {
     const cut = render('llama33-70b', 'h100', 3, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 512 });
     expect(cut).toMatch(/class="tbox pod(?: spanning)? cut"/);
-    expect(cut).toMatch(/<path d="M [\d.]+ 48 H/); // open-ended, not a closed rect
+    expect(cut).toMatch(/<path d="M [\d.]+ [\d.]+ V/); // open-ended, not a closed rect
     const whole = render('llama33-70b', 'h200', 8, { quant: 'FP8', selected_ctx: 131072, target_concurrency: 64 });
     expect(whole).not.toContain('cut');
     expect(whole).not.toContain('<path');
@@ -198,5 +251,23 @@ describe('topology SVG rendering', () => {
     expect(svg.endsWith('</svg>')).toBe(true);
     expect(svg).toContain(`viewBox="0 0 ${t.width} ${t.height}"`);
     expect((svg.match(/<rect/g) ?? []).length).toBeGreaterThanOrEqual(t.gpus.length);
+  });
+
+  it('keeps the widest storage caption inside the viewBox', () => {
+    // four-digit weights on a two-node plan — the caption is wider than the node column
+    const r = size('kimi-k3', 'h200', { quant: 'MXFP4', selected_ctx: 1048576, target_concurrency: 8, gpus_per_node: 8 });
+    const t = topologyLayout(r, 8);
+    const label = `shared weights · ${r.weights_gb.toFixed(1)} GiB per replica`;
+    const svg = topologySvg(t, { tp: r.tp, perNode: 8, multiNode: true, storeLabel: label, desc: 'x' });
+    const store = svg.match(/x="([\d.]+)" y="[\d.]+" width="([\d.]+)"[^>]*class="tbox store"/)!;
+    expect(Number(store[1])).toBeGreaterThanOrEqual(0);
+    expect(Number(store[1]) + Number(store[2])).toBeLessThanOrEqual(t.width);
+  });
+
+  it('composes the labels the layout measured', () => {
+    expect(podLabel(0, 16, false)).toBe('replica 1 · TP16');
+    expect(podLabel(2, 8, true)).toBe('⚠ replica 3 · TP8');
+    expect(truncLabels(3, 1)).toEqual(['+1 more replica', 'on +3 more nodes']);
+    expect(truncLabels(0, 0)).toEqual(['…']);
   });
 });
