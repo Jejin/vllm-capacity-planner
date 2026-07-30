@@ -65,7 +65,9 @@ ${styleFromApp()}
 body{background:var(--bg);color:var(--ink);font-family:Manrope,system-ui,sans-serif;margin:0;padding:20px}
 h2{font-size:12px;color:var(--ink2);margin:20px 0 6px;font-weight:700}
 h2 small{color:var(--ink3);font-weight:600}
-.panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px}
+/* the app's sizing column is ~690px at main's 1120px cap; a preview panel wider than that
+   scales the SVG up and stops being evidence about what ships */
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px;max-width:690px}
 .bad{color:var(--err);font-weight:700}
 </style></head><body>${sections}</body></html>`;
 }
@@ -122,7 +124,7 @@ for (const theme of ['light', 'dark']) {
     '--headless', '--no-sandbox', '--disable-gpu', '--hide-scrollbars',
     // wide and tall enough for every scenario at full size — a diagram clipped by the window
     // is exactly the kind of thing this harness exists to catch, so it must not clip it itself
-    '--window-size=1800,3400',
+    '--window-size=900,3600',
     `--screenshot=${join(outDir, `topology-${theme}.png`)}`,
     join(outDir, `topology-${theme}.html`),
   ], { stdio: 'ignore' });
