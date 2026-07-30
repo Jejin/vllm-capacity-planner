@@ -5,7 +5,7 @@
 // and GpuSku.mem_gb. Vectors were re-pinned when the engine stopped mixing 1e9-byte GB (weights)
 // with 2^30-byte GiB (KV, capacity), which had inflated weights ~7.4% against GPU capacity.
 import { describe, it, expect } from 'vitest';
-import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
+import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
 import { crossCheckVram } from '../recipes.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema, gpuSkuSchema } from '../schema.js';
@@ -395,6 +395,27 @@ describe('§C prefill activation reserve', () => {
     for (let i = 1; i < r.length; i++) expect(r[i]).toBeGreaterThanOrEqual(r[i - 1]);
     expect(near(runtimeReserveGib(m, 32768).total, 4.5, 0.02)).toBe(true);
     expect(runtimeReserveGib(m, 65536).total).toBeGreaterThan(RUNTIME_GB * 2);
+  });
+
+  // Where the floor gives out is worth stating: it is the answer to "why did raising the chunk
+  // change nothing?", and it was previously only findable by bisecting the input by hand.
+  it('AC-48b — reserveFloorChunk is exactly where the floor stops binding', () => {
+    for (const id of ['llama33-70b', 'glm52', 'gptoss-120b', 'llama31-8b']) {
+      const m = model(id);
+      const c = reserveFloorChunk(m)!;
+      expect(c).toBeGreaterThan(0);
+      expect(runtimeReserveGib(m, c - 1).total).toBe(RUNTIME_GB); // still floored
+      expect(runtimeReserveGib(m, c + 1).total).toBeGreaterThan(RUNTIME_GB); // and past it
+    }
+    // 1/hidden_size: the widest model in the catalogue leaves the floor soonest
+    expect(reserveFloorChunk(model('llama33-70b'))!).toBeLessThan(reserveFloorChunk(model('gptoss-120b'))!);
+    expect(reserveFloorChunk({ ...model('llama33-70b'), hidden_size: undefined } as any)).toBeNull();
+  });
+
+  // The planner starts at vLLM's throughput recommendation rather than its 2048 default, which
+  // is only safe because no catalogue model is wide enough to leave the floor at that chunk.
+  it('AC-48c — an 8192-token chunk still floors for every model in the catalogue', () => {
+    for (const m of models) expect(runtimeReserveGib(m, 8192).total).toBe(RUNTIME_GB);
   });
 
   it('AC-49 — it scales with hidden_size, so small models barely move', () => {

@@ -47,6 +47,25 @@ describe('Epic 3 — Catalog curation + RBAC (FR-2/3/4/29)', () => {
     const list = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();
     expect(list.models.find((m: any) => m.id === 'test-x')).toBeTruthy();
   });
+  // tflops_fp16 was missing from the GPU schema, so Zod stripped it on every write: re-saving a
+  // seeded SKU silently dropped the figure the compute-bound TTFT depends on.
+  it('a GPU SKU keeps its FP16 TFLOPS through a write (AD — TTFT input)', async () => {
+    const r = await app.inject({
+      method: 'POST', url: '/api/v1/gpus', headers: admin,
+      payload: { id: 'test-gpu', name: 'Test GPU 80GB', mem_gb: 80, bw_tbs: 3.3, tflops_fp16: 989, price_per_gpu_hour: 2.5 },
+    });
+    expect(r.statusCode).toBe(201);
+    const list = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();
+    expect(list.gpus.find((g: any) => g.id === 'test-gpu').tflops_fp16).toBe(989);
+    // and a seeded SKU round-tripped through the API keeps its own figure
+    const h200 = list.gpus.find((g: any) => g.id === 'h200');
+    expect(h200.tflops_fp16).toBeGreaterThan(0);
+    const again = await app.inject({ method: 'POST', url: '/api/v1/gpus', headers: admin, payload: h200 });
+    expect(again.statusCode).toBe(201);
+    const after = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();
+    expect(after.gpus.find((g: any) => g.id === 'h200').tflops_fp16).toBe(h200.tflops_fp16);
+  });
+
   it('rejects a GQA model with kv_heads=0 with field-level message (FR-2 / AD-14)', async () => {
     const r = await app.inject({ method: 'POST', url: '/api/v1/models', headers: admin, payload: { ...newModel, kv_heads: 0 } });
     expect(r.statusCode).toBe(422);

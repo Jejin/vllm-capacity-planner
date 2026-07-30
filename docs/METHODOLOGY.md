@@ -107,6 +107,16 @@ reserve = max( 2.5 GiB , 1.5 GiB CUDA context + chunk × hidden_size × 12 bytes
 
 At vLLM's default `--max-num-batched-tokens` of 2048 this floors at the historical 2.5 GiB, so default-configured plans size exactly as before. Raise the chunk and it bites: Llama-3.3-70B (hidden 8192) needs 3.0 GiB at 16K, 4.5 GiB at 32K, 7.5 GiB at 64K — memory that is no longer available for KV cache. It scales with `hidden_size` too, so a narrow model like GPT-OSS-120B (hidden 2880) stays floor-bound at the same chunk.
 
+The chunk at which the floor stops binding is worth stating outright, because otherwise it is only findable by bisecting the input by hand:
+
+```
+floor chunk = 1 GiB / ( hidden_size × 12 bytes )
+```
+
+That is ~10.9K tokens at hidden 8192, ~14.6K at 6144, ~21.8K at 4096 and ~31K at 2880 — so on most of the catalogue the whole activation term is invisible at any chunk you would plausibly set, and the reserve is the flat floor. The planner surfaces this figure next to the derived reserve.
+
+Two defaults are therefore distinct, and the tool keeps them distinct. vLLM's own default chunk is **2048**, which its tuning guide presents as the inter-token-latency choice, and the emitted `vllm serve` command only names the flag when the plan differs from it. The planner's own starting point is **8192**, because vLLM recommends `> 8192` for throughput and throughput is what this tool sizes for. Starting there changes no plan — no catalogue model is wide enough to leave the 2.5 GiB floor at 8192 tokens — but it does make the launch command state the chunk instead of implying the latency-tuned one.
+
 The 12-bytes-per-token-per-hidden-unit figure folds qkv, the MLP up/gate projections and residual copies into one multiple at 2-byte activations. It is an order-of-magnitude model, not a kernel-accurate one — but it moves in the right direction, which a flat reserve does not. Models with no `hidden_size` fall back to the flat figure.
 
 ## 3. KV cache & concurrency
@@ -268,6 +278,8 @@ $ per million tokens = ( GPUs × $/GPU-hour × 1,000,000 ) / ( tokens/sec × 360
 ```
 
 The per-million-token figure inherits the throughput estimate's ±40% band, so treat it as a comparison tool between configurations rather than a budget line. A configuration that halves GPU count but also halves throughput costs the same per token.
+
+The same arithmetic runs on a single deployment, so the sizing view reports its own run rate, monthly figure and cost per million tokens without waiting for the plan to be added to a cluster.
 
 ## 10. Fleet reconciliation and the capacity gate
 

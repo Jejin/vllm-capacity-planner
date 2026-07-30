@@ -115,6 +115,22 @@ export function runtimeReserveGib(model: Model, batchedTokens?: number): { total
   return { total: Math.max(RUNTIME_GB, CUDA_CONTEXT_GB + activations), activations };
 }
 
+/**
+ * The prefill chunk at which the reserve stops being the flat floor and starts tracking
+ * activations — below it, raising `--max-num-batched-tokens` costs no memory at all because the
+ * floor already covers the activations.
+ *
+ * Worth stating rather than leaving to be discovered by experiment: the breakeven scales as
+ * 1/hidden_size, so it is ~10.9K tokens on Llama-3.3-70B (hidden 8192) and ~31K on GPT-OSS-120B
+ * (hidden 2880). Null when the model carries no embedding geometry, where the reserve is flat
+ * at every chunk.
+ */
+export function reserveFloorChunk(model: Model): number | null {
+  const hidden = model.hidden_size;
+  if (!hidden) return null;
+  return Math.ceil(((RUNTIME_GB - CUDA_CONTEXT_GB) * GIB) / (hidden * ACT_BYTES_PER_TOKEN_HIDDEN));
+}
+
 /** KV bytes per token for ONE layer — GQA vs MLA (addendum §A). */
 export function kvPerLayerPerTokenBytes(model: Model, kvDtypeBytes: number): number {
   return model.mla
