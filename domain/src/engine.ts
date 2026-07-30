@@ -29,12 +29,28 @@ export const RUNTIME_GB = 2.5;
 export const CUDA_CONTEXT_GB = 1.5;
 /** vLLM's default --max-num-batched-tokens; the prefill chunk when the caller does not say. */
 export const DEFAULT_BATCHED_TOKENS = 2048;
+/** Activations are held at 2-byte precision even when the weights are not. */
+export const ACT_DTYPE_BYTES = 2;
 /**
- * Bytes of live activation per token per hidden unit during prefill. A chunk of T tokens
- * materialises qkv, the MLP up/gate projections and residual copies concurrently; this folds
- * those into one multiple over `hidden_size` at 2-byte activations. Order-of-magnitude, not exact.
+ * Activation elements per token that EVERY tensor-parallel rank materialises at full hidden
+ * width: the residual coming in, the residual going out, and one norm/temporary buffer. These do
+ * not shrink as the shard width grows, which is why a big-TP plan still reserves something.
  */
-export const ACT_BYTES_PER_TOKEN_HIDDEN = 12;
+export const ACT_REPLICATED_HIDDEN = 3;
+/**
+ * Activation elements per token at INTERMEDIATE width, divided across ranks. gate, up and their
+ * SiLU product, all produced by column-parallel projections, so each rank holds 1/tp of them.
+ * This is the dominant term and the reason a TP-blind reserve is wrong in both directions.
+ */
+export const ACT_SHARDED_INTERMEDIATE = 3;
+/** qkv and the attention output, also column-parallel; approximated at one hidden width. */
+export const ACT_SHARDED_HIDDEN = 1;
+/**
+ * Assumed FFN width when a model does not declare `intermediate_size`. SwiGLU models cluster
+ * near 3.5x hidden (Llama-3.3-70B is 28672 over 8192 = 3.5 exactly). MoE models are usually far
+ * narrower per token, so this over-reserves for them — the safe direction to be wrong in.
+ */
+export const DEFAULT_INTERMEDIATE_RATIO = 3.5;
 /**
  * Model FLOPs Utilisation achieved during prefill. Prefill is a big dense GEMM and reaches far
  * better utilisation than decode, but nowhere near peak once attention, norms and the scheduler
@@ -106,13 +122,41 @@ export const WHOLE_FILE_QUANTS: ReadonlySet<Quant> = new Set<Quant>(['Q8_0', 'Q4
  *
  * The floor is kept at RUNTIME_GB so nothing re-sizes for callers who never touch the chunk.
  */
-export function runtimeReserveGib(model: Model, batchedTokens?: number): { total: number; activations: number } {
+export function runtimeReserveGib(
+  model: Model,
+  batchedTokens?: number,
+  tp = 1,
+): { total: number; activations: number } {
   const chunk = batchedTokens && batchedTokens > 0 ? batchedTokens : DEFAULT_BATCHED_TOKENS;
   const hidden = model.hidden_size;
   // Without hidden_size we cannot scale anything; fall back to the flat historical reserve.
   if (!hidden) return { total: RUNTIME_GB, activations: 0 };
-  const activations = (chunk * hidden * ACT_BYTES_PER_TOKEN_HIDDEN) / GIB;
+  const activations = (chunk * activationElemsPerToken(model, tp) * ACT_DTYPE_BYTES) / GIB;
   return { total: Math.max(RUNTIME_GB, CUDA_CONTEXT_GB + activations), activations };
+}
+
+/**
+ * Activation elements per token, per GPU, at a given tensor-parallel width.
+ *
+ * Tensor parallelism shards the FFN: gate and up are column-parallel, so a rank holds 1/tp of the
+ * intermediate-width tensors, while the residual stream stays replicated at full width. A reserve
+ * that ignores this is wrong in BOTH directions — it over-reserves at TP16, where the dominant
+ * term has been divided by 16, and under-reserves at TP1, where nothing has been divided at all.
+ *
+ * `intermediate_size` is the FFN width one token traverses in one layer; for MoE that is the
+ * per-expert width times the experts a token is routed to. Peak is one layer's worth, not the
+ * whole stack, because activations are freed as the forward pass advances — which is why layer
+ * count does not appear here.
+ */
+export function activationElemsPerToken(model: Model, tp = 1): number {
+  const hidden = model.hidden_size;
+  if (!hidden) return 0;
+  const intermediate = model.intermediate_size ?? DEFAULT_INTERMEDIATE_RATIO * hidden;
+  const width = Math.max(1, tp);
+  return (
+    ACT_REPLICATED_HIDDEN * hidden +
+    (ACT_SHARDED_INTERMEDIATE * intermediate + ACT_SHARDED_HIDDEN * hidden) / width
+  );
 }
 
 /**
@@ -125,10 +169,11 @@ export function runtimeReserveGib(model: Model, batchedTokens?: number): { total
  * (hidden 2880). Null when the model carries no embedding geometry, where the reserve is flat
  * at every chunk.
  */
-export function reserveFloorChunk(model: Model): number | null {
+export function reserveFloorChunk(model: Model, tp = 1): number | null {
   const hidden = model.hidden_size;
   if (!hidden) return null;
-  return Math.ceil(((RUNTIME_GB - CUDA_CONTEXT_GB) * GIB) / (hidden * ACT_BYTES_PER_TOKEN_HIDDEN));
+  const perToken = activationElemsPerToken(model, tp) * ACT_DTYPE_BYTES;
+  return Math.ceil(((RUNTIME_GB - CUDA_CONTEXT_GB) * GIB) / perToken);
 }
 
 /** KV bytes per token for ONE layer — GQA vs MLA (addendum §A). */
@@ -289,8 +334,6 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   // reconciles with kv_per_request. For an all-full-attention model it equals the nominal rate;
   // with windowed layers it is lower, because most layers stopped growing at the window.
   const kv_per_token_gb = active_tokens > 0 ? kv_per_request_gb / active_tokens : 0;
-  const reserve = runtimeReserveGib(model, input.max_num_batched_tokens);
-  const usable_gb = gpu.mem_gb * mem_util_fraction - reserve.total;
 
   // TP selection: the TP size that needs the FEWEST TOTAL GPUs for the target concurrency.
   //
@@ -301,11 +344,23 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   //
   // Ties break toward the SMALLER shard — same GPU count, less collective traffic. That makes
   // this a cost/throughput objective; a latency-oriented planner would bias the other way.
+  //
+  // The reserve is evaluated PER CANDIDATE, not once up front: prefill activations shard with the
+  // FFN, so usable memory per GPU is itself a function of the shard width. Hoisting it out would
+  // charge every candidate the TP1 activation peak and bias the search toward wide shards for the
+  // wrong reason.
   let tp: number | null = null;
   let free_gb = 0;
   let best_gpus = Infinity;
+  let reserve = runtimeReserveGib(model, input.max_num_batched_tokens, 1);
+  let usable_gb = gpu.mem_gb * mem_util_fraction - reserve.total;
+  let any_room = false;
   for (const t of [...model.tp_options].sort((a, b) => a - b)) {
-    const f = t * usable_gb - weights_gb;
+    const res = runtimeReserveGib(model, input.max_num_batched_tokens, t);
+    const usable = gpu.mem_gb * mem_util_fraction - res.total;
+    if (usable <= 0) continue; // the reserve alone exhausts the card at this shard width
+    any_room = true;
+    const f = t * usable - weights_gb;
     if (f < kv_per_request_gb) continue; // cannot hold weights + one request
     const conc = Math.max(1, Math.floor(f / kv_per_request_gb));
     const total_gpus = Math.ceil(Math.max(1, target_concurrency) / conc) * t;
@@ -313,11 +368,29 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
       best_gpus = total_gpus;
       tp = t;
       free_gb = f;
+      reserve = res;
+      usable_gb = usable;
     }
   }
 
   if (tp === null) {
     const largest = Math.max(...model.tp_options);
+    // Two different failures, and conflating them sends the reader to the wrong lever: no room
+    // for the weights is a quant/context/SKU problem, whereas a reserve that eats the whole card
+    // is a prefill-chunk problem the caller can fix without changing the model at all.
+    if (!any_room) {
+      const worst = runtimeReserveGib(model, input.max_num_batched_tokens, largest);
+      return {
+        ok: false,
+        reason:
+          `The runtime reserve alone (${worst.total.toFixed(1)} GiB, of which ` +
+          `${worst.activations.toFixed(1)} GiB is prefill activations) exceeds the ` +
+          `${(gpu.mem_gb * mem_util_fraction).toFixed(1)} GiB this plan hands to vLLM. ` +
+          `Lower --max-num-batched-tokens.`,
+        weights_gb,
+        kv_per_request_gb,
+      };
+    }
     return {
       ok: false,
       reason:

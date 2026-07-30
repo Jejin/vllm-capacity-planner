@@ -69,6 +69,12 @@ export interface HfConfig {
   hidden_size?: number;
   vocab_size?: number;
   tie_word_embeddings?: boolean;
+  /** Dense FFN width. On an MoE config this is the width of the DENSE layers only. */
+  intermediate_size?: number;
+  /** MoE: per-expert FFN width. Narrower than intermediate_size, often by an order of magnitude. */
+  moe_intermediate_size?: number;
+  /** MoE: experts each token is routed to (top-k). */
+  num_experts_per_tok?: number;
   max_position_embeddings?: number;
   sliding_window?: number | null;
   /** MLA marker: compressed KV projection rank. Present only on latent-attention models. */
@@ -137,6 +143,24 @@ function slug(id: string): string {
   return id.split('/').pop()!.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 64);
 }
 
+/**
+ * FFN width one token traverses in one layer.
+ *
+ * On an MoE config, `intermediate_size` describes the dense layers and is the WRONG number to
+ * reserve activations against — a routed token visits `num_experts_per_tok` experts of
+ * `moe_intermediate_size` each, which for DeepSeek-V3 is 8 x 2048 = 16384 rather than the 18432
+ * its dense layers use. Prefer the MoE pair whenever the config carries it.
+ *
+ * The always-on shared expert some MoE models add is not counted; it is one expert's width
+ * against top-k, so it moves the total a few percent.
+ */
+export function perTokenFfnWidth(cfg: HfConfig): number | undefined {
+  if (cfg.moe_intermediate_size && cfg.num_experts_per_tok) {
+    return cfg.moe_intermediate_size * cfg.num_experts_per_tok;
+  }
+  return cfg.intermediate_size;
+}
+
 /** Map a HF model id + its config.json to a partial §F Model (AD-11). */
 export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
   const mla = detectMla(cfg);
@@ -157,6 +181,8 @@ export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
     hidden_size: cfg.hidden_size,
     vocab_size: cfg.vocab_size,
     tied_embeddings: cfg.tie_word_embeddings ?? false,
+    // FFN width per token per layer — what the prefill activation reserve shards
+    intermediate_size: perTokenFfnWidth(cfg),
   };
   // local/global attention — only set when the config actually declares a window, since
   // an unset pair means "treat every layer as full-context"

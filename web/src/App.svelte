@@ -59,7 +59,7 @@
   const R = $derived(result.ok ? (result as FeasibleSizing) : null);
   const fmt = (x: number, d = 1) => (x >= 1000 ? Math.round(x).toLocaleString() : x.toFixed(d));
   /** Chunk at which the reserve leaves its flat floor — below it, raising the chunk is free. */
-  const floorChunk = $derived(model ? reserveFloorChunk(model) : null);
+  const floorChunk = $derived(model ? reserveFloorChunk(model, R?.tp ?? 1) : null);
   /** What this one deployment costs to run, from the SKU's $/GPU-hour. */
   const rate = $derived(gpu?.price_per_gpu_hour ?? 0);
   const runHr = $derived(R && rate > 0 ? R.gpus * rate : 0);
@@ -244,12 +244,12 @@
   // QUANTS comes from the domain package — a local copy silently went stale and stopped
   // offering the GGUF k-quants after they were added to the engine.
   type Err = { path: string; message: string };
-  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '', linear_attention_layers: '' as number | '', linear_state_bytes_per_layer: '' as number | '' });
+  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '', linear_attention_layers: '' as number | '', linear_state_bytes_per_layer: '' as number | '', intermediate_size: '' as number | '' });
   let mf = $state(blankModel());
   let mfEditing = $state(false);
   let mfErrors = $state<Err[]>([]);
   const errFor = (errs: Err[], p: string) => errs.find((e) => e.path === p)?.message;
-  function editModel(m: Model) { mf = { ...m, tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '' } as any; mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
+  function editModel(m: Model) { mf = { ...m, tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '' } as any; mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
   function newModelForm() { mf = blankModel(); mfEditing = false; mfErrors = []; }
   function toggleQuant(q: string) { mf.quants = mf.quants.includes(q) ? mf.quants.filter((x) => x !== q) : [...mf.quants, q]; }
   async function saveModel() {
@@ -258,6 +258,9 @@
     const emb = mf.hidden_size !== '' && mf.vocab_size !== ''
       ? { hidden_size: +mf.hidden_size, vocab_size: +mf.vocab_size, tied_embeddings: !!mf.tied_embeddings }
       : {};
+    // FFN width stands alone — it drives the activation reserve, not the weight tail, so it is
+    // not gated on the embedding pair being filled in
+    const ffn = mf.intermediate_size !== '' ? { intermediate_size: +mf.intermediate_size } : {};
     // same all-or-nothing rule for the sliding-window pair
     const win = mf.sliding_window !== '' && mf.full_attention_layers !== ''
       ? { sliding_window: +mf.sliding_window, full_attention_layers: +mf.full_attention_layers }
@@ -266,7 +269,7 @@
     const lin = mf.linear_attention_layers !== '' && mf.linear_state_bytes_per_layer !== ''
       ? { linear_attention_layers: +mf.linear_attention_layers, linear_state_bytes_per_layer: +mf.linear_state_bytes_per_layer }
       : {};
-    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...win, ...lin };
+    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...ffn, ...win, ...lin };
     const r = await fetch(mfEditing ? `/api/v1/models/${mf.id}` : '/api/v1/models', { method: mfEditing ? 'PUT' : 'POST', headers: authH, body: JSON.stringify(body) });
     if (r.ok) { newModelForm(); loadCatalog(); notice = 'Model saved.'; }
     else { const e = await r.json(); mfErrors = e.error?.fields ?? [{ path: '', message: e.error?.message ?? 'Save failed.' }]; }
@@ -300,7 +303,7 @@
       const d = await r.json();
       hfCard = d; hfMissing = d.missing ?? [];
       const m = d.mapped ?? {};
-      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '' };
+      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '' };
       mfEditing = false; mfErrors = [];
       notice = `Fetched ${d.model_id}. Review below, complete params / TP / quants (highlighted), then Create model.`;
       document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' });
@@ -417,7 +420,7 @@
         <label>GPUs / node<input type="number" bind:value={perNode} /></label></div>
       <div class="row"><label>Prefill chunk<small> (--max-num-batched-tokens)</small><input type="number" min="256" step="256" bind:value={batchTokens} /></label>
         <label>Runtime reserve<small> (derived)</small><input type="text" value={R ? `${R.runtime_reserve_gb.toFixed(2)} GiB` : '—'} disabled /></label></div>
-      {#if floorChunk}<p class="hint">The reserve is flat at {RUNTIME_GB.toFixed(2)} GiB up to a {floorChunk.toLocaleString()}-token chunk on this model — below that, raising the chunk costs no memory. It scales as 1/hidden_size, so a wider model leaves the floor sooner.</p>{/if}
+      {#if floorChunk}<p class="hint">The reserve is flat at {RUNTIME_GB.toFixed(2)} GiB up to a {floorChunk.toLocaleString()}-token chunk{R ? ` at TP${R.tp}` : ''} — below that, raising the chunk costs no memory. Activations shard with the FFN, so a wider shard raises this figure and a wider model lowers it.{#if model && !model.intermediate_size} This model declares no <code>intermediate_size</code>, so a 3.5× hidden-size FFN is assumed.{/if}</p>{/if}
       {#if R}<button class="btn primary full" onclick={addToPlan}>+ Add to cluster plan</button>{/if}
     </section>
 
@@ -735,6 +738,7 @@
       <div class="row3">
         <label>Hidden size<small> (config.json)</small><input type="number" bind:value={mf.hidden_size} placeholder="8192" /></label>
         <label>Vocab size<small> (config.json)</small><input type="number" bind:value={mf.vocab_size} placeholder="128256" /></label>
+        <label>FFN width / token<small> (MoE: expert × top-k)</small><input type="number" bind:value={mf.intermediate_size} placeholder="28672" /></label>
         <label style="display:flex;align-items:center;gap:8px;margin-top:24px"><input type="checkbox" style="width:auto" bind:checked={mf.tied_embeddings} />Tied embeddings</label>
       </div>
       <div class="hint">Optional but recommended: the embedding table and lm_head stay at 16-bit through quantisation. Supplying these sizes the un-quantised tail exactly instead of a flat overhead factor — worth 10%+ of the footprint at INT4/MXFP4. <em>Not used for GGUF quants (Q4_K_M, Q8_0, IQ4_XS), whose published bytes/param already include the embedding layers.</em></div>
@@ -827,12 +831,16 @@
     <p class="note">GLM-5.2's dense block is 16.5 B parameters. Sized uniform, its NVFP4 checkpoint reads 0.75 of the published VRAM floor; keeping the dense block at 16-bit reads <b>0.80</b>. Quants with no declaration stay uniform.</p>
 
     <h3 class="dh3">Prefill activations</h3>
-    <p>The runtime reserve is <b>not a constant</b>. A prefill chunk materialises activations for every token in it at once, so the peak scales with <code>chunk × hidden_size</code>:</p>
-    <div class="formula">reserve = max( 2.5 GiB , 1.5 GiB context + chunk × hidden_size × 12 bytes )</div>
-    <p>At vLLM's default chunk of 2048 this floors at the historical 2.5 GiB, so default plans size exactly as before. Raise it and it bites: Llama-3.3-70B (hidden 8192) needs 3.0 GiB at 16K, 4.5 GiB at 32K, <b>7.5 GiB at 64K</b> — memory no longer available for KV cache. A narrow model like GPT-OSS-120B (hidden 2880) stays floor-bound at the same chunk.</p>
-    <p>The chunk at which the floor stops binding is <code>1 GiB / (hidden_size × 12)</code> — ~10.9K tokens at hidden 8192, ~21.8K at 4096, ~31K at 2880. On most of the catalogue the activation term is therefore invisible at any chunk you would plausibly set. The planner shows this figure next to the derived reserve rather than leaving it to be found by experiment.</p>
-    <p>Two defaults stay distinct: vLLM's own chunk default is <b>2048</b>, its latency-tuned choice, and the launch command only names the flag when the plan differs from it. The planner starts at <b>8192</b>, which vLLM's tuning guide recommends for throughput. That changes no plan — no catalogue model leaves the 2.5 GiB floor at 8192 tokens — but it makes the command state the chunk rather than imply the latency-tuned one.</p>
-    <p class="note">The 12-bytes figure folds qkv, MLP up/gate and residual copies into one multiple at 2-byte activations. Order-of-magnitude, not kernel-accurate — but it moves in the right direction, which a flat reserve does not.</p>
+    <p>The runtime reserve is <b>not a constant, and not the same on every GPU of a replica</b>. A prefill chunk materialises activations for every token at once, and tensor parallelism shards most of them:</p>
+    <div class="formula">elems/token/GPU = 3 × hidden &nbsp;+&nbsp; ( 3 × FFN_width + hidden ) / TP</div>
+    <div class="formula">reserve = max( 2.5 GiB , 1.5 GiB context + chunk × elems/token/GPU × 2 bytes )</div>
+    <p>The <b>sharded</b> term dominates — gate and up are column-parallel, so a rank holds 1/TP of the widest tensors in the layer. The <b>replicated</b> term does not shrink, so the reserve converges on <code>3 × hidden × chunk × 2</code> rather than on zero. Peak is <b>one layer's worth</b>: activations are freed as the forward pass advances, so layer count does not appear.</p>
+    <p><code>FFN_width</code> is the width one token traverses in one layer — <code>intermediate_size</code> for a dense model, <code>moe_intermediate_size × num_experts_per_tok</code> for MoE, since a routed token materialises activations in every expert it visits. DeepSeek-V3 is 8 × 2048 = 16,384 per token, not the 18,432 its dense layers use. Undeclared, the engine assumes <b>3.5 × hidden_size</b> — the SwiGLU convention, which over-reserves for MoE and is the safe direction.</p>
+    <p>Because the reserve depends on TP, it is evaluated <b>per candidate shard width inside the TP search</b>. Hoisting it out would charge every candidate the TP1 peak and bias selection toward wide shards for the wrong reason. Llama-3.3-70B (hidden 8192, FFN 28,672) at a 32K chunk: <b>8.75 GiB at TP1, 5.88 at TP2, 4.44 at TP4, 3.72 at TP8.</b> The flat <code>chunk × hidden × 12</code> model this replaces answered 4.50 at every width — under-reserving narrow shards by nearly 2× and over-reserving wide ones.</p>
+    <p>The chunk at which the floor stops binding is <code>1 GiB / (elems/token/GPU × 2)</code> — ~11.2K tokens for Llama-3.3-70B at TP4, ~4.5K for Mistral-Small-24B at TP1, whose 32,768 FFN over hidden 5120 is the steepest ratio in the catalogue. The planner shows the figure for the shard width the plan actually chose.</p>
+    <p>Two defaults stay distinct: vLLM's own chunk default is <b>2048</b>, its latency-tuned choice, and the launch command only names the flag when the plan differs from it. The planner starts at <b>8192</b>, which vLLM's tuning guide recommends for throughput. At that chunk every catalogue model is back on the floor once sharded eight ways; unsharded, the widest FFNs do leave it.</p>
+    <p>A reserve can now exhaust the card on its own — a large enough chunk on a small enough GPU leaves nothing for weights. That is reported as its own infeasibility, naming <code>--max-num-batched-tokens</code>, rather than folded into the "weights do not fit" message that would send you to the wrong lever.</p>
+    <p class="note">The multiples (3 replicated, 3 at FFN width, 1 at hidden) fold qkv, gate/up, their SiLU product and the residual copies into whole numbers at 2-byte activations. Structural, not kernel-accurate: it tracks what TP does and does not divide, which a flat reserve cannot, but it does not model fusion, recomputation or an always-on shared expert.</p>
 
     <h2 class="dh">3 · KV cache &amp; concurrency</h2>
     <p>KV cache grows linearly with both sequence length and batch size — the real limiter for long-context, high-concurrency serving. Per-token size depends on the attention geometry:</p>
