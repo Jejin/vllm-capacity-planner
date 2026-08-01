@@ -107,12 +107,25 @@ export interface Model {
   mixed_precision?: Partial<Record<Quant, Quant>>;
 }
 
+/**
+ * GPU architecture, as far as kernel support is concerned. Not a marketing generation: consumer
+ * Blackwell (GB202, SM 12.0) and datacentre Blackwell (SM 10.0) are separate entries because they
+ * differ in NVLink and in which kernels vLLM selects.
+ */
+export const GPU_ARCHES = ['ampere', 'ada', 'hopper', 'blackwell', 'blackwell-consumer', 'cdna3', 'cdna4'] as const;
+export type GpuArch = (typeof GPU_ARCHES)[number];
+
 /** A GPU type (addendum §F.2). */
 export interface GpuSku {
   id: string;
   name: string;
   mem_gb: number;
   bw_tbs: number; // per-GPU HBM aggregate bandwidth (TB/s)
+  /**
+   * What kernels this card can run. Drives the runtime-support verdict, which is a separate
+   * question from whether the plan fits in HBM. Absent => support reports `unverified`.
+   */
+  arch?: GpuArch;
   /**
    * Dense (non-sparse) FP16 tensor throughput in TFLOPS. Drives the prefill/TTFT estimate,
    * which is compute-bound — bandwidth alone under-states it by orders of magnitude at long

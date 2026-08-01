@@ -118,6 +118,20 @@ describe('Epic 3 — Catalog curation + RBAC (FR-2/3/4/29)', () => {
     expect(bad.json().error.fields.some((f: any) => f.path === 'mla_latent_elems')).toBe(true);
   });
 
+  it('a GPU SKU keeps its architecture through a write', async () => {
+    // arch drives the runtime-support verdict; stripped on write, every SKU would silently
+    // report "unverified" — the same failure the tflops_fp16 strip caused for TTFT.
+    const list = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();
+    const h200 = list.gpus.find((g: any) => g.id === 'h200');
+    expect(h200.arch).toBe('hopper');
+    expect((await app.inject({ method: 'POST', url: '/api/v1/gpus', headers: admin, payload: h200 })).statusCode).toBe(201);
+    const after = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();
+    expect(after.gpus.find((g: any) => g.id === 'h200').arch).toBe('hopper');
+    // and an architecture we do not model is refused rather than stored as a typo
+    const bad = await app.inject({ method: 'POST', url: '/api/v1/gpus', headers: admin, payload: { ...h200, id: 'test-arch', arch: 'volta' } });
+    expect(bad.statusCode).toBe(422);
+  });
+
   it('rejects a GQA model with kv_heads=0 with field-level message (FR-2 / AD-14)', async () => {
     const r = await app.inject({ method: 'POST', url: '/api/v1/models', headers: admin, payload: { ...newModel, kv_heads: 0 } });
     expect(r.statusCode).toBe(422);
