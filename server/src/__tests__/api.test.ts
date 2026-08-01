@@ -66,6 +66,39 @@ describe('Epic 3 — Catalog curation + RBAC (FR-2/3/4/29)', () => {
     expect(after.gpus.find((g: any) => g.id === 'h200').tflops_fp16).toBe(h200.tflops_fp16);
   });
 
+  // §9.1 command contract: identity must survive a write, and the display name must never be
+  // able to stand in for it.
+  it('keeps artifact identity and deployment paths through a write', async () => {
+    const list = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();
+    const l70 = list.models.find((m: any) => m.id === 'llama33-70b');
+    expect(l70.hf_id).toBe('meta-llama/Llama-3.3-70B-Instruct');
+    expect(l70.deployments.INT4).toEqual({ source: 'checkpoint', hf_id: 'RedHatAI/Llama-3.3-70B-Instruct-quantized.w4a16' });
+    const again = await app.inject({ method: 'PUT', url: '/api/v1/models/llama33-70b', headers: admin, payload: l70 });
+    expect(again.statusCode).toBe(200);
+    const after = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();
+    const round = after.models.find((m: any) => m.id === 'llama33-70b');
+    expect(round.hf_id).toBe(l70.hf_id);
+    expect(round.deployments).toEqual(l70.deployments);
+  });
+
+  it('rejects a display name as an artifact id, and a self-contradicting deployment', async () => {
+    const spaced = await app.inject({ method: 'POST', url: '/api/v1/models', headers: admin, payload: { ...newModel, id: 'test-spaced', hf_id: 'Llama 3.3 70B Instruct' } });
+    expect(spaced.statusCode).toBe(422);
+    expect(spaced.json().error.fields.some((f: any) => f.path === 'hf_id')).toBe(true);
+    // a checkpoint that also passes --quantization conflicts with its own metadata
+    const conflict = await app.inject({
+      method: 'POST', url: '/api/v1/models', headers: admin,
+      payload: { ...newModel, id: 'test-conflict', hf_id: 'owner/name', quants: ['FP8'], deployments: { FP8: { source: 'checkpoint', method: 'fp8_per_tensor' } } },
+    });
+    expect(conflict.statusCode).toBe(422);
+    // and an online path with no method would silently serve the base precision
+    const noMethod = await app.inject({
+      method: 'POST', url: '/api/v1/models', headers: admin,
+      payload: { ...newModel, id: 'test-nomethod', hf_id: 'owner/name', quants: ['FP8'], deployments: { FP8: { source: 'online' } } },
+    });
+    expect(noMethod.statusCode).toBe(422);
+  });
+
   // Same class of bug as the TFLOPS one above: geometry the engine reads must survive a write.
   it('an MLA model keeps its latent width through a write, and GQA cannot carry one', async () => {
     const mla = { ...newModel, id: 'test-mla', mla: true, kv_heads: 0, head_dim: 0, mla_latent_elems: 640 };

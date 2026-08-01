@@ -111,12 +111,14 @@
   let cmdDocker = $state(false);
   let cmdCopied = $state(false);
   /** Catalogue entries carry display names; only use one as a serve id if it looks like one. */
-  const hfIdFor = (m: Model) => (/^[\w.-]+\/[\w.-]+$/.test(m.name) ? m.name : undefined);
+  // The artifact comes from the catalogue entry's deployment for the selected precision. It used
+  // to come from regex-testing whether the DISPLAY NAME looked like a repo id, which no seeded
+  // model's name does — so every command served a display name.
   const serveCmd = $derived(
-    R && model ? serveCommand(model, sizingInput, R, { hf_id: hfIdFor(model), docker: cmdDocker }) : null,
+    R && model ? serveCommand(model, sizingInput, R, { docker: cmdDocker }) : null,
   );
   async function copyCmd() {
-    if (!serveCmd) return;
+    if (!serveCmd || serveCmd.blocked) return;
     try { await navigator.clipboard.writeText(serveCmd.command); cmdCopied = true; setTimeout(() => (cmdCopied = false), 1600); }
     catch { notice = 'Clipboard unavailable — select the command and copy manually.'; }
   }
@@ -244,14 +246,24 @@
   // QUANTS comes from the domain package — a local copy silently went stale and stopped
   // offering the GGUF k-quants after they were added to the engine.
   type Err = { path: string; message: string };
-  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '', linear_attention_layers: '' as number | '', linear_state_bytes_per_layer: '' as number | '', intermediate_size: '' as number | '', mla_latent_elems: '' as number | '' });
-  let mf = $state(blankModel());
+  type DeployForm = { source: '' | 'checkpoint' | 'online' | 'none'; hf_id: string; method: string };
+  const deployForm = (d: Model['deployments']): Record<string, DeployForm> =>
+    Object.fromEntries(Object.entries(d ?? {}).map(([q, v]) => [q, { source: v!.source, hf_id: v!.hf_id ?? '', method: v!.method ?? '' }]));
+  /** Every selected precision needs a row to bind to, so rows are materialised whenever the
+   *  quant set changes rather than lazily during render (bind: needs a real member). */
+  function ensureRows<T extends { quants: string[]; deployments: Record<string, DeployForm> }>(f: T): T {
+    for (const q of f.quants) f.deployments[q] ??= { source: '', hf_id: '', method: '' };
+    return f;
+  }
+
+  const blankModel = () => ({ id: '', name: '', hf_id: '', revision: '', deployments: {} as Record<string, DeployForm>, total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '', linear_attention_layers: '' as number | '', linear_state_bytes_per_layer: '' as number | '', intermediate_size: '' as number | '', mla_latent_elems: '' as number | '' });
+  let mf = $state(ensureRows(blankModel()));
   let mfEditing = $state(false);
   let mfErrors = $state<Err[]>([]);
   const errFor = (errs: Err[], p: string) => errs.find((e) => e.path === p)?.message;
-  function editModel(m: Model) { mf = { ...m, tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '' } as any; mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
-  function newModelForm() { mf = blankModel(); mfEditing = false; mfErrors = []; }
-  function toggleQuant(q: string) { mf.quants = mf.quants.includes(q) ? mf.quants.filter((x) => x !== q) : [...mf.quants, q]; }
+  function editModel(m: Model) { mf = { ...m, hf_id: m.hf_id ?? '', revision: m.revision ?? '', deployments: deployForm(m.deployments), tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '' } as any; ensureRows(mf); mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
+  function newModelForm() { mf = ensureRows(blankModel()); mfEditing = false; mfErrors = []; }
+  function toggleQuant(q: string) { mf.quants = mf.quants.includes(q) ? mf.quants.filter((x) => x !== q) : [...mf.quants, q]; ensureRows(mf); }
   async function saveModel() {
     // hidden_size/vocab_size are optional — send them only when both are filled in, so a blank
     // pair stays undefined (engine falls back) rather than becoming 0 and failing validation.
@@ -272,7 +284,22 @@
     // latent width is MLA-only geometry — the schema rejects it on a GQA entry, so a value left
     // behind by toggling MLA off must not be sent
     const lat = mf.mla && mf.mla_latent_elems !== '' ? { mla_latent_elems: +mf.mla_latent_elems } : {};
-    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...ffn, ...win, ...lin, ...lat };
+    // deployment identity — blank means "no artifact", which blocks command generation rather
+    // than falling back to anything
+    const identity = { ...(mf.hf_id.trim() ? { hf_id: mf.hf_id.trim() } : {}), ...(mf.revision.trim() ? { revision: mf.revision.trim() } : {}) };
+    // one deployment per selected quant, only for the rows the admin actually filled in
+    const deployments: Record<string, any> = {};
+    for (const q of mf.quants) {
+      const d = mf.deployments[q];
+      if (!d?.source) continue;
+      deployments[q] = {
+        source: d.source,
+        ...(d.hf_id.trim() ? { hf_id: d.hf_id.trim() } : {}),
+        ...(d.source === 'online' && d.method.trim() ? { method: d.method.trim() } : {}),
+      };
+    }
+    const dep = Object.keys(deployments).length ? { deployments } : {};
+    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...ffn, ...win, ...lin, ...lat, ...identity, ...dep };
     const r = await fetch(mfEditing ? `/api/v1/models/${mf.id}` : '/api/v1/models', { method: mfEditing ? 'PUT' : 'POST', headers: authH, body: JSON.stringify(body) });
     if (r.ok) { newModelForm(); loadCatalog(); notice = 'Model saved.'; }
     else { const e = await r.json(); mfErrors = e.error?.fields ?? [{ path: '', message: e.error?.message ?? 'Save failed.' }]; }
@@ -306,8 +333,8 @@
       const d = await r.json();
       hfCard = d; hfMissing = d.missing ?? [];
       const m = d.mapped ?? {};
-      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '', mla_latent_elems: m.mla_latent_elems ?? '' };
-      mfEditing = false; mfErrors = [];
+      mf = { id: m.id ?? '', name: m.name ?? hfId, hf_id: m.hf_id ?? '', revision: '', deployments: {}, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '', mla_latent_elems: m.mla_latent_elems ?? '' };
+      ensureRows(mf); mfEditing = false; mfErrors = [];
       notice = `Fetched ${d.model_id}. Review below, complete params / TP / quants (highlighted), then Create model.`;
       document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' });
     } else {
@@ -516,13 +543,21 @@
         {#if serveCmd}
           <div class="panel">
             <h2>Launch command
-              <span style="float:right;display:flex;gap:6px">
-                <button class="btn ghost" onclick={() => (cmdDocker = !cmdDocker)}>{cmdDocker ? 'plain' : 'docker'}</button>
-                <button class="btn" onclick={copyCmd}>{cmdCopied ? 'copied' : 'copy'}</button>
-              </span>
+              {#if serveCmd.artifact}<small>· {serveCmd.artifact.hf_id} · {serveCmd.artifact.source === 'online' ? `online ${serveCmd.artifact.method}` : serveCmd.artifact.source === 'checkpoint' ? `${effQuant} checkpoint` : 'native precision'}</small>{/if}
+              {#if !serveCmd.blocked}
+                <span style="float:right;display:flex;gap:6px">
+                  <button class="btn ghost" onclick={() => (cmdDocker = !cmdDocker)}>{cmdDocker ? 'plain' : 'docker'}</button>
+                  <button class="btn" onclick={copyCmd}>{cmdCopied ? 'copied' : 'copy'}</button>
+                </span>
+              {/if}
             </h2>
-            <pre class="cmd">{serveCmd.command}</pre>
-            <ul class="cmdnotes">{#each serveCmd.notes as n}<li>{n}</li>{/each}</ul>
+            {#if serveCmd.blocked}
+              <div class="state warn"><b>No launch command for this precision.</b> {serveCmd.blocked}</div>
+              <p class="tot">The memory plan above still stands — this is a gap in the <em>deployment</em> path, not the sizing. A command is withheld rather than approximated because one that silently launched a different precision would OOM against arithmetic that was correct for a deployment nobody ran.</p>
+            {:else}
+              <pre class="cmd">{serveCmd.command}</pre>
+              <ul class="cmdnotes">{#each serveCmd.notes as n}<li>{n}</li>{/each}</ul>
+            {/if}
           </div>
         {/if}
 
@@ -725,6 +760,12 @@
       </div>
       {#if errFor(mfErrors, 'id')}<div class="ferr">{errFor(mfErrors, 'id')}</div>{/if}
       <div class="row3">
+        <label style="grid-column:span 2">Hugging Face id<small> (owner/name — what <code>vllm serve</code> resolves)</small><input bind:value={mf.hf_id} placeholder="zai-org/GLM-6" /></label>
+        <label>Revision<small> (optional tag/SHA)</small><input bind:value={mf.revision} placeholder="main" /></label>
+      </div>
+      <div class="hint">The <b>Name</b> above is a display label and never reaches a command line. This is the artifact identity. Left blank, the planner still sizes the model but generates no launch command — there would be nothing for vLLM to resolve.</div>
+      {#if errFor(mfErrors, 'hf_id')}<div class="ferr">{errFor(mfErrors, 'hf_id')}</div>{/if}
+      <div class="row3">
         <label>Total params (B)<input type="number" step="0.01" bind:value={mf.total_params_b} /></label>
         <label>Active params (B)<input type="number" step="0.01" bind:value={mf.active_params_b} /></label>
         <label>Layers<input type="number" bind:value={mf.layers} /></label>
@@ -771,6 +812,21 @@
       <label>Quantisation variants</label>
       <div class="quants">{#each QUANTS as q}<button type="button" class="qbtn" class:on={mf.quants.includes(q)} onclick={() => toggleQuant(q)}>{q}</button>{/each}</div>
       {#if errFor(mfErrors, 'quants')}<div class="ferr">{errFor(mfErrors, 'quants')}</div>{/if}
+      {#if mf.quants.length}
+        <label style="margin-top:12px">Deployment path per precision</label>
+        <table class="deploy"><thead><tr><th>Precision</th><th>Source</th><th>Artifact <small>(blank = base id)</small></th><th>--quantization</th></tr></thead><tbody>
+          {#each mf.quants as q}
+            <tr>
+              <td><b>{q}</b></td>
+              <td><select bind:value={mf.deployments[q].source}><option value="">— none known —</option><option value="none">native precision</option><option value="checkpoint">pre-quantised checkpoint</option><option value="online">online quantisation</option></select></td>
+              <td><input bind:value={mf.deployments[q].hf_id} disabled={mf.deployments[q].source === '' || mf.deployments[q].source === 'none'} placeholder={mf.hf_id || 'owner/name'} /></td>
+              <td><input bind:value={mf.deployments[q].method} disabled={mf.deployments[q].source !== 'online'} placeholder={mf.deployments[q].source === 'online' ? 'fp8_per_tensor' : '—'} /></td>
+            </tr>
+          {/each}
+        </tbody></table>
+        <div class="hint">A precision with <b>no known source</b> is sized but cannot be launched: the planner blocks its command and says what is missing, rather than emitting one that quietly serves a different precision. vLLM applies only <code>fp8_per_tensor</code>, <code>fp8_per_block</code> and <code>mxfp8</code> online — every 4-bit format needs a pre-quantised artifact. A <em>checkpoint</em> source must not also pass <code>--quantization</code>; the flag conflicts with the artifact's own metadata.</div>
+        {#each mf.quants as q}{#if errFor(mfErrors, `deployments.${q}`)}<div class="ferr">{q}: {errFor(mfErrors, `deployments.${q}`)}</div>{/if}{#if errFor(mfErrors, `deployments.${q}.method`)}<div class="ferr">{q}: {errFor(mfErrors, `deployments.${q}.method`)}</div>{/if}{#if errFor(mfErrors, `deployments.${q}.hf_id`)}<div class="ferr">{q}: {errFor(mfErrors, `deployments.${q}.hf_id`)}</div>{/if}{/each}
+      {/if}
       {#if mfErrors.find((e) => e.path === '')}<div class="ferr">{mfErrors.find((e) => e.path === '')?.message}</div>{/if}
       <div style="margin-top:14px;display:flex;gap:8px"><button class="btn primary" onclick={saveModel}>{mfEditing ? 'Save changes' : 'Create model'}</button>{#if mfEditing}<button class="btn ghost" onclick={newModelForm}>Cancel</button>{/if}</div>
     </section>
@@ -930,6 +986,13 @@
     <p>Every feasible plan emits the <code>vllm serve</code> command implied by its own numbers. <code>--max-num-seqs</code> is the one worth understanding: it is set to the <b>pod's</b> KV budget, not the deployment target. Left at vLLM's default the scheduler admits more sequences than the cache holds and preempts under load — which presents as a throughput problem and is really a sizing one.</p>
     <p class="note">The command describes <b>one replica</b>. A plan needing <em>n</em> pods needs <em>n</em> copies behind a load balancer; conflating the two is the classic way to under-provision.</p>
 
+    <h3 class="dh3">The artifact is not the display name</h3>
+    <p>A model entry carries two separate identities. <code>name</code> is a label for people ("Llama 3.3 70B Instruct"); <code>hf_id</code> is the repository <code>vllm serve</code> resolves. Only the second ever reaches a command line. The planner previously fell back from one to the other, which produced <code>vllm serve Llama 3.3 70B Instruct</code> — three positional arguments as far as the shell is concerned, and unresolvable even if it parsed.</p>
+
+    <h3 class="dh3">Precision is a deployment path, not just a byte count</h3>
+    <p>Bytes per parameter is enough to size memory and not enough to launch a server. Each precision a model offers declares how it is actually obtained: a <b>checkpoint</b> that already carries it (no <code>--quantization</code> — the flag would conflict with the artifact's own metadata), an <b>online</b> method applied to an unquantised base (<code>--quantization &lt;method&gt;</code>), or <b>native</b> precision needing no flag. vLLM applies only <code>fp8_per_tensor</code>, <code>fp8_per_block</code> and <code>mxfp8</code> online — every 4-bit format needs a pre-quantised artifact, usually a <em>different repository</em>, so a model's INT4 plan and its FP16 plan generally resolve different ids.</p>
+    <p class="note">A precision with no declared path <b>blocks its command</b>. Sizing still runs and the memory plan still stands; only the command is withheld. Emitting one that silently launched BF16 for a plan sized at INT4 produces an OOM hours later, against arithmetic that was correct for a deployment nobody ran — withholding is the safer failure, and filling the gap is a catalogue edit rather than a code change.</p>
+
     <h2 class="dh">12 · Where catalog numbers come from</h2>
     <p>Model geometry is not guessed. Two sources, separated by what each is authoritative for:</p>
     <table class="qtab"><thead><tr><th>Source</th><th>Supplies</th></tr></thead><tbody>
@@ -980,6 +1043,7 @@
   label{display:block;font-size:11px;font-weight:600;color:var(--ink2);text-transform:uppercase;letter-spacing:.03em;margin:11px 0 4px}
   select,input{width:100%;padding:8px 9px;border:1px solid var(--line);background:var(--surface2);color:var(--ink);border-radius:5px;font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:13px}
   select:focus,input:focus{outline:2px solid var(--brand);outline-offset:-1px}
+  .deploy{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}.deploy th{text-align:left;font-size:10px;letter-spacing:.04em;text-transform:uppercase;color:var(--ink3);padding:4px 6px 4px 0;font-weight:700}.deploy td{padding:3px 6px 3px 0;vertical-align:middle}.deploy input,.deploy select{width:100%}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
   .meta{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink2);background:var(--surface2);border:1px dashed var(--line);border-radius:5px;padding:8px 10px;margin-top:8px;line-height:1.6}
   .full{margin-top:14px;width:100%}

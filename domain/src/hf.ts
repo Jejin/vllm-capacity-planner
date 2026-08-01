@@ -2,6 +2,7 @@
 // identically. Params/tp/quants aren't in config.json → the admin completes them before commit.
 import type { Model, Quant } from './types.js';
 import { computeSizing } from './engine.js';
+import { HF_ID_RE } from './schema.js';
 import type { GpuSku, SizingInput, Sizing } from './types.js';
 
 /** HF `architectures` / `model_type` values that use Multi-head Latent Attention. */
@@ -95,6 +96,8 @@ export interface HfConfig {
   shared_expert_intermediate_size?: number;
   max_position_embeddings?: number;
   sliding_window?: number | null;
+  /** Present on pre-quantised checkpoints; `quant_method` names the format the weights are in. */
+  quantization_config?: { quant_method?: string; [k: string]: unknown };
   /** MLA marker: compressed KV projection rank. Present only on latent-attention models. */
   kv_lora_rank?: number;
   qk_rope_head_dim?: number;
@@ -155,6 +158,13 @@ export interface HfMapResult {
   /** §F fields the card does not carry — the admin MUST supply these before commit. */
   missing: (keyof Model)[];
   detectedMla: boolean;
+  /**
+   * `quant_method` from the config, when the repository is already quantised. This is the
+   * signal that the fetched id is itself a deployable artifact for that precision rather than
+   * a base checkpoint needing an online method — the admin still confirms which of our quants
+   * it maps to, since vendor spellings ("compressed-tensors") do not name a format.
+   */
+  detectedQuantMethod?: string;
 }
 
 function slug(id: string): string {
@@ -198,6 +208,9 @@ export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
   const mapped: Partial<Model> = {
     id: slug(id),
     name: id,
+    // the fetched repository IS the deployment identity — the one field that must never be
+    // confused with the display label
+    hf_id: HF_ID_RE.test(id) ? id : undefined,
     layers: cfg.num_hidden_layers,
     mla,
     kv_heads: mla ? 0 : kv_heads,
@@ -233,7 +246,12 @@ export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
   if (!mla && (!kv_heads || !head_dim)) missing.push('kv_heads', 'head_dim');
   if (!cfg.num_hidden_layers) missing.push('layers');
   if (!cfg.max_position_embeddings) missing.push('max_ctx');
-  return { mapped, missing: [...new Set(missing)], detectedMla: mla };
+  return {
+    mapped,
+    missing: [...new Set(missing)],
+    detectedMla: mla,
+    detectedQuantMethod: cfg.quantization_config?.quant_method,
+  };
 }
 
 /** Concurrency rubric: sweep target concurrency, returning the sizing metrics at each level. */

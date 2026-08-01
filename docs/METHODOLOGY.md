@@ -318,6 +318,24 @@ Integer bytes rather than floats keep the browser's live verdict and the server'
 
 Every feasible plan emits the `vllm serve` command implied by its own numbers — TP size, `--max-model-len`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--max-num-batched-tokens` where it differs from default, and `--max-num-seqs`.
 
+### The artifact is not the display name
+
+A model entry carries two separate identities. `name` is a label for people ("Llama 3.3 70B Instruct"); `hf_id` is the repository `vllm serve` resolves. Only the second ever reaches a command line. The planner previously fell back from one to the other, which produced `vllm serve Llama 3.3 70B Instruct` — three positional arguments as far as the shell is concerned, and unresolvable even if it parsed.
+
+### Precision is a deployment path, not just a byte count
+
+Bytes per parameter is enough to size memory and not enough to launch a server. Each precision a model offers therefore declares how it is actually obtained:
+
+| Source | Meaning | Command |
+|---|---|---|
+| `checkpoint` | the artifact already carries this precision | no `--quantization`; the flag would conflict with the checkpoint's own metadata |
+| `online` | unquantised base plus a load-time method | `--quantization <method>` |
+| `none` | the checkpoint's native dtype already matches | no flag |
+
+vLLM applies only `fp8_per_tensor`, `fp8_per_block` and `mxfp8` online — every 4-bit format needs a pre-quantised artifact, which is usually a *different repository* rather than a flag on the base one. So a model's INT4 plan and its FP16 plan generally resolve different `hf_id`s.
+
+**A precision with no declared path blocks its command.** Sizing still runs and the memory plan still stands; only the command is withheld. This is deliberate: emitting a command that silently launches BF16 for a plan sized at INT4 produces an OOM hours later, against arithmetic that was correct for a deployment nobody ran. Withholding is the safer failure. Filling the gap is a catalogue edit — an artifact id, not a code change.
+
 `--max-num-seqs` is the one worth understanding. It is set to the **pod's** KV budget, not the deployment target. Left at vLLM's default the scheduler admits more sequences than the cache can hold and preempts under load — which presents as a throughput problem and is really a sizing one.
 
 The command describes **one replica**. A plan needing *n* pods needs *n* copies of it behind a load balancer; conflating the two is the classic way to under-provision.

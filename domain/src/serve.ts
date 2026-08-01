@@ -6,11 +6,10 @@
 // command OOMs, the sizing was wrong.
 
 import { DEFAULT_BATCHED_TOKENS } from './engine.js';
-import type { FeasibleSizing, Model, SizingInput } from './types.js';
+import { HF_ID_RE } from './schema.js';
+import type { DeploymentVariant, FeasibleSizing, Model, Quant, SizingInput } from './types.js';
 
 export interface ServeCommandOptions {
-  /** Hugging Face id to serve. Falls back to the catalogue model name. */
-  hf_id?: string;
   /** Emit a `docker run` wrapper around the same arguments. */
   docker?: boolean;
   /** Image for the docker form. */
@@ -18,12 +17,56 @@ export interface ServeCommandOptions {
 }
 
 export interface ServeCommand {
-  /** Argument vector — the source of truth; the strings below are rendered from it. */
+  /** Argument vector — the source of truth; the strings below are rendered from it. Empty when blocked. */
   argv: string[];
-  /** Shell command, backslash-continued for readability. */
+  /** Shell command, backslash-continued for readability. Empty when blocked. */
   command: string;
   /** Notes explaining non-obvious flags, shown beside the command. */
   notes: string[];
+  /** Why no command could be generated. Present ⇒ argv/command are empty. */
+  blocked?: string;
+  /** The artifact this command resolves, once one is known. */
+  artifact?: { hf_id: string; source: DeploymentVariant['source']; method?: string; revision?: string };
+}
+
+/**
+ * Resolve the artifact and launch semantics for one precision, or say why they can't be.
+ *
+ * The planner used to fall back to `model.name` here, so every seeded model emitted
+ * `vllm serve Llama 3.3 70B Instruct` — three positional arguments to the shell, and a
+ * resolution failure even if it parsed. Guessing is worse than refusing: a command that starts
+ * at a precision the plan was not sized for OOMs later, against arithmetic that was correct for
+ * a deployment nobody launched.
+ */
+export function resolveDeployment(
+  model: Model,
+  quant: Quant,
+): { artifact: NonNullable<ServeCommand['artifact']> } | { blocked: string } {
+  const variant = model.deployments?.[quant];
+  if (!variant) {
+    return {
+      blocked:
+        `No known ${quant} deployment path for ${model.name}. Sizing is unaffected, but launching at ` +
+        `${quant} needs either a pre-quantised checkpoint or a vLLM online-quantisation method — ` +
+        `add one to this model's deployments in the catalogue.`,
+    };
+  }
+  const hf_id = variant.hf_id ?? model.hf_id;
+  if (!hf_id || !HF_ID_RE.test(hf_id)) {
+    return {
+      blocked:
+        `${model.name} has no Hugging Face artifact id, so there is nothing for \`vllm serve\` to ` +
+        `resolve. Add the owner/name repository to the catalogue entry.`,
+    };
+  }
+  return {
+    artifact: {
+      hf_id,
+      source: variant.source,
+      method: variant.source === 'online' ? variant.method : undefined,
+      revision: variant.revision ?? model.revision,
+    },
+  };
 }
 
 /** vLLM's flag for a KV cache dtype, or null when the default (model dtype) applies. */
@@ -44,9 +87,29 @@ export function serveCommand(
   sizing: FeasibleSizing,
   opts: ServeCommandOptions = {},
 ): ServeCommand {
-  const id = opts.hf_id?.trim() || model.name;
-  const argv: string[] = ['vllm', 'serve', id];
+  const resolved = resolveDeployment(model, input.quant);
+  if ('blocked' in resolved) return { argv: [], command: '', notes: [], blocked: resolved.blocked };
+  const { artifact } = resolved;
+
+  const argv: string[] = ['vllm', 'serve', artifact.hf_id];
   const notes: string[] = [];
+
+  if (artifact.revision) argv.push('--revision', artifact.revision);
+  if (artifact.source === 'online') {
+    // the plan's bytes/param only materialise if the flag is actually passed
+    argv.push('--quantization', artifact.method!);
+    notes.push(
+      `${input.quant} is applied at load time by vLLM (--quantization ${artifact.method}) to an ` +
+        `unquantised checkpoint. Dropping the flag serves the base precision, which needs far more HBM than this plan allows.`,
+    );
+  } else if (artifact.source === 'checkpoint') {
+    notes.push(
+      `${artifact.hf_id} is already a ${input.quant} checkpoint, so no --quantization flag is passed — ` +
+        `the precision comes from the artifact's own metadata, and a conflicting flag would be an error.`,
+    );
+  } else {
+    notes.push(`${input.quant} is this checkpoint's native precision, so no quantisation flag is needed.`);
+  }
 
   argv.push('--tensor-parallel-size', String(sizing.tp));
   if (sizing.multi_node) {
@@ -101,15 +164,24 @@ export function serveCommand(
   const command = opts.docker
     ? dockerWrap(argv, opts.image ?? 'vllm/vllm-openai:latest')
     : renderShell(argv);
-  return { argv, command, notes };
+  return { argv, command, notes, artifact };
+}
+
+/**
+ * Single-quote any token the shell would not read as one word. argv is the source of truth and
+ * every element is one argument; rendering it back to a string has to preserve that.
+ */
+function shellQuote(tok: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(tok) ? tok : `'${tok.replace(/'/g, `'\\''`)}'`;
 }
 
 /** Render argv as a readable shell command, one flag per line. */
 function renderShell(argv: string[]): string {
-  const head = argv.slice(0, 3).join(' ');
+  const q = argv.map(shellQuote);
+  const head = q.slice(0, 3).join(' ');
   const rest: string[] = [];
-  for (let i = 3; i < argv.length; i += 2) {
-    rest.push(argv[i + 1] === undefined ? argv[i] : `${argv[i]} ${argv[i + 1]}`);
+  for (let i = 3; i < q.length; i += 2) {
+    rest.push(q[i + 1] === undefined ? q[i] : `${q[i]} ${q[i + 1]}`);
   }
   return rest.length ? `${head} \\\n  ${rest.join(' \\\n  ')}` : head;
 }
