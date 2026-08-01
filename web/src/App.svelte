@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, serveCommand, topologyLayout, topologySvg, reserveFloorChunk, RUNTIME_GB, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, serveCommand, topologyLayout, topologySvg, reserveFloorChunk, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -244,7 +244,7 @@
   // QUANTS comes from the domain package — a local copy silently went stale and stopped
   // offering the GGUF k-quants after they were added to the engine.
   type Err = { path: string; message: string };
-  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '', linear_attention_layers: '' as number | '', linear_state_bytes_per_layer: '' as number | '', intermediate_size: '' as number | '' });
+  const blankModel = () => ({ id: '', name: '', total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '', linear_attention_layers: '' as number | '', linear_state_bytes_per_layer: '' as number | '', intermediate_size: '' as number | '', mla_latent_elems: '' as number | '' });
   let mf = $state(blankModel());
   let mfEditing = $state(false);
   let mfErrors = $state<Err[]>([]);
@@ -269,7 +269,10 @@
     const lin = mf.linear_attention_layers !== '' && mf.linear_state_bytes_per_layer !== ''
       ? { linear_attention_layers: +mf.linear_attention_layers, linear_state_bytes_per_layer: +mf.linear_state_bytes_per_layer }
       : {};
-    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...ffn, ...win, ...lin };
+    // latent width is MLA-only geometry — the schema rejects it on a GQA entry, so a value left
+    // behind by toggling MLA off must not be sent
+    const lat = mf.mla && mf.mla_latent_elems !== '' ? { mla_latent_elems: +mf.mla_latent_elems } : {};
+    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...ffn, ...win, ...lin, ...lat };
     const r = await fetch(mfEditing ? `/api/v1/models/${mf.id}` : '/api/v1/models', { method: mfEditing ? 'PUT' : 'POST', headers: authH, body: JSON.stringify(body) });
     if (r.ok) { newModelForm(); loadCatalog(); notice = 'Model saved.'; }
     else { const e = await r.json(); mfErrors = e.error?.fields ?? [{ path: '', message: e.error?.message ?? 'Save failed.' }]; }
@@ -303,7 +306,7 @@
       const d = await r.json();
       hfCard = d; hfMissing = d.missing ?? [];
       const m = d.mapped ?? {};
-      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '' };
+      mf = { id: m.id ?? '', name: m.name ?? hfId, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '', mla_latent_elems: m.mla_latent_elems ?? '' };
       mfEditing = false; mfErrors = [];
       notice = `Fetched ${d.model_id}. Review below, complete params / TP / quants (highlighted), then Create model.`;
       document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' });
@@ -409,7 +412,7 @@
     <section class="panel">
       <h2>Deployment inputs</h2>
       <label>Model<select bind:value={modelId}>{#each catalog.models as m}<option value={m.id}>{m.name}</option>{/each}</select></label>
-      <div class="meta">total {model?.total_params_b} B · active {model?.active_params_b} B · layers {model?.layers} · {model?.mla ? 'MLA (latent 576/layer)' : `GQA ${model?.kv_heads} KV-heads × ${model?.head_dim}`} · max ctx {((model?.max_ctx ?? 0) / 1024)}K · TP {`{${model?.tp_options.join(',')}}`}{#if model?.vocab_size && model?.hidden_size} · emb {model.vocab_size.toLocaleString()}×{model.hidden_size}{model.tied_embeddings ? ' (tied)' : ''}{/if}{#if model?.sliding_window && model?.full_attention_layers != null} · <b>SWA {model.full_attention_layers}/{model.layers} full</b>, {model.sliding_window}-tok window{/if}{#if model?.linear_attention_layers} · <b>{model.linear_attention_layers} linear</b> (constant state){/if}</div>
+      <div class="meta">total {model?.total_params_b} B · active {model?.active_params_b} B · layers {model?.layers} · {model?.mla ? `MLA (latent ${mlaLatentElems(model)}/layer)` : `GQA ${model?.kv_heads} KV-heads × ${model?.head_dim}`} · max ctx {((model?.max_ctx ?? 0) / 1024)}K · TP {`{${model?.tp_options.join(',')}}`}{#if model?.vocab_size && model?.hidden_size} · emb {model.vocab_size.toLocaleString()}×{model.hidden_size}{model.tied_embeddings ? ' (tied)' : ''}{/if}{#if model?.sliding_window && model?.full_attention_layers != null} · <b>SWA {model.full_attention_layers}/{model.layers} full</b>, {model.sliding_window}-tok window{/if}{#if model?.linear_attention_layers} · <b>{model.linear_attention_layers} linear</b> (constant state){/if}</div>
       <div class="row"><label>Quantisation<select bind:value={quant}>{#each (model?.quants ?? []) as q}<option value={q}>{q}</option>{/each}</select></label>
         <label>KV dtype<select bind:value={kvBytes}><option value={1}>FP8 (1B)</option><option value={2}>FP16 (2B)</option></select></label></div>
       <div class="row"><label>Max context<select bind:value={ctx}>{#each ctxChoices as c}<option value={c}>{c / 1024}K</option>{/each}</select></label>
@@ -663,7 +666,7 @@
           <div class="mcard-b">
             <div><span>Total / Active</span><b>{m.total_params_b} / {m.active_params_b} B</b></div>
             <div><span>Layers</span><b>{m.layers}</b></div>
-            <div><span>KV geometry</span><b>{m.mla ? 'latent 576' : `${m.kv_heads}×${m.head_dim}`}</b></div>
+            <div><span>KV geometry</span><b>{m.mla ? `latent ${mlaLatentElems(m)}` : `${m.kv_heads}×${m.head_dim}`}</b></div>
             <div><span>Max context</span><b>{(m.max_ctx / 1024)}K</b></div>
             <div><span>TP options</span><b>{m.tp_options.join(', ')}</b></div>
             <div><span>Quants</span><b>{m.quants.join(', ')}</b></div>
@@ -760,8 +763,11 @@
       {#if errFor(mfErrors, 'hidden_size')}<div class="ferr">{errFor(mfErrors, 'hidden_size')}</div>{/if}
       <div class="row3">
         <label>TP options<input bind:value={mf.tp_options} placeholder="8,16" /></label>
-        <label style="display:flex;align-items:center;gap:8px;margin-top:24px"><input type="checkbox" style="width:auto" bind:checked={mf.mla} onchange={() => { if (mf.mla) { mf.kv_heads = 0; mf.head_dim = 0; } }} />MLA (latent attention)</label>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:24px"><input type="checkbox" style="width:auto" bind:checked={mf.mla} onchange={() => { if (mf.mla) { mf.kv_heads = 0; mf.head_dim = 0; } else { mf.mla_latent_elems = ''; } }} />MLA (latent attention)</label>
+        <label>Latent / layer{#if !mf.mla}<small> (MLA only)</small>{/if}<input type="number" bind:value={mf.mla_latent_elems} disabled={!mf.mla} placeholder={String(DEFAULT_MLA_LATENT_ELEMS)} /></label>
       </div>
+      {#if mf.mla}<div class="hint">An MLA model's per-layer KV width is <code>kv_lora_rank + qk_rope_head_dim</code> from <code>config.json</code> — the latent counterpart to a GQA model's <code>2 × KV-heads × head-dim</code>. DeepSeek, Kimi and GLM-5.2 all ship 512 + 64 = {DEFAULT_MLA_LATENT_ELEMS}, which is assumed if this is left blank; it is checkpoint geometry, not a planner constant, so a model with a different rank must state it.</div>{/if}
+      {#if errFor(mfErrors, 'mla_latent_elems')}<div class="ferr">{errFor(mfErrors, 'mla_latent_elems')}</div>{/if}
       <label>Quantisation variants</label>
       <div class="quants">{#each QUANTS as q}<button type="button" class="qbtn" class:on={mf.quants.includes(q)} onclick={() => toggleQuant(q)}>{q}</button>{/each}</div>
       {#if errFor(mfErrors, 'quants')}<div class="ferr">{errFor(mfErrors, 'quants')}</div>{/if}
@@ -790,7 +796,7 @@
 {:else if tab === 'methodology'}
   <section class="panel doc">
     <h1 class="doctitle">How the calculator works</h1>
-    <p class="lead">LLM capacity planning is deterministic maths, not guesswork. Because autoregressive decoding generates <em>one token at a time</em>, serving is <b>memory-bound</b> — the bottleneck is memory <em>bandwidth</em>, not compute. Every figure on the Sizing tab comes from the formulas below. Fixed constants: runtime reserve <b>2.5 GiB</b>, MBU <b>0.55</b>, MLA latent <b>576</b>, tight-fit threshold <b>10%</b>.</p>
+    <p class="lead">LLM capacity planning is deterministic maths, not guesswork. Because autoregressive decoding generates <em>one token at a time</em>, serving is <b>memory-bound</b> — the bottleneck is memory <em>bandwidth</em>, not compute. Every figure on the Sizing tab comes from the formulas below. Fixed constants: runtime reserve <b>2.5 GiB</b>, MBU <b>0.55</b>, tight-fit threshold <b>10%</b>. Everything else is read from the model or the GPU SKU — including the MLA latent width, which is checkpoint geometry rather than a planner constant (§3).</p>
 
     <h2 class="dh">1 · Hardware memory modelling</h2>
     <p>Start with how much high-bandwidth memory (HBM) the inference engine (e.g. vLLM) may actually use. The <code>gpu_memory_utilization</code> factor caps it; a fixed runtime reserve is subtracted to prevent out-of-memory (OOM) failures.</p>
@@ -846,7 +852,7 @@
     <h2 class="dh">3 · KV cache &amp; concurrency</h2>
     <p>KV cache grows linearly with both sequence length and batch size — the real limiter for long-context, high-concurrency serving. Per-token size depends on the attention geometry:</p>
     <div class="formula">Bytes per token = 2 × layers × KV-heads × head-dim × Bytes per element</div>
-    <p>The factor <b>2</b> covers the Key and Value tensors. <b>MLA</b> models (DeepSeek, Kimi) compress KV into a latent instead — <code>layers × 576 × bytes</code> — materially smaller. Per user request:</p>
+    <p>The factor <b>2</b> covers the Key and Value tensors. <b>MLA</b> models (DeepSeek, Kimi, GLM-5.2) compress KV into a single latent instead — <code>layers × latent × bytes</code> — materially smaller. That <b>latent width is the model's own geometry</b>, <code>kv_lora_rank + qk_rope_head_dim</code> from its <code>config.json</code>, in exactly the way <code>KV-heads × head-dim</code> belongs to a GQA model; a GQA model has no latent at all. Every MLA checkpoint in the catalogue happens to ship 512 + 64 = <b>576</b>, which is what the planner assumes for an MLA entry that does not state its own width — a default, not a universal. Per user request:</p>
     <div class="formula">KV per session (GiB) = <span class="frac"><span class="fnum">Bytes per token × Active tokens</span><span class="fden">1024³</span></span></div>
     <p>where <em>active tokens = context length × average utilisation</em>. The most sessions one pod can hold is then bounded by the free space from §2:</p>
     <div class="formula">Max pod concurrency = ⌊ <span class="frac"><span class="fnum">Free KV space</span><span class="fden">KV per session</span></span> ⌋</div>
@@ -937,11 +943,11 @@
       <div class="qa"><div class="q">Why memory-bound, not compute-bound?</div><div class="a">Decoding produces one token at a time and must re-read all weights + KV every step. The GPUs finish the arithmetic faster than HBM can feed them, so bandwidth — not FLOPs — sets the ceiling.</div></div>
       <div class="qa"><div class="q">Why does KV cache dominate at long context?</div><div class="a">Weights are fixed, but KV grows linearly with sequence length × concurrency. At 128K it can exceed the weights, becoming the limit on how many users a pod can serve.</div></div>
       <div class="qa"><div class="q">What is MBU?</div><div class="a">Memory-Bandwidth Utilisation — the fraction of peak HBM bandwidth actually achieved in practice (kernel efficiency, overheads). We use 0.55.</div></div>
-      <div class="qa"><div class="q">GQA vs. MLA?</div><div class="a">Grouped-Query Attention shares KV across query heads: KV = 2 × layers × KV-heads × head-dim. Multi-head Latent Attention compresses KV to a small latent (layers × 576), so long-context KV is far smaller.</div></div>
+      <div class="qa"><div class="q">GQA vs. MLA?</div><div class="a">Grouped-Query Attention shares KV across query heads: KV = 2 × layers × KV-heads × head-dim. Multi-head Latent Attention compresses KV to a small latent: KV = layers × latent width, where that width is the checkpoint's own <code>kv_lora_rank + qk_rope_head_dim</code> (512 + 64 = 576 on DeepSeek, Kimi and GLM-5.2). Long-context KV is far smaller as a result.</div></div>
       <div class="qa"><div class="q">Why are throughput and TTFT approximate?</div><div class="a">They're roofline estimates (±40% / ±50%). Real numbers depend on kernels, batching, prefix caching and speculative decoding — planning figures, not commitments. Validate against benchmarks before procurement.</div></div>
       <div class="qa"><div class="q">When is a model “infeasible”?</div><div class="a">If the weights plus one request's KV can't fit even at the largest permitted TP size, no valid deployment exists — the tool shows an infeasibility error rather than a plausible-but-wrong number.</div></div>
     </div>
-    <p class="tot">These are the exact formulas the Sizing tab runs. Constants: runtime reserve 2.5 GiB · MBU 0.55 · MLA latent 576 · tight-fit threshold 10%. All memory in GiB (2³⁰ bytes).</p>
+    <p class="tot">These are the exact formulas the Sizing tab runs. Constants: runtime reserve 2.5 GiB · MBU 0.55 · tight-fit threshold 10%. MLA latent width comes from the model entry (576 assumed when unstated). All memory in GiB (2³⁰ bytes).</p>
   </section>
 {/if}
 </main>

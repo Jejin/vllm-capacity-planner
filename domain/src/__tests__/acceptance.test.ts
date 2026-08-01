@@ -5,7 +5,7 @@
 // and GpuSku.mem_gb. Vectors were re-pinned when the engine stopped mixing 1e9-byte GB (weights)
 // with 2^30-byte GiB (KV, capacity), which had inflated weights ~7.4% against GPU capacity.
 import { describe, it, expect } from 'vitest';
-import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, activationElemsPerToken, DEFAULT_INTERMEDIATE_RATIO, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
+import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, activationElemsPerToken, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, DEFAULT_INTERMEDIATE_RATIO, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
 import { crossCheckVram } from '../recipes.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema, gpuSkuSchema } from '../schema.js';
@@ -896,5 +896,42 @@ describe('reconciliation invariant + hard-block (FR-19..21, AD-10)', () => {
     expect(headroomCheck('h200', 10, rows).verdict).toBe('fit');
     expect(headroomCheck('h100', 4, rows).verdict).toBe('shortage');
     expect(headroomCheck('b200', 4, rows).verdict).toBe('sku_absent');
+  });
+});
+
+describe('MLA latent width is model geometry, not a sizing constant (§3)', () => {
+  it('AC-60 — every MLA entry declares its own latent; no GQA entry carries one', () => {
+    for (const m of models) {
+      if (m.mla) {
+        // kv_lora_rank 512 + qk_rope_head_dim 64 — read from each checkpoint, not assumed
+        expect(m.mla_latent_elems).toBe(576);
+      } else {
+        // a GQA model has no latent to describe; its cache is 2 x kv_heads x head_dim
+        expect(m.mla_latent_elems).toBeUndefined();
+      }
+    }
+    expect(models.some((m) => m.mla)).toBe(true); // guard: the loop must actually see MLA models
+  });
+
+  it('AC-61 — KV follows the declared latent, and 576 is only the fallback', () => {
+    const base = model('dsv3');
+    // double the latent => double the cache. A hard-coded 576 would report the same figure.
+    const wide = { ...base, mla_latent_elems: 1152 };
+    expect(kvPerTokenBytes(wide, 1)).toBe(2 * kvPerTokenBytes(base, 1));
+    expect(kvPerTokenBytes(base, 1)).toBe(base.layers * 576);
+
+    // an entry written before the field existed still sizes exactly as it used to
+    const { mla_latent_elems: _drop, ...legacy } = base;
+    expect(mlaLatentElems(legacy)).toBe(DEFAULT_MLA_LATENT_ELEMS);
+    expect(kvPerTokenBytes(legacy, 1)).toBe(kvPerTokenBytes(base, 1));
+  });
+
+  it('AC-62 — a latent on a GQA entry is rejected rather than silently ignored', () => {
+    // the engine reads kv_heads x head_dim for a GQA model, so a latent here would be dead
+    // geometry that reads as though it were sizing something
+    const bad = { ...model('llama33-70b'), mla_latent_elems: 576 };
+    const res = modelSchema.safeParse(bad);
+    expect(res.success).toBe(false);
+    expect(modelSchema.safeParse({ ...model('dsv3'), mla_latent_elems: 640 }).success).toBe(true);
   });
 });

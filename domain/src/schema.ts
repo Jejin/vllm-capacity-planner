@@ -18,6 +18,9 @@ export const modelSchema = z
     kv_heads: z.number().int().min(0),
     head_dim: z.number().int().min(0),
     mla: z.boolean(),
+    // Per-layer MLA latent width (kv_lora_rank + qk_rope_head_dim). MLA models only —
+    // it is checkpoint geometry, and a GQA model has no latent to describe.
+    mla_latent_elems: z.number().int().positive().optional(),
     max_ctx: z.number().int().positive().max(8_388_608),
     tp_options: z.array(z.number().int().positive()).min(1),
     quants: z.array(quantSchema).min(1),
@@ -49,6 +52,11 @@ export const modelSchema = z
     if (!m.mla) {
       if (m.kv_heads <= 0) ctx.addIssue({ code: 'custom', path: ['kv_heads'], message: 'GQA model (mla=false) requires kv_heads > 0' });
       if (m.head_dim <= 0) ctx.addIssue({ code: 'custom', path: ['head_dim'], message: 'GQA model (mla=false) requires head_dim > 0' });
+      // A latent width on a GQA entry is silently ignored by the engine — reject it rather
+      // than let a catalogue carry geometry that reads as if it were being used.
+      if (m.mla_latent_elems != null) {
+        ctx.addIssue({ code: 'custom', path: ['mla_latent_elems'], message: 'GQA model (mla=false) has no latent — mla_latent_elems applies to MLA models only' });
+      }
     } else {
       if (m.kv_heads !== 0) ctx.addIssue({ code: 'custom', path: ['kv_heads'], message: 'MLA model (mla=true) must have kv_heads = 0 (unused)' });
       if (m.head_dim !== 0) ctx.addIssue({ code: 'custom', path: ['head_dim'], message: 'MLA model (mla=true) must have head_dim = 0 (unused)' });
