@@ -82,6 +82,69 @@ describe('HF config.json → §F mapping (AD-11)', () => {
     expect(gqa.mla_latent_elems).toBeUndefined();
   });
 
+  it('unwraps a multimodal config to the language model inside it', () => {
+    // Kimi K3 ships as KimiK3ForConditionalGeneration: the top level is the vision tower and
+    // everything that sizes a deployment lives under text_config. Read from the top level this
+    // mapped six fields and still reported partial success — a form that looks mostly filled in.
+    const { mapped, missing } = hfConfigToModel('moonshotai/Kimi-K3', {
+      architectures: ['KimiK3ForConditionalGeneration'], model_type: 'kimi_k3',
+      tie_word_embeddings: false,
+      text_config: {
+        architectures: ['KimiLinearForCausalLM'], model_type: 'kimi_linear',
+        num_hidden_layers: 93, hidden_size: 7168, vocab_size: 163840,
+        max_position_embeddings: 1048576, kv_lora_rank: 512, qk_rope_head_dim: 64,
+        num_attention_heads: 96, num_key_value_heads: 96,
+        moe_intermediate_size: 3072, num_experts: 896, num_experts_per_token: 16,
+        num_shared_experts: 2,
+        linear_attn_config: {
+          full_attn_layers: Array.from({ length: 24 }, (_, i) => (i + 1) * 4),
+          kda_layers: Array.from({ length: 69 }, (_, i) => i + 1),
+          num_heads: 96, head_dim: 128,
+        },
+      },
+    });
+    expect(mapped.layers).toBe(93);
+    expect(mapped.hidden_size).toBe(7168);
+    expect(mapped.max_ctx).toBe(1048576);
+    expect(mapped.mla_latent_elems).toBe(576);
+    expect(mapped.num_experts).toBe(896);
+    expect(mapped.experts_per_token).toBe(16);
+    expect(mapped.linear_attention_layers).toBe(69);
+    // 3072 per expert x (16 routed + 2 shared) — the width one token actually traverses
+    expect(mapped.intermediate_size).toBe(55296);
+    expect(missing).toEqual(['total_params_b', 'active_params_b', 'tp_options', 'quants']);
+  });
+
+  it('leaves a plain config alone rather than hunting for a nested one', () => {
+    const { mapped } = hfConfigToModel('meta-llama/Llama-3.3-70B-Instruct', {
+      num_hidden_layers: 80, num_attention_heads: 64, num_key_value_heads: 8, head_dim: 128,
+      hidden_size: 8192, vocab_size: 128256, max_position_embeddings: 131072,
+      // a vision block with no transformer of its own must not be mistaken for the text model
+      text_config: { hidden_size: 1280 },
+    });
+    expect(mapped.hidden_size).toBe(8192);
+    expect(mapped.layers).toBe(80);
+  });
+
+  it('maps MoE routing, however the family spells the expert count', () => {
+    const one = hfConfigToModel('deepseek-ai/DeepSeek-V3', {
+      model_type: 'deepseek_v3', num_hidden_layers: 61, num_attention_heads: 128,
+      hidden_size: 7168, vocab_size: 129280, max_position_embeddings: 131072,
+      kv_lora_rank: 512, qk_rope_head_dim: 64,
+      n_routed_experts: 256, num_experts_per_tok: 8,
+    }).mapped;
+    expect(one.num_experts).toBe(256);
+    expect(one.experts_per_token).toBe(8);
+
+    const two = hfConfigToModel('openai/gpt-oss-120b', {
+      num_hidden_layers: 36, num_attention_heads: 64, num_key_value_heads: 8, head_dim: 64,
+      hidden_size: 2880, vocab_size: 201088, max_position_embeddings: 131072,
+      num_local_experts: 128, num_experts_per_tok: 4,
+    }).mapped;
+    expect(two.num_experts).toBe(128);
+    expect(two.experts_per_token).toBe(4);
+  });
+
   it('does not mistake a plain GQA model for MLA', () => {
     const { detectedMla } = hfConfigToModel('zai-org/GLM-4.5', {
       architectures: ['Glm4MoeForCausalLM'], model_type: 'glm4_moe',

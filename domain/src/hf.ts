@@ -84,6 +84,10 @@ export interface HfConfig {
   intermediate_size?: number;
   /** MoE: per-expert FFN width. Narrower than intermediate_size, often by an order of magnitude. */
   moe_intermediate_size?: number;
+  /** MoE: total routed experts. Spelled three ways across families. */
+  num_experts?: number;
+  n_routed_experts?: number;
+  num_local_experts?: number;
   /** MoE: experts each token is routed to (top-k). */
   num_experts_per_tok?: number;
   /** Kimi's spelling of the same field. */
@@ -105,6 +109,13 @@ export interface HfConfig {
   layer_types?: string[];
   /** Gemma-style: one global layer every N (so N-1 of every N are windowed). */
   sliding_window_pattern?: number;
+  /**
+   * Multimodal wrappers nest the language model here (Kimi K3, Gemma 3, Qwen-VL, Llama 4).
+   * Everything sizing cares about lives inside, and the top level carries the vision tower.
+   */
+  text_config?: HfConfig;
+  /** The same idea under a different name (InternVL and friends). */
+  llm_config?: HfConfig;
   /** Hybrid linear attention, Kimi spelling: nested config listing both layer sets. */
   linear_attn_config?: {
     full_attn_layers?: number[];
@@ -198,8 +209,28 @@ export function perTokenFfnWidth(cfg: HfConfig): number | undefined {
   return expert * topK + shared;
 }
 
+/**
+ * Unwrap a multimodal config to the language model inside it.
+ *
+ * `KimiK3ForConditionalGeneration` carries a vision tower at the top level and every field that
+ * sizes a deployment — layers, hidden_size, vocab_size, max_position_embeddings, kv_lora_rank,
+ * the MoE routing, the linear-attention split — under `text_config`. Read from the top level it
+ * mapped six fields out of a dozen and still reported partial success, which is worse than
+ * failing: the admin sees a form that looks mostly filled in.
+ *
+ * The nested config wins where it has a value; the top level survives as a fallback, since
+ * things like `tie_word_embeddings` are sometimes only stated outside.
+ */
+export function textConfig(cfg: HfConfig): HfConfig {
+  const nested = cfg.text_config ?? cfg.llm_config;
+  // only unwrap when the nested block is the one carrying the transformer
+  if (!nested?.num_hidden_layers) return cfg;
+  return { ...cfg, ...nested };
+}
+
 /** Map a HF model id + its config.json to a partial §F Model (AD-11). */
-export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
+export function hfConfigToModel(id: string, raw: HfConfig): HfMapResult {
+  const cfg = textConfig(raw);
   const mla = detectMla(cfg);
   const heads = cfg.num_attention_heads;
   const head_dim = cfg.head_dim ?? (cfg.hidden_size && heads ? Math.round(cfg.hidden_size / heads) : undefined);
@@ -225,6 +256,9 @@ export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
     intermediate_size: perTokenFfnWidth(cfg),
     // latent width per layer — the MLA equivalent of kv_heads x head_dim, and unset on GQA
     mla_latent_elems: mla ? mlaLatentWidth(cfg) : undefined,
+    // routed-expert count and top-k — what makes decode traffic computable for an MoE
+    num_experts: cfg.num_experts ?? cfg.n_routed_experts ?? cfg.num_local_experts,
+    experts_per_token: cfg.num_experts_per_tok ?? cfg.num_experts_per_token,
   };
   // local/global attention — only set when the config actually declares a window, since
   // an unset pair means "treat every layer as full-context"
