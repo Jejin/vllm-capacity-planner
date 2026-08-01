@@ -42,7 +42,8 @@
   // vLLM's own default is 2048, which it documents as the ITL-friendly choice; its tuning guide
   // asks for >8192 for throughput, and throughput is what this planner sizes for. Starting here
   // makes the emitted serve command carry the flag explicitly rather than imply 2048.
-  let batchTokens = $state(8192); // --max-num-batched-tokens; drives the activation reserve
+  let batchTokens = $state(8192);
+  let fabricGbs = $state('' as number | ''); // --max-num-batched-tokens; drives the activation reserve
   const model = $derived<Model>(catalog.models.find((m: Model) => m.id === modelId) ?? catalog.models[0]);
   const gpu = $derived<GpuSku>(catalog.gpus.find((g: GpuSku) => g.id === gpuId) ?? catalog.gpus[0]);
   const ctxChoices = $derived(CTXS.filter((c) => c <= (model?.max_ctx ?? 0)));
@@ -54,6 +55,7 @@
     quant: effQuant, kv_dtype_bytes: kvBytes, selected_ctx: Math.min(ctx, model?.max_ctx ?? ctx),
     avg_context_utilisation: util, target_concurrency: conc, mem_util_fraction: memUtil, gpus_per_node: perNode,
     max_num_batched_tokens: batchTokens,
+    fabric_gbs: fabricGbs !== '' ? +fabricGbs : undefined,
   });
   const result = $derived(computeSizing(model, gpu, sizingInput));
   const R = $derived(result.ok ? (result as FeasibleSizing) : null);
@@ -65,7 +67,7 @@
   const runHr = $derived(R && rate > 0 ? R.gpus * rate : 0);
   /** $ per million output tokens — the figure that compares plans across SKUs, not just GPUs. */
   const perMtok = $derived(
-    R && runHr > 0 && R.throughput_tokens_per_sec > 0
+    R && runHr > 0 && !R.throughput_suppressed && R.throughput_tokens_per_sec > 0
       ? (runHr * 1e6) / (R.throughput_tokens_per_sec * 3600)
       : 0,
   );
@@ -145,7 +147,7 @@
     const fc = fleetCheck();
     if (fc?.kind === 'absent') { notice = `Fleet check: ${gpu.name} is not in the defined fleet — add a pool first.`; return; }
     if (fc?.kind === 'short') { notice = `⛔ Over capacity: needs ${R.gpus} ${gpu.name}, only ${fc.head} uncommitted. Short by ${fc.short}. Cannot add.`; return; }
-    plan.push({ id: 'd' + Math.round(performance.now()), label: `${model.name} · ${effQuant}`, gpu_sku_id: gpuId, gpus: R.gpus, pods: R.pods, tp: R.tp, kv: kvAlloc, tps: R.throughput_tokens_per_sec });
+    plan.push({ id: 'd' + Math.round(performance.now()), label: `${model.name} · ${effQuant}`, gpu_sku_id: gpuId, gpus: R.gpus, pods: R.pods, tp: R.tp, kv: kvAlloc, tps: R.throughput_suppressed ? 0 : R.throughput_tokens_per_sec });
     notice = `Added ${model.name} (${R.gpus} × ${gpu.name}) to the cluster plan.`;
   }
 
@@ -302,11 +304,11 @@
   }
   async function deleteModelUi(id: string) { if (!confirm(`Delete model "${id}"?`)) return; const r = await fetch(`/api/v1/models/${id}`, { method: 'DELETE', headers: authH }); if (r.ok) { loadCatalog(); notice = 'Model deleted.'; } else notice = (await r.json()).error?.message ?? 'Delete failed.'; }
 
-  const blankGpu = () => ({ id: '', name: '', mem_gb: 80, bw_tbs: 3, tflops_fp16: 989, price_per_gpu_hour: 2.5, arch: '' as string });
+  const blankGpu = () => ({ id: '', name: '', mem_gb: 80, bw_tbs: 3, tflops_fp16: 989, price_per_gpu_hour: 2.5, arch: '' as string, link_gbs: 900 });
   let gf = $state(blankGpu());
   let gfErrors = $state<Err[]>([]);
   async function saveGpu() {
-    const body = { id: gf.id, name: gf.name, mem_gb: +gf.mem_gb, bw_tbs: +gf.bw_tbs, tflops_fp16: +gf.tflops_fp16 || undefined, price_per_gpu_hour: +gf.price_per_gpu_hour, ...(gf.arch ? { arch: gf.arch } : {}) };
+    const body = { id: gf.id, name: gf.name, mem_gb: +gf.mem_gb, bw_tbs: +gf.bw_tbs, tflops_fp16: +gf.tflops_fp16 || undefined, price_per_gpu_hour: +gf.price_per_gpu_hour, link_gbs: +gf.link_gbs || undefined, ...(gf.arch ? { arch: gf.arch } : {}) };
     const r = await fetch('/api/v1/gpus', { method: 'POST', headers: authH, body: JSON.stringify(body) });
     if (r.ok) { gf = blankGpu(); gfErrors = []; loadCatalog(); notice = 'GPU SKU saved.'; }
     else { const e = await r.json(); gfErrors = e.error?.fields ?? [{ path: '', message: e.error?.message ?? 'Save failed.' }]; }
@@ -444,6 +446,7 @@
         <label>GPU SKU<select bind:value={gpuId}>{#each catalog.gpus as g}<option value={g.id}>{g.name}</option>{/each}</select></label></div>
       <div class="row"><label>GPU mem-util<input type="number" min="0.1" max="1" step="0.05" bind:value={memUtil} /></label>
         <label>GPUs / node<input type="number" bind:value={perNode} /></label></div>
+      <div class="row"><label>Fabric GB/s<small> (per GPU, inter-node)</small><input type="number" min="1" step="1" bind:value={fabricGbs} placeholder="only used when a replica spans nodes" /></label></div>
       <div class="row"><label>Prefill chunk<small> (--max-num-batched-tokens)</small><input type="number" min="256" step="256" bind:value={batchTokens} /></label>
         <label>Runtime reserve<small> (derived)</small><input type="text" value={R ? `${R.runtime_reserve_gb.toFixed(2)} GiB` : '—'} disabled /></label></div>
       {#if floorChunk}<p class="hint">The reserve is flat at {RUNTIME_GB.toFixed(2)} GiB up to a {floorChunk.toLocaleString()}-token chunk{R ? ` at TP${R.tp}` : ''} — below that, raising the chunk costs no memory. Activations shard with the FFN, so a wider shard raises this figure and a wider model lowers it.{#if model && !model.intermediate_size} This model declares no <code>intermediate_size</code>, so a 3.5× hidden-size FFN is assumed.{/if}</p>{/if}
@@ -467,6 +470,9 @@
             <div class="ssrc">Kernel support checked against {support.source.runtime} documentation, snapshot {support.source.docs_snapshot}. Memory feasibility is a separate verdict and is unaffected.</div>
           </div>
         {/if}
+        {#if R.throughput_suppressed}
+          <div class="state warn"><b>Throughput withheld.</b> {R.throughput_suppressed}<div class="sfind">Memory sizing, GPU count and TTFT are unaffected — only the decode throughput depends on the fabric.</div></div>
+        {/if}
         {#if kvScales?.applies && kvScales.level !== 'ok'}
           <div class="state {kvScales.level === 'warn' ? 'err' : 'warn'}">
             <b>{kvScales.headline}.</b> {kvScales.detail}{#if kvScales.remedy}<div class="sfind">{kvScales.remedy}</div>{/if}
@@ -477,7 +483,7 @@
           <div class="kpi n"><div class="v">{R.nodes}<small> × {perNode} GPU</small></div><div class="l">Nodes</div>{#if R.multi_node}<div class="cav">a replica spans nodes</div>{/if}</div>
           <div class="kpi p"><div class="v">{R.pods}<small> × TP{R.tp}</small></div><div class="l">Pods</div></div>
           <div class="kpi a"><div class="v">{fmt(kvAlloc)}<small> GiB</small></div><div class="l">KV cache</div></div>
-          <div class="kpi g"><div class="v">~{R.throughput_tokens_per_sec.toLocaleString()}</div><div class="l">Tokens/s</div><div class="cav">±40% · not a commitment</div></div>
+          <div class="kpi g"><div class="v">{R.throughput_suppressed ? '—' : `~${R.throughput_tokens_per_sec.toLocaleString()}`}</div><div class="l">Tokens/s</div><div class="cav">{R.throughput_suppressed ? 'withheld · fabric unknown' : '±40% · not a commitment'}</div></div>
           <div class="kpi t"><div class="v">{ttftLabel(R.ttft_ms)}</div><div class="l">Time to first token</div><div class="cav">±50% · {R.ttft_compute_bound ? 'compute-bound' : 'bandwidth floor'}</div></div>
           <div class="kpi c"><div class="v">{runHr > 0 ? money(runHr) : '—'}<small>/hr</small></div><div class="l">Run rate</div>{#if runHr > 0}<div class="note">{money(runHr * 730)}/mo · {money(rate)}/GPU-hr</div>{/if}</div>
         </div>
@@ -550,7 +556,8 @@
           <div class="li"><span>Time to first token <small>({R.ttft_compute_bound ? 'compute-bound prefill' : 'bandwidth floor'})</small></span><b>~{ttftLabel(R.ttft_ms)} <small>±50%</small></b></div>
           <div class="li"><span>Prefill work <small>({Math.round(ctx * util).toLocaleString()} tokens)</small></span><b>{R.prefill_pflops.toFixed(2)} PFLOP</b></div>
           <div class="li"><span>Decode throughput / request</span><b>~{R.decode_tps_per_request} tok/s</b></div>
-          <div class="li"><span>Aggregate throughput</span><b>~{R.throughput_tokens_per_sec.toLocaleString()} tok/s <small>±40%</small></b></div>
+          <div class="li"><span>Aggregate throughput</span><b>{R.throughput_suppressed ? '—' : `~${R.throughput_tokens_per_sec.toLocaleString()} tok/s`} <small>{R.throughput_suppressed ? 'withheld' : '±40%'}</small></b></div>
+          {#if R.tp > 1}<div class="li"><span>TP all-reduce <small>(bandwidth term, per decode step)</small></span><b>{R.collective_sec > 0 ? `${(R.collective_sec * 1000).toFixed(2)} ms · ${(R.collective_share * 100).toFixed(1)}% of step` : '—'}</b></div>{/if}
           <div class="li"><span>Run rate <small>({R.gpus} × {money(rate)}/GPU-hr)</small></span><b>{runHr > 0 ? `${money(runHr)}/hr` : '—'}</b></div>
           <div class="li"><span>Monthly <small>(730 h)</small></span><b>{runHr > 0 ? `${money(runHr * 730)}/mo` : '—'}</b></div>
           <div class="li"><span>Cost per million tokens <small>(at the throughput above)</small></span><b>{perMtok > 0 ? money(perMtok) : '—'}</b></div>
@@ -563,7 +570,7 @@
               <tr class:cur={s.concurrency === conc} class:infeasible={!s.feasible}>
                 <td class="num">{s.concurrency}</td>
                 {#if s.feasible}
-                  <td class="num">{s.gpus}{#if s.tight}<span class="badge tightb" title="under 10% pod headroom">tight</span>{/if}</td><td class="num">{s.pods} × TP{s.tp}</td><td class="num">~{ttftLabel(s.ttft_ms)}</td><td class="num">~{s.decode_tps_per_request}</td><td class="num">~{s.throughput_tokens_per_sec.toLocaleString()}</td>
+                  <td class="num">{s.gpus}{#if s.tight}<span class="badge tightb" title="under 10% pod headroom">tight</span>{/if}</td><td class="num">{s.pods} × TP{s.tp}</td><td class="num">~{ttftLabel(s.ttft_ms)}</td><td class="num">~{s.decode_tps_per_request}</td><td class="num">{s.throughput_suppressed ? '—' : `~${s.throughput_tokens_per_sec.toLocaleString()}`}</td>
                   <td>{#if s.concurrency !== conc}<button class="btn ghost" onclick={() => (conc = s.concurrency)}>use</button>{:else}<span class="badge">current</span>{/if}</td>
                 {:else}
                   <td class="num" colspan="5" style="color:var(--err)">infeasible at this concurrency</td><td></td>
@@ -665,7 +672,7 @@
         </tbody></table>
         <h2 style="margin-top:18px">Per-model economics — cost per million tokens</h2>
         <table><thead><tr><th>Model</th><th class="num">GPUs</th><th class="num">$/hr</th><th class="num">tok/s</th><th class="num">$ / Mtok</th></tr></thead><tbody>
-          {#each modelEconomics() as e}<tr><td>{e.label}</td><td class="num">{e.gpus}</td><td class="num">{money(e.hr)}</td><td class="num">~{e.tps.toLocaleString()}</td><td class="num">{e.perMtok > 0 ? money(e.perMtok) : '—'}</td></tr>{/each}
+          {#each modelEconomics() as e}<tr><td>{e.label}</td><td class="num">{e.gpus}</td><td class="num">{money(e.hr)}</td><td class="num">{e.tps > 0 ? `~${e.tps.toLocaleString()}` : '—'}</td><td class="num">{e.perMtok > 0 ? money(e.perMtok) : '—'}</td></tr>{/each}
         </tbody></table>
         <p class="tot">Rental at admin-set $/GPU-hour; $/Mtok = ($/hr) ÷ (tokens per hour ÷ 1e6), using the indicative throughput (±40%). Prices are indicative — set your contracted rates on the Models tab.</p>
       {/if}
@@ -832,17 +839,17 @@
     <section class="panel"><h2>New GPU SKU</h2>
       <div class="row"><label>ID<input bind:value={gf.id} placeholder="b300" /></label><label>Name<input bind:value={gf.name} placeholder="B300 288 GB" /></label></div>
       <div class="row3"><label>Memory (GiB)<small> as nvidia-smi reports</small><input type="number" bind:value={gf.mem_gb} /></label><label>Bandwidth (TB/s)<input type="number" step="0.1" bind:value={gf.bw_tbs} /></label><label>FP16 TFLOPS<small> dense, no sparsity</small><input type="number" step="1" bind:value={gf.tflops_fp16} /></label></div>
-      <div class="row3"><label>Price ($/GPU-hr)<input type="number" step="0.1" bind:value={gf.price_per_gpu_hour} /></label><label>Architecture<small> (kernel support)</small><select bind:value={gf.arch}><option value="">— unverified —</option>{#each GPU_ARCHES as a}<option value={a}>{a}</option>{/each}</select></label></div>
+      <div class="row3"><label>Price ($/GPU-hr)<input type="number" step="0.1" bind:value={gf.price_per_gpu_hour} /></label><label>Link GB/s<small> NVLINK/PCIe, BIDIRECTIONAL</small><input type="number" step="1" bind:value={gf.link_gbs} /></label><label>Architecture<small> (kernel support)</small><select bind:value={gf.arch}><option value="">— unverified —</option>{#each GPU_ARCHES as a}<option value={a}>{a}</option>{/each}</select></label></div>
       {#if gfErrors.length}<div class="ferr">{gfErrors[0].message}</div>{/if}
       <button class="btn primary" style="margin-top:12px" onclick={saveGpu}>Add / update GPU SKU</button>
     </section>
   {/if}
   <section class="panel"><h2>GPU SKUs</h2>
-    <table><thead><tr><th>SKU</th><th>Arch</th><th class="num">HBM (GiB)</th><th class="num">BW (TB/s)</th><th class="num">FP16 TFLOPS</th><th class="num">$/GPU-hr</th>{#if ident.role === 'admin'}<th></th>{/if}</tr></thead><tbody>
-      {#each catalog.gpus as g}<tr><td>{g.name}</td><td>{g.arch ?? '—'}</td><td class="num">{g.mem_gb}</td><td class="num">{g.bw_tbs}</td><td class="num">{g.tflops_fp16 != null ? g.tflops_fp16.toLocaleString() : '—'}</td><td class="num">{g.price_per_gpu_hour != null ? money(g.price_per_gpu_hour) : '—'}</td>{#if ident.role === 'admin'}<td><button class="btn ghost danger" onclick={() => deleteGpuUi(g.id)}>del</button></td>{/if}</tr>{/each}
+    <table><thead><tr><th>SKU</th><th>Arch</th><th class="num">HBM (GiB)</th><th class="num">BW (TB/s)</th><th class="num">FP16 TFLOPS</th><th class="num">Link GB/s</th><th class="num">$/GPU-hr</th>{#if ident.role === 'admin'}<th></th>{/if}</tr></thead><tbody>
+      {#each catalog.gpus as g}<tr><td>{g.name}</td><td>{g.arch ?? '—'}</td><td class="num">{g.mem_gb}</td><td class="num">{g.bw_tbs}</td><td class="num">{g.tflops_fp16 != null ? g.tflops_fp16.toLocaleString() : '—'}</td><td class="num">{g.link_gbs != null ? g.link_gbs.toLocaleString() : '—'}</td><td class="num">{g.price_per_gpu_hour != null ? money(g.price_per_gpu_hour) : '—'}</td>{#if ident.role === 'admin'}<td><button class="btn ghost danger" onclick={() => deleteGpuUi(g.id)}>del</button></td>{/if}</tr>{/each}
     </tbody></table>
     <p class="tot">{catalog.gpus.length} GPU SKUs</p>
-    <div class="hint">Each column drives a different number, and the two easily-confused ones drive opposite halves of the plan. <b>Bandwidth</b> sets throughput: decode is memory-bound, so tok/s comes from TB/s × MBU, never from TFLOPS. <b>FP16 TFLOPS</b> sets time-to-first-token: prefill is a dense GEMM, so TTFT comes from FLOPS × MFU, with sub-16-bit weights assumed to run up to 2× faster. A SKU with no TFLOPS figure falls back to a weight-streaming floor for TTFT, which is optimistic — the KPI says "bandwidth floor" when that happens. Figures are dense, no-sparsity, and indicative. <b>Arch</b> drives neither: it decides which quantisation kernels vLLM can actually use on the card, which is the runtime-support verdict rather than a memory or speed input. A SKU with no architecture reports that verdict as unverified.</div>
+    <div class="hint">Each column drives a different number, and the two easily-confused ones drive opposite halves of the plan. <b>Bandwidth</b> sets throughput: decode is memory-bound, so tok/s comes from TB/s × MBU, never from TFLOPS. <b>FP16 TFLOPS</b> sets time-to-first-token: prefill is a dense GEMM, so TTFT comes from FLOPS × MFU, with sub-16-bit weights assumed to run up to 2× faster. A SKU with no TFLOPS figure falls back to a weight-streaming floor for TTFT, which is optimistic — the KPI says "bandwidth floor" when that happens. <b>Link GB/s</b> sets what tensor parallelism costs: every layer all-reduces across it twice, so a card with only PCIe pays an order of magnitude more per collective than an NVLink one. Figures are dense, no-sparsity, and indicative. <b>Arch</b> drives none of the three: it decides which quantisation kernels vLLM can actually use on the card, which is the runtime-support verdict rather than a memory or speed input. A SKU with no architecture reports that verdict as unverified.</div>
   </section>
 
 {:else if tab === 'methodology'}
@@ -918,7 +925,9 @@
     <p class="note">The engine evaluates every TP in the model's ladder and takes the cheapest total, breaking ties toward the <em>smaller</em> shard — same GPU count, less collective traffic. That makes this a cost/throughput objective; a latency-oriented planner would bias toward larger shards.</p>
 
     <h3 class="dh3">What crossing a node boundary costs</h3>
-    <p>TP is not free at any width, but the price jumps at the node boundary. A tensor-parallel group performs an <b>all-reduce on every layer, for every token</b> — inside a node that rides NVLink at multiple TB/s; between nodes it rides InfiniBand or RoCE at a fraction of that, on the critical path of every forward pass. The throughput and TTFT figures here assume the collective is not the bottleneck, which stops being true once a replica spans nodes.</p>
+    <p>TP is not free at any width, but the price jumps at the node boundary. A tensor-parallel group performs an <b>all-reduce on every layer, for every token</b> — inside a node that rides NVLink at multiple TB/s; between nodes it rides InfiniBand or RoCE at a fraction of that, on the critical path of every forward pass. The throughput figure prices the <b>bandwidth</b> half of that traffic rather than assuming it away: <code>all-reduce bytes = layers × 2 × 2(N−1)/N × batch × hidden × 2 B</code>, divided by half the vendor's link figure (they quote bidirectionally — H100's "900 GB/s" NVLink is 450 each way), added to the memory time rather than hidden inside it.</p>
+    <p><b>Per-collective latency is deliberately not modelled.</b> At decode batch sizes the messages are small and there are <code>2 × layers</code> launches per step, so fixed cost per collective can rival the byte cost. What the plan reports is a <em>floor</em> on the interconnect cost, not an estimate of it. The shape is still worth knowing: inside a node the bandwidth term lands under a few percent of the step, while a PCIe-only box pays an order of magnitude more per byte.</p>
+    <p class="note"><b>Across nodes the number is withheld, not estimated.</b> A replica wider than a node all-reduces over a fabric this plan knows nothing about, so throughput reads <code>—</code> until the per-GPU fabric bandwidth is supplied. Memory sizing, GPU count and TTFT are unaffected. At roughly 100 GB/s per GPU the collective costs about 6% of the step for a 78-layer MLA model at TP16, and about 20% at 25 GB/s — quoting a figure that silently assumed it were free would be the most confident and least supportable number on the page.</p>
     <p class="note">The Sizing tab draws this rather than asserting it: every GPU on one axis, grouped into node boxes, each replica a bar above them. A replica that fits inside a node is a bar inside one box; one that does not visibly spans the gap where the fabric sits. Replicas are independent — they share only the weights on storage and the router in front — so scaling <em>out</em> adds throughput without adding collective traffic, while scaling <em>up</em> past the node boundary adds both.</p>
 
     <h3 class="dh3">Local &amp; global attention</h3>

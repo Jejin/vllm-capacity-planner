@@ -191,7 +191,19 @@ The engine evaluates every TP in the model's ladder and takes the cheapest total
 
 ### What crossing a node boundary costs
 
-TP is not free at any width, but the price jumps at the node boundary. A tensor-parallel group performs an **all-reduce on every layer, for every token** — inside a node that traffic rides NVLink at multiple TB/s; between nodes it rides InfiniBand or RoCE at a fraction of that, and it sits on the critical path of every forward pass. The throughput and TTFT figures here assume the collective is not the bottleneck, which stops being true once a replica spans nodes.
+TP is not free at any width, but the price jumps at the node boundary. A tensor-parallel group performs an **all-reduce on every layer, for every token** — inside a node that traffic rides NVLink at multiple TB/s; between nodes it rides InfiniBand or RoCE at a fraction of that, and it sits on the critical path of every forward pass. The throughput figure prices the **bandwidth** half of that traffic rather than assuming it away.
+
+```
+All-reduce bytes per GPU per step = layers × 2 × 2(N−1)/N × batch × hidden × 2 B
+Collective seconds                = those bytes / (link GB/s ÷ 2)
+Step time                         = memory time + collective seconds
+```
+
+Two all-reduces per layer (after the attention output projection and after the FFN down projection), and a ring all-reduce moves 2(N−1)/N of the tensor per rank — which is why widening TP costs more than nothing and less than linearly. Vendor link figures are quoted **bidirectionally** (H100's NVLink 4 is "900 GB/s", meaning 450 each way), so the engine halves them; using the headline number would report half the true cost.
+
+**What this deliberately does not model is per-collective latency.** At decode batch sizes the messages are small and there are `2 × layers` launches per step, so the fixed cost per collective can rival the byte cost. The figure here is therefore a **floor** on what the interconnect costs, not an estimate of it — and the shape of the answer is worth knowing: inside a node the bandwidth term lands under a few percent of the step, while on a PCIe-only box the same work costs an order of magnitude more per byte.
+
+**Across nodes the number is withheld, not estimated.** A replica wider than a node all-reduces over a fabric this plan knows nothing about, so throughput is reported as `—` until the per-GPU fabric bandwidth is supplied. Memory sizing, GPU count and TTFT are unaffected; only the decode throughput depends on it. A modern Blackwell node budgets roughly 100 GB/s per GPU, where the collective costs about 6% of the step for a 78-layer MLA model at TP16 — and about 20% at 25 GB/s. Quoting a figure that silently assumed the collective were free would be the most confident and least supportable number on the page.
 
 The sizing view draws this rather than asserting it: every GPU on one axis, grouped into node boxes, with each replica as a bar above them. A replica that fits inside a node is a bar inside one box; one that does not is a bar visibly spanning the gap where the fabric is drawn. Replicas are independent of each other — they share only the weights on storage and the router in front — so scaling *out* adds throughput without adding collective traffic, while scaling *up* past the node boundary adds both.
 

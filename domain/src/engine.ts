@@ -192,6 +192,41 @@ export function mlaLatentElems(model: Model): number {
   return model.mla_latent_elems ?? DEFAULT_MLA_LATENT_ELEMS;
 }
 
+/**
+ * Bytes each GPU pushes through the interconnect for ONE decode step of tensor-parallel work.
+ *
+ * Megatron-style TP all-reduces twice per layer — after the attention output projection and
+ * after the FFN down projection — and each all-reduce covers the activation tensor for every
+ * token in the batch. A ring all-reduce moves 2(N-1)/N of the tensor per rank, which is why
+ * widening TP costs more than nothing and less than linearly.
+ *
+ * What this does NOT model is per-collective latency. At decode batch sizes the messages are
+ * small, and 2 x layers launches per step means fixed cost per collective can rival the byte
+ * cost — so the figure here is a FLOOR on what the interconnect costs, not an estimate of it.
+ * Modelling the latency term needs a per-fabric constant this catalogue does not carry.
+ */
+export function collectiveBytesPerStep(model: Model, tp: number, batchTokens: number): number {
+  const hidden = model.hidden_size;
+  if (!hidden || tp <= 1) return 0;
+  const perAllReduce = batchTokens * hidden * ACT_DTYPE_BYTES;
+  const ringFactor = (2 * (tp - 1)) / tp;
+  return model.layers * ALL_REDUCES_PER_LAYER * ringFactor * perAllReduce;
+}
+
+/** Attention output + FFN down projection, per transformer layer. */
+export const ALL_REDUCES_PER_LAYER = 2;
+
+/**
+ * One-way collective bandwidth from the vendor's bidirectional aggregate figure.
+ *
+ * Vendors quote NVLink and Infinity Fabric bidirectionally (H100's "900 GB/s" is 450 each way).
+ * A ring all-reduce is limited by the one-way path, so quoting the headline number into the
+ * formula would halve the cost the plan reports.
+ */
+export function oneWayLinkBytesPerSec(linkGbs: number): number {
+  return (linkGbs / 2) * 1e9;
+}
+
 /** KV bytes per token for ONE layer — GQA vs MLA (addendum §A). */
 export function kvPerLayerPerTokenBytes(model: Model, kvDtypeBytes: number): number {
   return model.mla
@@ -440,7 +475,29 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   );
   const pod_bytes_per_sec = tp * gpu.bw_tbs * TBS_TO_BYTES_PER_SEC * MBU;
   const step_bytes = (active_gib + active_per_replica * kv_per_request_gb) * GIB;
-  const step_time_sec = step_bytes / pod_bytes_per_sec;
+  const memory_sec = step_bytes / pod_bytes_per_sec;
+
+  // Tensor parallelism is not free bandwidth. The old roofline read `tp x HBM bandwidth` and
+  // stopped there, which assumes the per-layer all-reduce is instantaneous — true of no
+  // interconnect, and least true of the ones that need it most (PCIe, and anything crossing a
+  // node). The collective serialises with the layer it follows, so it adds to the step.
+  const collective_bytes = collectiveBytesPerStep(model, tp, active_per_replica);
+  const link_gbs = multi_node ? input.fabric_gbs : gpu.link_gbs;
+  const collective_sec = collective_bytes > 0 && link_gbs
+    ? collective_bytes / oneWayLinkBytesPerSec(link_gbs)
+    : 0;
+  const step_time_sec = memory_sec + collective_sec;
+  const collective_share = step_time_sec > 0 ? collective_sec / step_time_sec : 0;
+
+  // §6.3: a replica spanning nodes rides a fabric this plan knows nothing about unless it is
+  // told. Reporting a number that assumes the collective is free would be the most confident
+  // and least defensible figure on the page, so it is withheld instead.
+  const throughput_suppressed =
+    multi_node && !input.fabric_gbs
+      ? `TP ${tp} spans ${Math.ceil(tp / gpus_per_node)} nodes and no inter-node fabric bandwidth was given. ` +
+        'Every layer all-reduces across that fabric, so throughput here depends on hardware this plan ' +
+        'has not been told about — supply the per-GPU fabric bandwidth to get a figure.'
+      : null;
   const throughput_tokens_per_sec = Math.round(
     (pods * active_per_replica) / step_time_sec,
   );
@@ -483,6 +540,9 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     runtime_reserve_gb: reserve.total,
     activation_gb: reserve.activations,
     throughput_tokens_per_sec,
+    throughput_suppressed,
+    collective_sec,
+    collective_share,
     decode_tps_per_request,
     ttft_ms,
     ttft_compute_bound,
