@@ -26,6 +26,12 @@ export interface DeploymentVariant {
   method?: string;
   /** Pinned tag or commit, where reproducibility matters. */
   revision?: string;
+  /**
+   * Where this artifact's FP8 KV cache scaling factors come from (§4.3). Only consulted when a
+   * plan selects a 1-byte KV cache. Absent => `unknown`, which reads as a warning rather than
+   * as approval: vLLM's default with no scales present is to set them all to 1.0.
+   */
+  kv_scale_source?: 'checkpoint' | 'calibrated' | 'runtime' | 'none';
 }
 
 /** A servable model, by sizing-relevant geometry (addendum §F.1). */

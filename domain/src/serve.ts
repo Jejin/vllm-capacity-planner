@@ -7,6 +7,7 @@
 
 import { DEFAULT_BATCHED_TOKENS } from './engine.js';
 import { HF_ID_RE } from './schema.js';
+import { kvScalePolicy } from './kvscale.js';
 import type { DeploymentVariant, FeasibleSizing, Model, Quant, SizingInput } from './types.js';
 
 export interface ServeCommandOptions {
@@ -126,6 +127,14 @@ export function serveCommand(
   if (kv) {
     argv.push('--kv-cache-dtype', kv);
     notes.push('FP8 KV cache halves cache size against FP16 for a small quality cost — the plan assumes it.');
+    // Where the scales come from is not implied by the dtype flag. With none in the checkpoint
+    // and no request to compute them, vLLM sets every scale to 1.0 and says nothing.
+    const scales = kvScalePolicy(model, input.quant, input.kv_dtype_bytes);
+    if (scales.source === 'runtime') {
+      // CLI spelling of the `calculate_kv_scales` engine argument
+      argv.push('--calculate-kv-scales');
+    }
+    notes.push(`${scales.headline}. ${scales.detail}${scales.remedy ? ` ${scales.remedy}` : ''}`);
   }
 
   // Only emit the chunk when it differs from vLLM's default — an explicit flag that repeats the
