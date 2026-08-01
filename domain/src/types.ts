@@ -6,10 +6,46 @@
 export const QUANTS = ['FP16', 'FP8', 'INT8', 'INT4', 'MXFP4', 'NVFP4', 'Q8_0', 'Q4_K_M', 'IQ4_XS'] as const;
 export type Quant = (typeof QUANTS)[number];
 
+/**
+ * How a given precision is actually obtained at launch. A bytes-per-parameter figure is enough
+ * to size memory and not enough to start a server: INT4 is a different repository, FP8 is
+ * sometimes a repository and sometimes a runtime flag, and MXFP4 is baked into the checkpoint.
+ *   checkpoint — the artifact already carries this precision; passing --quantization as well
+ *                conflicts with the checkpoint's own metadata
+ *   online     — an unquantised checkpoint plus a vLLM --quantization method applied at load
+ *   none       — the checkpoint's native dtype already matches the estimate
+ */
+export type QuantSource = 'checkpoint' | 'online' | 'none';
+
+/** The deployment path for ONE precision of one model (§4.2 of the implementation handoff). */
+export interface DeploymentVariant {
+  source: QuantSource;
+  /** Repository carrying this precision. Absent => the model's base `hf_id`. */
+  hf_id?: string;
+  /** vLLM `--quantization` value. Required for `online`; must be absent otherwise. */
+  method?: string;
+  /** Pinned tag or commit, where reproducibility matters. */
+  revision?: string;
+}
+
 /** A servable model, by sizing-relevant geometry (addendum §F.1). */
 export interface Model {
   id: string;
+  /** Display label. UI only — it must never reach a command line. */
   name: string;
+  // --- deployment identity ---
+  // The repository a launch command resolves. `name` is a marketing label ("Llama 3.3 70B
+  // Instruct"); passing it to `vllm serve` fails at argument parsing, never mind resolution.
+  // Absent, no command can be generated at all — which is the honest outcome, since there is
+  // nothing to serve.
+  hf_id?: string;
+  revision?: string;
+  /**
+   * Per-precision deployment path. A quant with no entry has no known way to launch, so the
+   * command is blocked rather than guessed: sizing a plan at INT4 and emitting a command that
+   * silently launches BF16 is worse than emitting nothing.
+   */
+  deployments?: Partial<Record<Quant, DeploymentVariant>>;
   total_params_b: number;
   active_params_b: number;
   layers: number;

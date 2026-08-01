@@ -5,6 +5,20 @@ import { QUANTS } from './types.js';
 export const quantSchema = z.enum(QUANTS);
 
 /**
+ * `owner/name` — what `vllm serve` takes as its positional argument. Anything with a space in it
+ * is not an artifact id, it is a display name, and the shell will split it into three arguments.
+ */
+export const HF_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const hfIdSchema = z.string().max(128).regex(HF_ID_RE, 'must be a Hugging Face id of the form owner/name');
+
+export const deploymentVariantSchema = z.object({
+  source: z.enum(['checkpoint', 'online', 'none']),
+  hf_id: hfIdSchema.optional(),
+  method: z.string().min(1).max(64).optional(),
+  revision: z.string().min(1).max(64).optional(),
+});
+
+/**
  * Model entity (§F.1). The mla-conditional rule is the critical structural check
  * (a GQA model with kv_heads=0 divides by zero in KV-per-token).
  */
@@ -12,6 +26,13 @@ export const modelSchema = z
   .object({
     id: z.string().min(1).max(64),
     name: z.string().min(1).max(128),
+    // Deployment identity, kept separate from the display name so the label can never be
+    // passed to a runtime (§4.1). Optional for backward compatibility; without it no launch
+    // command is generated.
+    hf_id: hfIdSchema.optional(),
+    revision: z.string().min(1).max(64).optional(),
+    // NB: z.record(enum, ...) is EXHAUSTIVE in Zod 4 — keys are checked in the refinement below.
+    deployments: z.record(z.string(), deploymentVariantSchema).optional(),
     total_params_b: z.number().positive(),
     active_params_b: z.number().positive(),
     layers: z.number().int().positive(),
@@ -100,6 +121,29 @@ export const modelSchema = z
     }
     if (m.mixed_precision && Object.keys(m.mixed_precision).length > 0 && m.dense_params_b == null) {
       ctx.addIssue({ code: 'custom', path: ['dense_params_b'], message: 'mixed_precision requires dense_params_b — the parameters that stay at the higher precision' });
+    }
+    // Deployment variants: keys must be real quants the model actually offers, and the
+    // source must agree with whether a --quantization method is present. A checkpoint that
+    // also passes the flag conflicts with its own metadata; an online path without one
+    // silently launches the base precision the plan was not sized for.
+    for (const [k, v] of Object.entries(m.deployments ?? {})) {
+      const path = ['deployments', k];
+      if (!(QUANTS as readonly string[]).includes(k)) {
+        ctx.addIssue({ code: 'custom', path, message: `"${k}" is not a known quantisation` });
+        continue;
+      }
+      if (!m.quants.includes(k as (typeof QUANTS)[number])) {
+        ctx.addIssue({ code: 'custom', path, message: `deployment declared for ${k}, which is not in this model's quants` });
+      }
+      if (v.source === 'online' && !v.method) {
+        ctx.addIssue({ code: 'custom', path: [...path, 'method'], message: 'online quantisation requires a --quantization method' });
+      }
+      if (v.source !== 'online' && v.method) {
+        ctx.addIssue({ code: 'custom', path: [...path, 'method'], message: `a ${v.source} artifact must not also pass --quantization — the flag conflicts with the checkpoint's own metadata` });
+      }
+      if (v.source === 'checkpoint' && !v.hf_id && !m.hf_id) {
+        ctx.addIssue({ code: 'custom', path: [...path, 'hf_id'], message: 'checkpoint source needs an artifact id, on the variant or the model' });
+      }
     }
     if (m.dense_params_b != null && m.dense_params_b >= m.total_params_b) {
       ctx.addIssue({ code: 'custom', path: ['dense_params_b'], message: 'dense_params_b must be smaller than total_params_b' });

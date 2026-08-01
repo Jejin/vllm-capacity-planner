@@ -6,7 +6,7 @@
 // migration seed AND the FR-23 reset (AD-15). [VERIFY]: all GPU bandwidths were self-flagged
 // approximate in the addendum (OQ-2) — confirm before prod. Model geometry is now sourced.
 
-import type { Model, GpuSku } from './types.js';
+import type { Model, GpuSku, Quant, DeploymentVariant } from './types.js';
 
 // hidden_size / vocab_size / tied_embeddings come from each model's HF config.json and size the
 // 16-bit embedding + lm_head tail that survives quantisation (engine.weightsGb).
@@ -36,31 +36,111 @@ import type { Model, GpuSku } from './types.js';
 //   gpt-oss-20b : 24 layers = 12 full + 12 sliding
 // Their head/embedding geometry was confirmed in the same pass (kv_heads 8, head_dim 64,
 // hidden_size 2880, vocab_size 201088, tie_word_embeddings false).
-export const SEED_MODELS: Model[] = [
-  { id: 'llama31-8b', name: 'Llama 3.1 8B Instruct', total_params_b: 8.03, active_params_b: 8.03, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4], quants: ['FP16', 'FP8', 'INT4', 'Q8_0', 'Q4_K_M'], hidden_size: 4096, intermediate_size: 14336, vocab_size: 128256, tied_embeddings: false },
-  { id: 'gptoss-20b', name: 'GPT-OSS 20B (MoE 3.6B act)', total_params_b: 21, active_params_b: 3.6, layers: 24, kv_heads: 8, head_dim: 64, mla: false, max_ctx: 131072, tp_options: [1, 2, 4], quants: ['MXFP4'], hidden_size: 2880, intermediate_size: 11520, vocab_size: 201088, tied_embeddings: false, sliding_window: 128, full_attention_layers: 12 },
-  { id: 'mistral-s24', name: 'Mistral Small 3.2 24B', total_params_b: 24, active_params_b: 24, layers: 40, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4], quants: ['FP16', 'FP8', 'INT4', 'Q4_K_M'], hidden_size: 5120, intermediate_size: 32768, vocab_size: 131072, tied_embeddings: false },
-  { id: 'qwen3-30a3', name: 'Qwen3-30B-A3B / Coder (MoE)', total_params_b: 30.5, active_params_b: 3.3, layers: 48, kv_heads: 4, head_dim: 128, mla: false, max_ctx: 262144, tp_options: [1, 2, 4], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 2048, intermediate_size: 6144, vocab_size: 151936, tied_embeddings: false },
+// Deployment paths per precision (§4.1/§4.2 of the implementation handoff). VERIFIED
+// 2026-08-01: every id below returned 200 from the Hugging Face model API, and each
+// `checkpoint` entry pointing at a base repo was confirmed to carry a `quantization_config`
+// declaring that precision. Nothing here is inferred from a naming convention.
+//
+// The rules the schema enforces, restated because they are easy to get backwards:
+//   checkpoint — the artifact IS this precision; passing --quantization too is an error
+//   online     — base checkpoint + a vLLM --quantization method applied at load
+//   none       — the checkpoint's native dtype already matches
+// vLLM's online methods are fp8_per_tensor, fp8_per_block and mxfp8 (the last needs SM100+);
+// 4-bit formats have no online path and always require a pre-quantised artifact.
+//
+// A precision with NO entry is deliberate, not an oversight: no artifact for it was verified,
+// so the planner blocks the command and says what is missing rather than emitting one that
+// launches a precision the plan was not sized for. That covers every GGUF quant (llama.cpp
+// territory; vLLM's support is experimental), and the 4-bit paths where no checkpoint was
+// confirmed. Filling one in is a catalogue edit, not a code change.
+const DEPLOYMENTS: Record<string, Partial<Record<Quant, DeploymentVariant>>> = {
+  'llama31-8b': {
+    FP16: { source: 'none' },
+    FP8: { source: 'checkpoint', hf_id: 'RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic' },
+    INT4: { source: 'checkpoint', hf_id: 'RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w4a16' },
+  },
+  'gptoss-20b': { MXFP4: { source: 'checkpoint' } }, // base repo declares quant_method mxfp4
+  'mistral-s24': {
+    FP16: { source: 'none' },
+    FP8: { source: 'online', method: 'fp8_per_tensor' },
+  },
+  'qwen3-30a3': {
+    FP16: { source: 'none' },
+    FP8: { source: 'checkpoint', hf_id: 'RedHatAI/Qwen3-30B-A3B-FP8-dynamic' },
+  },
+  'qwen36-27b': {
+    FP16: { source: 'none' },
+    FP8: { source: 'online', method: 'fp8_per_tensor' },
+    NVFP4: { source: 'checkpoint', hf_id: 'nvidia/Qwen3.6-27B-NVFP4' },
+  },
+  'qwen3-32b': {
+    FP16: { source: 'none' },
+    FP8: { source: 'checkpoint', hf_id: 'Qwen/Qwen3-32B-FP8' },
+    INT4: { source: 'checkpoint', hf_id: 'RedHatAI/Qwen3-32B-quantized.w4a16' },
+  },
+  'llama33-70b': {
+    FP16: { source: 'none' },
+    FP8: { source: 'checkpoint', hf_id: 'RedHatAI/Llama-3.3-70B-Instruct-FP8-dynamic' },
+    INT4: { source: 'checkpoint', hf_id: 'RedHatAI/Llama-3.3-70B-Instruct-quantized.w4a16' },
+  },
+  'qwen25-72b': {
+    FP16: { source: 'none' },
+    FP8: { source: 'checkpoint', hf_id: 'RedHatAI/Qwen2.5-72B-Instruct-FP8-dynamic' },
+    INT4: { source: 'checkpoint', hf_id: 'RedHatAI/Qwen2.5-72B-Instruct-quantized.w4a16' },
+  },
+  'gptoss-120b': { MXFP4: { source: 'checkpoint' } }, // base repo declares quant_method mxfp4
+  'qwen3-235b': {
+    FP16: { source: 'none' },
+    FP8: { source: 'checkpoint', hf_id: 'Qwen/Qwen3-235B-A22B-FP8' },
+    INT4: { source: 'checkpoint', hf_id: 'Qwen/Qwen3-235B-A22B-GPTQ-Int4' },
+  },
+  glm45: {
+    FP16: { source: 'none' },
+    FP8: { source: 'checkpoint', hf_id: 'zai-org/GLM-4.5-FP8' },
+  },
+  glm52: {
+    FP16: { source: 'none' },
+    FP8: { source: 'checkpoint', hf_id: 'zai-org/GLM-5.2-FP8' },
+    MXFP4: { source: 'checkpoint', hf_id: 'amd/GLM-5.2-MXFP4' },
+    NVFP4: { source: 'checkpoint', hf_id: 'nvidia/GLM-5.2-NVFP4' },
+  },
+  // DeepSeek-V3 and Kimi K2 ship FP8 in their BASE repositories (block-scaled e4m3, 128x128),
+  // so FP8 needs no separate artifact and no flag.
+  dsv3: { FP8: { source: 'checkpoint' } },
+  'kimi-k2': { FP8: { source: 'checkpoint' } },
+  // Kimi K3's base repo is bfloat16 and no MXFP4 artifact was found, so its only catalogued
+  // precision has no launch path — the planner sizes it and blocks the command.
+  'kimi-k3': {},
+};
+
+const SEED_MODEL_GEOMETRY: Model[] = [
+  { id: 'llama31-8b', name: 'Llama 3.1 8B Instruct', hf_id: 'meta-llama/Llama-3.1-8B-Instruct', total_params_b: 8.03, active_params_b: 8.03, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4], quants: ['FP16', 'FP8', 'INT4', 'Q8_0', 'Q4_K_M'], hidden_size: 4096, intermediate_size: 14336, vocab_size: 128256, tied_embeddings: false },
+  { id: 'gptoss-20b', name: 'GPT-OSS 20B (MoE 3.6B act)', hf_id: 'openai/gpt-oss-20b', total_params_b: 21, active_params_b: 3.6, layers: 24, kv_heads: 8, head_dim: 64, mla: false, max_ctx: 131072, tp_options: [1, 2, 4], quants: ['MXFP4'], hidden_size: 2880, intermediate_size: 11520, vocab_size: 201088, tied_embeddings: false, sliding_window: 128, full_attention_layers: 12 },
+  { id: 'mistral-s24', name: 'Mistral Small 3.2 24B', hf_id: 'mistralai/Mistral-Small-3.2-24B-Instruct-2506', total_params_b: 24, active_params_b: 24, layers: 40, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4], quants: ['FP16', 'FP8', 'INT4', 'Q4_K_M'], hidden_size: 5120, intermediate_size: 32768, vocab_size: 131072, tied_embeddings: false },
+  { id: 'qwen3-30a3', name: 'Qwen3-30B-A3B / Coder (MoE)', hf_id: 'Qwen/Qwen3-30B-A3B', total_params_b: 30.5, active_params_b: 3.3, layers: 48, kv_heads: 4, head_dim: 128, mla: false, max_ctx: 262144, tp_options: [1, 2, 4], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 2048, intermediate_size: 6144, vocab_size: 151936, tied_embeddings: false },
   // Qwen3.6-27B — hybrid gated delta-net. 16 of 64 layers keep a token cache (full_attention_interval 4);
   // the other 48 are linear, with a [48 v-heads x 128 x 128] fp32 state = 3.15 MB/layer (151 MB flat).
   // Note the 248,320-token vocab: at INT4 the fp16 embedding tail is ~5.1 GB, ~30% of the checkpoint.
-  { id: 'qwen36-27b', name: 'Qwen3.6-27B (hybrid GDN)', total_params_b: 27, active_params_b: 27, layers: 64, kv_heads: 4, head_dim: 256, mla: false, max_ctx: 262144, tp_options: [1, 2, 4], quants: ['FP16', 'FP8', 'INT4', 'NVFP4'], hidden_size: 5120, intermediate_size: 17408, vocab_size: 248320, tied_embeddings: false, full_attention_layers: 16, linear_attention_layers: 48, linear_state_bytes_per_layer: 3145728 },
-  { id: 'qwen3-32b', name: 'Qwen3-32B (dense)', total_params_b: 32.8, active_params_b: 32.8, layers: 64, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4], quants: ['FP16', 'FP8', 'INT4', 'Q4_K_M'], hidden_size: 5120, intermediate_size: 25600, vocab_size: 151936, tied_embeddings: false },
-  { id: 'llama33-70b', name: 'Llama 3.3 70B Instruct', total_params_b: 70.6, active_params_b: 70.6, layers: 80, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8], quants: ['FP16', 'FP8', 'INT4', 'Q4_K_M', 'IQ4_XS'], hidden_size: 8192, intermediate_size: 28672, vocab_size: 128256, tied_embeddings: false },
-  { id: 'qwen25-72b', name: 'Qwen2.5-72B Instruct', total_params_b: 72.7, active_params_b: 72.7, layers: 80, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 8192, intermediate_size: 29568, vocab_size: 152064, tied_embeddings: false },
-  { id: 'gptoss-120b', name: 'GPT-OSS 120B (MoE 5.1B act)', total_params_b: 117, active_params_b: 5.1, layers: 36, kv_heads: 8, head_dim: 64, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8], quants: ['MXFP4'], hidden_size: 2880, intermediate_size: 11520, vocab_size: 201088, tied_embeddings: false, sliding_window: 128, full_attention_layers: 18 },
-  { id: 'qwen3-235b', name: 'Qwen3-235B-A22B (MoE)', total_params_b: 235, active_params_b: 22, layers: 94, kv_heads: 4, head_dim: 128, mla: false, max_ctx: 262144, tp_options: [1, 2, 4, 8, 16], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 4096, intermediate_size: 12288, vocab_size: 151936, tied_embeddings: false },
-  { id: 'glm45', name: 'GLM-4.5 355B-A32B (MoE)', total_params_b: 355, active_params_b: 32, layers: 92, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8, 16], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 5120, intermediate_size: 13824, vocab_size: 151552, tied_embeddings: false, dense_params_b: 15.3 },
-  { id: 'glm52', name: 'GLM-5.2 743B-A39B (MoE·MLA·DSA)', total_params_b: 743, active_params_b: 39, layers: 78, kv_heads: 0, head_dim: 0, mla: true, mla_latent_elems: 576, max_ctx: 1048576, tp_options: [2, 4, 8, 16], quants: ['FP16', 'FP8', 'MXFP4', 'NVFP4'], hidden_size: 6144, intermediate_size: 18432, vocab_size: 154880, tied_embeddings: false, dense_params_b: 16.5, mixed_precision: { NVFP4: 'FP16' } },
-  { id: 'dsv3', name: 'DeepSeek-V3 / R1 671B (MLA)', total_params_b: 671, active_params_b: 37, layers: 61, kv_heads: 0, head_dim: 0, mla: true, mla_latent_elems: 576, max_ctx: 131072, tp_options: [2, 4, 8, 16], quants: ['FP8', 'INT4'], hidden_size: 7168, intermediate_size: 18432, vocab_size: 129280, tied_embeddings: false },
-  { id: 'kimi-k2', name: 'Kimi K2 1T-A32B (MLA)', total_params_b: 1026, active_params_b: 32.5, layers: 61, kv_heads: 0, head_dim: 0, mla: true, mla_latent_elems: 576, max_ctx: 131072, tp_options: [4, 8, 16], quants: ['FP8', 'INT4'], hidden_size: 7168, intermediate_size: 18432, vocab_size: 163840, tied_embeddings: false, dense_params_b: 9.4 },
+  { id: 'qwen36-27b', name: 'Qwen3.6-27B (hybrid GDN)', hf_id: 'Qwen/Qwen3.6-27B', total_params_b: 27, active_params_b: 27, layers: 64, kv_heads: 4, head_dim: 256, mla: false, max_ctx: 262144, tp_options: [1, 2, 4], quants: ['FP16', 'FP8', 'INT4', 'NVFP4'], hidden_size: 5120, intermediate_size: 17408, vocab_size: 248320, tied_embeddings: false, full_attention_layers: 16, linear_attention_layers: 48, linear_state_bytes_per_layer: 3145728 },
+  { id: 'qwen3-32b', name: 'Qwen3-32B (dense)', hf_id: 'Qwen/Qwen3-32B', total_params_b: 32.8, active_params_b: 32.8, layers: 64, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4], quants: ['FP16', 'FP8', 'INT4', 'Q4_K_M'], hidden_size: 5120, intermediate_size: 25600, vocab_size: 151936, tied_embeddings: false },
+  { id: 'llama33-70b', name: 'Llama 3.3 70B Instruct', hf_id: 'meta-llama/Llama-3.3-70B-Instruct', total_params_b: 70.6, active_params_b: 70.6, layers: 80, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8], quants: ['FP16', 'FP8', 'INT4', 'Q4_K_M', 'IQ4_XS'], hidden_size: 8192, intermediate_size: 28672, vocab_size: 128256, tied_embeddings: false },
+  { id: 'qwen25-72b', name: 'Qwen2.5-72B Instruct', hf_id: 'Qwen/Qwen2.5-72B-Instruct', total_params_b: 72.7, active_params_b: 72.7, layers: 80, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 8192, intermediate_size: 29568, vocab_size: 152064, tied_embeddings: false },
+  { id: 'gptoss-120b', name: 'GPT-OSS 120B (MoE 5.1B act)', hf_id: 'openai/gpt-oss-120b', total_params_b: 117, active_params_b: 5.1, layers: 36, kv_heads: 8, head_dim: 64, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8], quants: ['MXFP4'], hidden_size: 2880, intermediate_size: 11520, vocab_size: 201088, tied_embeddings: false, sliding_window: 128, full_attention_layers: 18 },
+  { id: 'qwen3-235b', name: 'Qwen3-235B-A22B (MoE)', hf_id: 'Qwen/Qwen3-235B-A22B', total_params_b: 235, active_params_b: 22, layers: 94, kv_heads: 4, head_dim: 128, mla: false, max_ctx: 262144, tp_options: [1, 2, 4, 8, 16], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 4096, intermediate_size: 12288, vocab_size: 151936, tied_embeddings: false },
+  { id: 'glm45', name: 'GLM-4.5 355B-A32B (MoE)', hf_id: 'zai-org/GLM-4.5', total_params_b: 355, active_params_b: 32, layers: 92, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: [1, 2, 4, 8, 16], quants: ['FP16', 'FP8', 'INT4'], hidden_size: 5120, intermediate_size: 13824, vocab_size: 151552, tied_embeddings: false, dense_params_b: 15.3 },
+  { id: 'glm52', name: 'GLM-5.2 743B-A39B (MoE·MLA·DSA)', hf_id: 'zai-org/GLM-5.2', total_params_b: 743, active_params_b: 39, layers: 78, kv_heads: 0, head_dim: 0, mla: true, mla_latent_elems: 576, max_ctx: 1048576, tp_options: [2, 4, 8, 16], quants: ['FP16', 'FP8', 'MXFP4', 'NVFP4'], hidden_size: 6144, intermediate_size: 18432, vocab_size: 154880, tied_embeddings: false, dense_params_b: 16.5, mixed_precision: { NVFP4: 'FP16' } },
+  { id: 'dsv3', name: 'DeepSeek-V3 / R1 671B (MLA)', hf_id: 'deepseek-ai/DeepSeek-V3', total_params_b: 671, active_params_b: 37, layers: 61, kv_heads: 0, head_dim: 0, mla: true, mla_latent_elems: 576, max_ctx: 131072, tp_options: [2, 4, 8, 16], quants: ['FP8', 'INT4'], hidden_size: 7168, intermediate_size: 18432, vocab_size: 129280, tied_embeddings: false },
+  { id: 'kimi-k2', name: 'Kimi K2 1T-A32B (MLA)', hf_id: 'moonshotai/Kimi-K2-Instruct', total_params_b: 1026, active_params_b: 32.5, layers: 61, kv_heads: 0, head_dim: 0, mla: true, mla_latent_elems: 576, max_ctx: 131072, tp_options: [4, 8, 16], quants: ['FP8', 'INT4'], hidden_size: 7168, intermediate_size: 18432, vocab_size: 163840, tied_embeddings: false, dense_params_b: 9.4 },
   // Kimi K3 — hybrid attention. Only 24 of 93 layers keep a token-indexed cache (full MLA);
   // the other 69 are KDA (Kimi Delta Attention), a recurrent form whose state is CONSTANT in
   // sequence length. linear_state_bytes_per_layer = num_heads 96 x head_dim 128 x 128 x 4 B
   // (fp32 recurrent state) = 6.29 MB/layer, so 69 layers cost a flat ~434 MB per request
   // regardless of context. Sizing all 93 layers as MLA would overstate KV ~3.9x at 1M.
-  { id: 'kimi-k3', name: 'Kimi K3 2.8T-A60B (MoE·MLA+KDA)', total_params_b: 2800, active_params_b: 60, layers: 93, kv_heads: 0, head_dim: 0, mla: true, mla_latent_elems: 576, max_ctx: 1048576, tp_options: [8, 16], quants: ['MXFP4'], hidden_size: 7168, intermediate_size: 55296, vocab_size: 163840, tied_embeddings: false, full_attention_layers: 24, linear_attention_layers: 69, linear_state_bytes_per_layer: 6291456, dense_params_b: 20.8 },
+  { id: 'kimi-k3', name: 'Kimi K3 2.8T-A60B (MoE·MLA+KDA)', hf_id: 'moonshotai/Kimi-K3', total_params_b: 2800, active_params_b: 60, layers: 93, kv_heads: 0, head_dim: 0, mla: true, mla_latent_elems: 576, max_ctx: 1048576, tp_options: [8, 16], quants: ['MXFP4'], hidden_size: 7168, intermediate_size: 55296, vocab_size: 163840, tied_embeddings: false, full_attention_layers: 24, linear_attention_layers: 69, linear_state_bytes_per_layer: 6291456, dense_params_b: 20.8 },
 ];
+
+/** The catalogue as consumed everywhere: geometry above, deployment paths attached. */
+export const SEED_MODELS: Model[] = SEED_MODEL_GEOMETRY.map((m) => ({ ...m, deployments: DEPLOYMENTS[m.id] ?? {} }));
 
 // tflops_fp16: DENSE (non-sparse) FP16 tensor throughput, driving the compute-bound TTFT
 // estimate. [VERIFY] against vendor datasheets — like the bandwidths, these are indicative.

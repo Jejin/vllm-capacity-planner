@@ -8,7 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, activationElemsPerToken, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, DEFAULT_INTERMEDIATE_RATIO, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
 import { crossCheckVram } from '../recipes.js';
 import { seedCatalog } from '../seed.js';
-import { modelSchema, gpuSkuSchema } from '../schema.js';
+import { modelSchema, gpuSkuSchema, HF_ID_RE } from '../schema.js';
 import { reconcile, headroomCheck } from '../reconcile.js';
 import type { FeasibleSizing } from '../types.js';
 
@@ -933,5 +933,45 @@ describe('MLA latent width is model geometry, not a sizing constant (§3)', () =
     const res = modelSchema.safeParse(bad);
     expect(res.success).toBe(false);
     expect(modelSchema.safeParse({ ...model('dsv3'), mla_latent_elems: 640 }).success).toBe(true);
+  });
+});
+
+describe('deployment identity — every plan maps to a real artifact (§4.1/§9.1)', () => {
+  it('AC-63 — every catalogue entry carries a resolvable artifact id, never a label', () => {
+    for (const m of models) {
+      expect(m.hf_id, `${m.id} has no hf_id`).toBeTruthy();
+      expect(m.hf_id!).toMatch(HF_ID_RE);
+      expect(m.hf_id).not.toBe(m.name); // the display label is not an identity
+      expect(modelSchema.safeParse(m).success, `${m.id} fails validation`).toBe(true);
+    }
+  });
+
+  it('AC-64 — declared deployments are internally consistent', () => {
+    for (const m of models) {
+      for (const [q, v] of Object.entries(m.deployments ?? {})) {
+        expect(m.quants).toContain(q); // no path for a precision the model does not offer
+        if (v!.source === 'online') expect(v!.method).toBeTruthy();
+        else expect(v!.method).toBeUndefined(); // a checkpoint must not also pass --quantization
+        if (v!.hf_id) expect(v!.hf_id).toMatch(HF_ID_RE);
+      }
+    }
+  });
+
+  it('AC-65 — the precisions with no launch path are exactly the known-missing ones', () => {
+    // Not a wish-list: each of these is a (model, precision) pair for which no artifact was
+    // verified, so the command is withheld. Q*/IQ* are GGUF — llama.cpp territory, where vLLM
+    // support is experimental. The rest are 4-bit paths with no confirmed checkpoint, plus
+    // Kimi K3, whose base repo is bfloat16 and whose only catalogued precision is MXFP4.
+    // Adding a real artifact to the catalogue should shorten this list, and this test is the
+    // reminder to record it here when it does.
+    const blocked = models.flatMap((m) => m.quants.filter((q) => !m.deployments?.[q]).map((q) => `${m.id}:${q}`));
+    expect(blocked.sort()).toEqual([
+      'dsv3:INT4', 'glm45:INT4', 'kimi-k2:INT4', 'kimi-k3:MXFP4',
+      'llama31-8b:Q4_K_M', 'llama31-8b:Q8_0', 'llama33-70b:IQ4_XS', 'llama33-70b:Q4_K_M',
+      'mistral-s24:INT4', 'mistral-s24:Q4_K_M', 'qwen3-30a3:INT4', 'qwen3-32b:Q4_K_M', 'qwen36-27b:INT4',
+    ].sort());
+    // the other 32 of 45 catalogued (model, precision) pairs do resolve an artifact
+    const total = models.reduce((n, m) => n + m.quants.length, 0);
+    expect(total - blocked.length).toBe(32);
   });
 });
