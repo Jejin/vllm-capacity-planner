@@ -40,6 +40,10 @@ export const modelSchema = z
     kv_heads: z.number().int().min(0),
     head_dim: z.number().int().min(0),
     mla: z.boolean(),
+    // Routed-expert count and top-k, for MoE decode traffic. Both required together: one
+    // without the other cannot express what fraction of experts a batch touches.
+    num_experts: z.number().int().positive().optional(),
+    experts_per_token: z.number().int().positive().optional(),
     // Per-layer MLA latent width (kv_lora_rank + qk_rope_head_dim). MLA models only —
     // it is checkpoint geometry, and a GQA model has no latent to describe.
     mla_latent_elems: z.number().int().positive().optional(),
@@ -82,6 +86,12 @@ export const modelSchema = z
     } else {
       if (m.kv_heads !== 0) ctx.addIssue({ code: 'custom', path: ['kv_heads'], message: 'MLA model (mla=true) must have kv_heads = 0 (unused)' });
       if (m.head_dim !== 0) ctx.addIssue({ code: 'custom', path: ['head_dim'], message: 'MLA model (mla=true) must have head_dim = 0 (unused)' });
+    }
+    if ((m.num_experts == null) !== (m.experts_per_token == null)) {
+      ctx.addIssue({ code: 'custom', path: ['experts_per_token'], message: 'num_experts and experts_per_token must be supplied together — one alone cannot size expert coverage' });
+    }
+    if (m.num_experts != null && m.experts_per_token != null && m.experts_per_token > m.num_experts) {
+      ctx.addIssue({ code: 'custom', path: ['experts_per_token'], message: 'experts_per_token must be <= num_experts' });
     }
     // Embedding geometry is all-or-nothing: one half alone can't size the un-quantised tail.
     if ((m.hidden_size == null) !== (m.vocab_size == null)) {

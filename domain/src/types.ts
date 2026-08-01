@@ -61,6 +61,15 @@ export interface Model {
   max_ctx: number;
   tp_options: number[];
   quants: Quant[];
+  // --- MoE routing (optional; routed-expert models only) ---
+  // `active_params_b` describes ONE token's path. A decode step runs a whole batch, and every
+  // expert any token in it selects has to be read from HBM — so traffic follows the UNION of
+  // their choices. These two fields are what makes that computable: total routed experts and
+  // the top-k each token selects, straight from config.json. Absent => the model is treated as
+  // dense and one token's active parameters stand for the whole step, which is what the engine
+  // did for every model before.
+  num_experts?: number;
+  experts_per_token?: number;
   // --- MLA latent geometry (optional; MLA models only) ---
   // An MLA model caches ONE compressed latent per layer per token instead of a K and a V
   // tensor, so its per-layer KV width is `kv_lora_rank + qk_rope_head_dim` from config.json.
@@ -201,6 +210,10 @@ export interface FeasibleSizing {
    * the least supportable.
    */
   throughput_suppressed: string | null;
+  /** GiB of weights actually streamed per decode step at this batch size (MoE: the expert union). */
+  decode_stream_gb: number;
+  /** Fraction of routed experts the batch touches. 1 for dense models. */
+  expert_coverage: number;
   /** Seconds per decode step spent in the tensor-parallel all-reduce (bandwidth term only). */
   collective_sec: number;
   /** That collective time as a fraction of the whole step. */
