@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, topologyLayout, topologySvg, reserveFloorChunk, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, topologyLayout, topologySvg, reserveFloorChunk, runtimeSupport, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, GPU_ARCHES, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -105,6 +105,12 @@
           desc: `${R.pods} serving replica${R.pods > 1 ? 's' : ''}, each sharded across ${R.tp} GPUs, placed on ${R.nodes} node${R.nodes > 1 ? 's' : ''} of ${perNode} GPUs. ${R.multi_node ? 'At least one replica spans a node boundary, so its tensor-parallel collective crosses the inter-node fabric.' : 'Every replica fits inside a single node.'}${topo.truncated ? ` The diagram draws only the first ${topo.shown} nodes and ${topo.shownPods} replicas; the rest repeat the same pattern.` : ''}`,
         })
       : '',
+  );
+
+  // Runtime support — deliberately NOT folded into `R`: a plan can fit perfectly and still have
+  // no way to run, and the two verdicts have to be readable separately (§4.4 / §8).
+  const support = $derived(
+    model && gpu ? runtimeSupport(model, gpu, { quant: effQuant, gpus_per_node: perNode }, R?.tp ?? 1) : null,
   );
 
   // what this model's KV would cost if every layer were full-context — the comparison the
@@ -291,11 +297,11 @@
   }
   async function deleteModelUi(id: string) { if (!confirm(`Delete model "${id}"?`)) return; const r = await fetch(`/api/v1/models/${id}`, { method: 'DELETE', headers: authH }); if (r.ok) { loadCatalog(); notice = 'Model deleted.'; } else notice = (await r.json()).error?.message ?? 'Delete failed.'; }
 
-  const blankGpu = () => ({ id: '', name: '', mem_gb: 80, bw_tbs: 3, tflops_fp16: 989, price_per_gpu_hour: 2.5 });
+  const blankGpu = () => ({ id: '', name: '', mem_gb: 80, bw_tbs: 3, tflops_fp16: 989, price_per_gpu_hour: 2.5, arch: '' as string });
   let gf = $state(blankGpu());
   let gfErrors = $state<Err[]>([]);
   async function saveGpu() {
-    const body = { id: gf.id, name: gf.name, mem_gb: +gf.mem_gb, bw_tbs: +gf.bw_tbs, tflops_fp16: +gf.tflops_fp16 || undefined, price_per_gpu_hour: +gf.price_per_gpu_hour };
+    const body = { id: gf.id, name: gf.name, mem_gb: +gf.mem_gb, bw_tbs: +gf.bw_tbs, tflops_fp16: +gf.tflops_fp16 || undefined, price_per_gpu_hour: +gf.price_per_gpu_hour, ...(gf.arch ? { arch: gf.arch } : {}) };
     const r = await fetch('/api/v1/gpus', { method: 'POST', headers: authH, body: JSON.stringify(body) });
     if (r.ok) { gf = blankGpu(); gfErrors = []; loadCatalog(); notice = 'GPU SKU saved.'; }
     else { const e = await r.json(); gfErrors = e.error?.fields ?? [{ path: '', message: e.error?.message ?? 'Save failed.' }]; }
@@ -441,6 +447,21 @@
 
     <section>
       {#if R}
+        <div class="verdicts">
+          <span class="vb ok" class:warnv={R.tight}><i></i>Memory fit<b>{R.tight ? `Tight · ${(R.headroom_fraction * 100).toFixed(1)}% headroom` : `Fits · ${(R.headroom_fraction * 100).toFixed(0)}% free`}</b></span>
+          {#if support}
+            <span class="vb {support.level}"><i></i>Runtime support<b>{support.headline}</b></span>
+          {/if}
+        </div>
+        {#if support && support.level !== 'supported'}
+          <div class="state {support.level === 'unsupported' ? 'err' : 'warn'}">
+            <b>{support.headline}.</b>
+            {#each support.findings.filter((f) => f.level !== 'supported') as f}
+              <div class="sfind">{f.detail}{#if f.alternative}<em class="alt">{f.alternative}</em>{/if}</div>
+            {/each}
+            <div class="ssrc">Kernel support checked against {support.source.runtime} documentation, snapshot {support.source.docs_snapshot}. Memory feasibility is a separate verdict and is unaffected.</div>
+          </div>
+        {/if}
         <div class="kpis">
           <div class="kpi" class:tight={R.tight}><div class="v">{R.gpus}</div><div class="l">GPUs</div><div class="verdict" class:t={R.tight}>{R.tight ? `Tight · ${(R.headroom_fraction * 100).toFixed(1)}% free` : `Fits · ${(R.headroom_fraction * 100).toFixed(0)}% free`}</div></div>
           <div class="kpi n"><div class="v">{R.nodes}<small> × {perNode} GPU</small></div><div class="l">Nodes</div>{#if R.multi_node}<div class="cav">a replica spans nodes</div>{/if}</div>
@@ -800,17 +821,17 @@
     <section class="panel"><h2>New GPU SKU</h2>
       <div class="row"><label>ID<input bind:value={gf.id} placeholder="b300" /></label><label>Name<input bind:value={gf.name} placeholder="B300 288 GB" /></label></div>
       <div class="row3"><label>Memory (GiB)<small> as nvidia-smi reports</small><input type="number" bind:value={gf.mem_gb} /></label><label>Bandwidth (TB/s)<input type="number" step="0.1" bind:value={gf.bw_tbs} /></label><label>FP16 TFLOPS<small> dense, no sparsity</small><input type="number" step="1" bind:value={gf.tflops_fp16} /></label></div>
-      <div class="row3"><label>Price ($/GPU-hr)<input type="number" step="0.1" bind:value={gf.price_per_gpu_hour} /></label></div>
+      <div class="row3"><label>Price ($/GPU-hr)<input type="number" step="0.1" bind:value={gf.price_per_gpu_hour} /></label><label>Architecture<small> (kernel support)</small><select bind:value={gf.arch}><option value="">— unverified —</option>{#each GPU_ARCHES as a}<option value={a}>{a}</option>{/each}</select></label></div>
       {#if gfErrors.length}<div class="ferr">{gfErrors[0].message}</div>{/if}
       <button class="btn primary" style="margin-top:12px" onclick={saveGpu}>Add / update GPU SKU</button>
     </section>
   {/if}
   <section class="panel"><h2>GPU SKUs</h2>
-    <table><thead><tr><th>SKU</th><th class="num">HBM (GiB)</th><th class="num">BW (TB/s)</th><th class="num">FP16 TFLOPS</th><th class="num">$/GPU-hr</th>{#if ident.role === 'admin'}<th></th>{/if}</tr></thead><tbody>
-      {#each catalog.gpus as g}<tr><td>{g.name}</td><td class="num">{g.mem_gb}</td><td class="num">{g.bw_tbs}</td><td class="num">{g.tflops_fp16 != null ? g.tflops_fp16.toLocaleString() : '—'}</td><td class="num">{g.price_per_gpu_hour != null ? money(g.price_per_gpu_hour) : '—'}</td>{#if ident.role === 'admin'}<td><button class="btn ghost danger" onclick={() => deleteGpuUi(g.id)}>del</button></td>{/if}</tr>{/each}
+    <table><thead><tr><th>SKU</th><th>Arch</th><th class="num">HBM (GiB)</th><th class="num">BW (TB/s)</th><th class="num">FP16 TFLOPS</th><th class="num">$/GPU-hr</th>{#if ident.role === 'admin'}<th></th>{/if}</tr></thead><tbody>
+      {#each catalog.gpus as g}<tr><td>{g.name}</td><td>{g.arch ?? '—'}</td><td class="num">{g.mem_gb}</td><td class="num">{g.bw_tbs}</td><td class="num">{g.tflops_fp16 != null ? g.tflops_fp16.toLocaleString() : '—'}</td><td class="num">{g.price_per_gpu_hour != null ? money(g.price_per_gpu_hour) : '—'}</td>{#if ident.role === 'admin'}<td><button class="btn ghost danger" onclick={() => deleteGpuUi(g.id)}>del</button></td>{/if}</tr>{/each}
     </tbody></table>
     <p class="tot">{catalog.gpus.length} GPU SKUs</p>
-    <div class="hint">Each column drives a different number, and the two easily-confused ones drive opposite halves of the plan. <b>Bandwidth</b> sets throughput: decode is memory-bound, so tok/s comes from TB/s × MBU, never from TFLOPS. <b>FP16 TFLOPS</b> sets time-to-first-token: prefill is a dense GEMM, so TTFT comes from FLOPS × MFU, with sub-16-bit weights assumed to run up to 2× faster. A SKU with no TFLOPS figure falls back to a weight-streaming floor for TTFT, which is optimistic — the KPI says "bandwidth floor" when that happens. Figures are dense, no-sparsity, and indicative.</div>
+    <div class="hint">Each column drives a different number, and the two easily-confused ones drive opposite halves of the plan. <b>Bandwidth</b> sets throughput: decode is memory-bound, so tok/s comes from TB/s × MBU, never from TFLOPS. <b>FP16 TFLOPS</b> sets time-to-first-token: prefill is a dense GEMM, so TTFT comes from FLOPS × MFU, with sub-16-bit weights assumed to run up to 2× faster. A SKU with no TFLOPS figure falls back to a weight-streaming floor for TTFT, which is optimistic — the KPI says "bandwidth floor" when that happens. Figures are dense, no-sparsity, and indicative. <b>Arch</b> drives neither: it decides which quantisation kernels vLLM can actually use on the card, which is the runtime-support verdict rather than a memory or speed input. A SKU with no architecture reports that verdict as unverified.</div>
   </section>
 
 {:else if tab === 'methodology'}
@@ -925,6 +946,12 @@
     <div class="formula">Pod headroom = <span class="frac"><span class="fnum">Usable pod memory − Weights − KV per session</span><span class="fden">Usable pod memory</span></span> · Tight = headroom &lt; 10%</div>
     <p>A <b>tight</b> plan is arithmetically feasible but has no margin for the ±5% weight estimate, allocator fragmentation, or a prompt longer than the modelled average — the configuration that passes a spreadsheet and then OOMs on launch. Qwen3-32B at Q4_K_M on a single RTX 4090 is the canonical case: 18.6 GiB of weights against 19.1 GiB usable leaves <b>0.9% headroom</b> at 4K context and room for exactly one request. Push the context to 8K and it needs TP2, where it is comfortable again.</p>
 
+    <h3 class="dh3">Memory fit is not runtime support</h3>
+    <p>All of the above answers one question — does it fit? — and the plan reports a second one beside it: will these kernels actually run on this card? They are independent. A B300 plan at INT4 and an A100 plan at NVFP4 both fit comfortably; one runs on native tensor cores and the other does not.</p>
+    <p>The verdict has three levels rather than two, because vLLM rarely refuses a format outright. It selects a kernel from the backends available on the platform, and where there is no native one it falls back to weight-only execution and logs a warning. <b>Supported</b> means native kernels. <b>Runs, but not as modelled</b> means a weight-only fallback (typically Marlin): the weights really are low-precision, so the <b>memory plan holds</b>, but activations stay 16-bit, so the <b>throughput and TTFT figures are optimistic</b>. <b>No runtime path</b> means no implementation at all. <b>Unverified</b> means the combination is not in vLLM's published matrix, or the SKU has no architecture recorded.</p>
+    <p>Topology is part of the same verdict. A replica wider than a node needs a Ray cluster and puts every layer's all-reduce on the inter-node fabric; a tensor-parallel group on consumer cards runs that collective over PCIe with no NVLink. Both are marked as running-but-not-as-modelled, because the throughput roofline assumes the collective is not the bottleneck.</p>
+    <p class="note"><b>Unknown is reported, not assumed.</b> vLLM's own support matrix stops at Hopper for several formats, so INT4 on Blackwell is genuinely unrecorded — the plan says so rather than guessing in either direction. Failing closed on <em>unknown</em> would block the whole catalogue the moment a GPU generation is added, which turns a safety property into a reason to delete the check; failing closed on <em>known-incompatible</em> is the useful half. Every rule carries its source and the date the documentation was read.</p>
+
     <h2 class="dh">7 · A note on units</h2>
     <p>Every memory figure in this tool is <b>GiB = 2³⁰ bytes</b> — the unit <code>nvidia-smi</code> reports and the one <code>gpu_memory_utilization</code> is applied against. Parameter counts are in billions (10⁹), so weights are converted explicitly: <code>params × bytes/param × 10⁹ ÷ 2³⁰</code>. Skipping that conversion (a common shortcut) makes weights read <b>7.4% larger</b> than they are relative to GPU capacity — conservative, but wrong, and it compounds against a KV figure that <em>was</em> converted.</p>
     <p class="note">Bandwidth is the exception: <code>bw_tbs</code> is decimal TB/s (10¹² B/s), as vendors quote it. The roofline therefore converts memory to raw bytes before dividing, rather than mixing the two scales.</p>
@@ -1015,6 +1042,16 @@
   /* auto-fit rather than a fixed count: main is capped at 1120px, so this row gets ~720px whatever
      the window does. Six tiles at 1fr is ~110px each and "time to first token" wraps; 200px
      minimum lands them 3 x 2 with room for the labels, and still reflows on a narrow screen */
+  .verdicts{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .vb{display:inline-flex;align-items:center;gap:7px;font-size:10px;letter-spacing:.04em;text-transform:uppercase;font-weight:700;color:var(--ink3);border:1px solid var(--line);border-radius:999px;padding:5px 12px 5px 10px;background:var(--surface)}
+  .vb b{font-size:11.5px;letter-spacing:0;text-transform:none;color:var(--ink)}
+  .vb i{width:8px;height:8px;border-radius:50%;background:var(--ok,#5a9e2f);display:inline-block}
+  .vb.degraded i,.vb.warnv i,.vb.unverified i{background:var(--warn)}
+  .vb.unsupported i{background:var(--err)}
+  .vb.unverified{border-style:dashed}
+  .sfind{margin-top:6px;font-weight:400}
+  .sfind .alt{display:block;margin-top:3px;opacity:.85}
+  .ssrc{margin-top:8px;font-size:11px;color:var(--ink3);font-weight:400}
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
   .kpi{background:var(--surface);border:1px solid var(--line);border-top:3px solid var(--brand);border-radius:6px;padding:12px 13px;box-shadow:0 1px 2px rgba(21,24,26,.05)}
   .kpi.p{border-top-color:var(--purple)}.kpi.a{border-top-color:var(--warnln)}.kpi.g{border-top-color:var(--brandink)}.kpi.t{border-top-color:var(--slate)}.kpi.n{border-top-color:var(--grey)}.kpi.c{border-top-color:var(--ink2)}

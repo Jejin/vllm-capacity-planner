@@ -1,6 +1,6 @@
 // §F validation — expressed ONCE, shared by client (UX) and server (authoritative) (AD-14, NFR-S-4).
 import { z } from 'zod';
-import { QUANTS } from './types.js';
+import { GPU_ARCHES, QUANTS } from './types.js';
 
 export const quantSchema = z.enum(QUANTS);
 
@@ -156,6 +156,9 @@ export const gpuSkuSchema = z.object({
   name: z.string().min(1).max(128),
   mem_gb: z.number().int().positive(),
   bw_tbs: z.number().positive(),
+  // Kernel-support architecture. Optional for backward compatibility; without it the runtime
+  // verdict is `unverified` rather than assumed good.
+  arch: z.enum(GPU_ARCHES).optional(),
   // Dense FP16/BF16 TFLOPS. Drives the compute-bound TTFT estimate; without it the engine falls
   // back to a weight-streaming floor. Omitted here, Zod stripped it on every upsert and catalog
   // import, so editing a seeded SKU silently downgraded its own TTFT to that floor.

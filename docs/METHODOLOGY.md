@@ -267,6 +267,27 @@ Tight        = Pod headroom < 10%
 
 A tight plan is arithmetically feasible but has no margin for the ±5% weight estimate, allocator fragmentation, or a prompt longer than the modelled average — it is the configuration that passes a spreadsheet and then OOMs on launch. Qwen3-32B at Q4_K_M on a single RTX 4090 is the canonical example: 18.6 GiB of weights against 19.1 GiB usable leaves **0.9% headroom** at 4K context and room for exactly one request. Push the context to 8K and it needs TP2, where it is comfortable again.
 
+### Memory fit is not runtime support
+
+All of the above answers one question — does it fit? — and the plan reports a second one beside it: will these kernels actually run on this card? They are independent. A B300 plan at INT4 and an A100 plan at NVFP4 both fit comfortably; one runs on native tensor cores and the other does not.
+
+The verdict has three levels rather than two, because vLLM rarely refuses a format outright. It selects a kernel from the backends available on the platform, and where there is no native one it falls back to weight-only execution and logs a warning:
+
+| Verdict | Meaning |
+|---|---|
+| **Supported** | native kernels for this format on this architecture |
+| **Runs, but not as modelled** | a weight-only fallback (typically Marlin). The weights really are low-precision, so the **memory plan holds**; activations stay 16-bit, so the **throughput and TTFT figures are optimistic** |
+| **No runtime path** | the format has no implementation on this architecture at all |
+| **Unverified** | the combination is not in vLLM's published matrix, or the SKU has no architecture recorded |
+
+Collapsing the middle row into "supported" is what this tool did before; collapsing it into "unsupported" would be equally wrong, since the plan does run and its memory arithmetic is unaffected.
+
+Topology is part of the same verdict. A replica wider than a node needs a Ray cluster and puts every layer's all-reduce on the inter-node fabric; a tensor-parallel group on consumer cards runs that collective over PCIe with no NVLink. Both are marked as running-but-not-as-modelled for the same reason: the throughput roofline assumes the collective is not the bottleneck.
+
+**Unknown is reported, not assumed.** vLLM's own support matrix stops at Hopper for several formats, so INT4 on Blackwell is genuinely unrecorded — the plan says so rather than guessing in either direction. Failing closed on *unknown* would block the whole catalogue the moment a GPU generation is added, which turns a safety property into a reason to delete the check. Failing closed on *known-incompatible* is the useful half, and that is what the table does.
+
+Every rule carries its source and the date the documentation was read, so a rule that has gone stale is visible as a stale rule rather than passing for folklore.
+
 ## 7. A note on units
 
 Every memory figure here and in the app is **GiB = 2³⁰ bytes** — the unit `nvidia-smi` reports and the one `gpu_memory_utilization` is applied against. Parameter counts are quoted in billions (10⁹), so weights need an explicit conversion:
