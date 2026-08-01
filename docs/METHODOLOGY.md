@@ -250,6 +250,30 @@ Aggregate throughput       = (Effective pod bandwidth / Data read per step) × A
 
 Note the explicit `× 2³⁰`: memory here is GiB but bandwidth is decimal, so both sides go to raw bytes before dividing. **Active weights** is not the same as total weights — only the output head streams every step; the embedding table is a per-token gather. For MoE models only the *active* parameters are read.
 
+### MoE decode reads the expert union, not one token's path
+
+`active_params_b` describes the path **one token** takes. A decode step runs a whole batch at once, and every expert *any* token in it selects has to be read out of HBM — so the traffic follows the **union** of their choices. With E routed experts and top-k routing, one token misses a given expert with probability (1 − k/E), so a batch of B misses it with (1 − k/E)^B:
+
+```
+Expert coverage   = 1 − (1 − k/E)^B
+Params streamed   = dense + coverage × routed
+routed            = (total − active) / (1 − k/E)      dense = total − routed
+```
+
+The dense/routed split is solved from the catalogue's own `total` and `active` rather than needing a new field, and the arithmetic checks out against a figure declared independently: DeepSeek-V3 solves to a **16.6 B** dense block, next to GLM-5.2's separately-sourced `dense_params_b` of 16.5 B.
+
+At batch 1 this returns exactly `active_params_b`, so single-request plans and dense models are unchanged. It diverges fast:
+
+| DeepSeek-V3 (256 experts, top-8) | coverage | streamed | vs active |
+|---|---|---|---|
+| batch 1 | 3.1% | 37 B | 1× |
+| batch 8 | 22.4% | 163 B | 4.4× |
+| batch 64 | 86.9% | 585 B | **15.8×** |
+
+Reported throughput for that plan on 8×H200 falls from ~6,000 tok/s to ~1,750. The old figure was not conservative — it was describing a batch size of one and labelling it a throughput number.
+
+**Uniform routing is assumed.** Real routers are skewed, which concentrates tokens on fewer experts and therefore touches fewer of them, so this is the pessimistic direction — the right way to be wrong in a capacity plan. Expert parallelism is also not modelled: this is the TP picture, where every rank holds a slice of every expert.
+
 ### Time to first token is a different problem
 
 Decode is memory-bound; **prefill is not.** It runs the entire prompt through the network before emitting a token, so TTFT is bounded by arithmetic:

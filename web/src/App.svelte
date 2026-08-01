@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, topologyLayout, topologySvg, reserveFloorChunk, runtimeSupport, kvScalePolicy, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, GPU_ARCHES, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, activeWeightsGb, topologyLayout, topologySvg, reserveFloorChunk, runtimeSupport, kvScalePolicy, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, GPU_ARCHES, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -253,12 +253,12 @@
     return f;
   }
 
-  const blankModel = () => ({ id: '', name: '', hf_id: '', revision: '', deployments: {} as Record<string, DeployForm>, total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '', linear_attention_layers: '' as number | '', linear_state_bytes_per_layer: '' as number | '', intermediate_size: '' as number | '', mla_latent_elems: '' as number | '' });
+  const blankModel = () => ({ id: '', name: '', hf_id: '', revision: '', deployments: {} as Record<string, DeployForm>, total_params_b: 1, active_params_b: 1, layers: 32, kv_heads: 8, head_dim: 128, mla: false, max_ctx: 131072, tp_options: '1,2', quants: ['FP16'] as string[], hidden_size: '' as number | '', vocab_size: '' as number | '', tied_embeddings: false, sliding_window: '' as number | '', full_attention_layers: '' as number | '', linear_attention_layers: '' as number | '', linear_state_bytes_per_layer: '' as number | '', intermediate_size: '' as number | '', mla_latent_elems: '' as number | '', num_experts: '' as number | '', experts_per_token: '' as number | '' });
   let mf = $state(ensureRows(blankModel()));
   let mfEditing = $state(false);
   let mfErrors = $state<Err[]>([]);
   const errFor = (errs: Err[], p: string) => errs.find((e) => e.path === p)?.message;
-  function editModel(m: Model) { mf = { ...m, hf_id: m.hf_id ?? '', revision: m.revision ?? '', deployments: deployForm(m.deployments), tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '' } as any; ensureRows(mf); mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
+  function editModel(m: Model) { mf = { ...m, hf_id: m.hf_id ?? '', revision: m.revision ?? '', deployments: deployForm(m.deployments), tp_options: m.tp_options.join(','), quants: [...m.quants], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '', num_experts: m.num_experts ?? '', experts_per_token: m.experts_per_token ?? '' } as any; ensureRows(mf); mfEditing = true; mfErrors = []; document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' }); }
   function newModelForm() { mf = ensureRows(blankModel()); mfEditing = false; mfErrors = []; }
   function toggleQuant(q: string) { mf.quants = mf.quants.includes(q) ? mf.quants.filter((x) => x !== q) : [...mf.quants, q]; ensureRows(mf); }
   async function saveModel() {
@@ -270,6 +270,10 @@
     // FFN width stands alone — it drives the activation reserve, not the weight tail, so it is
     // not gated on the embedding pair being filled in
     const ffn = mf.intermediate_size !== '' ? { intermediate_size: +mf.intermediate_size } : {};
+    // routing is a pair: one half alone cannot express what share of experts a batch touches
+    const moe = mf.num_experts !== '' && mf.experts_per_token !== ''
+      ? { num_experts: +mf.num_experts, experts_per_token: +mf.experts_per_token }
+      : {};
     // same all-or-nothing rule for the sliding-window pair
     const win = mf.sliding_window !== '' && mf.full_attention_layers !== ''
       ? { sliding_window: +mf.sliding_window, full_attention_layers: +mf.full_attention_layers }
@@ -297,7 +301,7 @@
       };
     }
     const dep = Object.keys(deployments).length ? { deployments } : {};
-    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...ffn, ...win, ...lin, ...lat, ...identity, ...dep };
+    const body = { id: mf.id, name: mf.name, total_params_b: +mf.total_params_b, active_params_b: +mf.active_params_b, layers: +mf.layers, kv_heads: +mf.kv_heads, head_dim: +mf.head_dim, mla: mf.mla, max_ctx: +mf.max_ctx, tp_options: String(mf.tp_options).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0), quants: mf.quants, ...emb, ...ffn, ...moe, ...win, ...lin, ...lat, ...identity, ...dep };
     const r = await fetch(mfEditing ? `/api/v1/models/${mf.id}` : '/api/v1/models', { method: mfEditing ? 'PUT' : 'POST', headers: authH, body: JSON.stringify(body) });
     if (r.ok) { newModelForm(); loadCatalog(); notice = 'Model saved.'; }
     else { const e = await r.json(); mfErrors = e.error?.fields ?? [{ path: '', message: e.error?.message ?? 'Save failed.' }]; }
@@ -331,7 +335,7 @@
       const d = await r.json();
       hfCard = d; hfMissing = d.missing ?? [];
       const m = d.mapped ?? {};
-      mf = { id: m.id ?? '', name: m.name ?? hfId, hf_id: m.hf_id ?? '', revision: '', deployments: {}, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '', mla_latent_elems: m.mla_latent_elems ?? '' };
+      mf = { id: m.id ?? '', name: m.name ?? hfId, hf_id: m.hf_id ?? '', revision: '', deployments: {}, total_params_b: 1, active_params_b: 1, layers: m.layers ?? 32, kv_heads: m.kv_heads ?? 8, head_dim: m.head_dim ?? 128, mla: !!m.mla, max_ctx: m.max_ctx ?? 131072, tp_options: '', quants: [], hidden_size: m.hidden_size ?? '', vocab_size: m.vocab_size ?? '', tied_embeddings: !!m.tied_embeddings, sliding_window: m.sliding_window ?? '', full_attention_layers: m.full_attention_layers ?? '', linear_attention_layers: m.linear_attention_layers ?? '', linear_state_bytes_per_layer: m.linear_state_bytes_per_layer ?? '', intermediate_size: m.intermediate_size ?? '', mla_latent_elems: m.mla_latent_elems ?? '', num_experts: m.num_experts ?? '', experts_per_token: m.experts_per_token ?? '' };
       ensureRows(mf); mfEditing = false; mfErrors = [];
       notice = `Fetched ${d.model_id}. Review below, complete params / TP / quants (highlighted), then Create model.`;
       document.getElementById('mform')?.scrollIntoView({ behavior: 'smooth' });
@@ -437,7 +441,7 @@
     <section class="panel">
       <h2>Deployment inputs</h2>
       <label>Model<select bind:value={modelId}>{#each catalog.models as m}<option value={m.id}>{m.name}</option>{/each}</select></label>
-      <div class="meta">total {model?.total_params_b} B · active {model?.active_params_b} B · layers {model?.layers} · {model?.mla ? `MLA (latent ${mlaLatentElems(model)}/layer)` : `GQA ${model?.kv_heads} KV-heads × ${model?.head_dim}`} · max ctx {((model?.max_ctx ?? 0) / 1024)}K · TP {`{${model?.tp_options.join(',')}}`}{#if model?.vocab_size && model?.hidden_size} · emb {model.vocab_size.toLocaleString()}×{model.hidden_size}{model.tied_embeddings ? ' (tied)' : ''}{/if}{#if model?.sliding_window && model?.full_attention_layers != null} · <b>SWA {model.full_attention_layers}/{model.layers} full</b>, {model.sliding_window}-tok window{/if}{#if model?.linear_attention_layers} · <b>{model.linear_attention_layers} linear</b> (constant state){/if}</div>
+      <div class="meta">total {model?.total_params_b} B · active {model?.active_params_b} B · layers {model?.layers} · {model?.mla ? `MLA (latent ${mlaLatentElems(model)}/layer)` : `GQA ${model?.kv_heads} KV-heads × ${model?.head_dim}`} {#if model?.num_experts} · MoE {model.experts_per_token}/{model.num_experts} experts{/if} · max ctx {((model?.max_ctx ?? 0) / 1024)}K · TP {`{${model?.tp_options.join(',')}}`}{#if model?.vocab_size && model?.hidden_size} · emb {model.vocab_size.toLocaleString()}×{model.hidden_size}{model.tied_embeddings ? ' (tied)' : ''}{/if}{#if model?.sliding_window && model?.full_attention_layers != null} · <b>SWA {model.full_attention_layers}/{model.layers} full</b>, {model.sliding_window}-tok window{/if}{#if model?.linear_attention_layers} · <b>{model.linear_attention_layers} linear</b> (constant state){/if}</div>
       <div class="row"><label>Quantisation<select bind:value={quant}>{#each (model?.quants ?? []) as q}<option value={q}>{q}</option>{/each}</select></label>
         <label>KV dtype<select bind:value={kvBytes}><option value={1}>FP8 (1B)</option><option value={2}>FP16 (2B)</option></select></label></div>
       <div class="row"><label>Max context<select bind:value={ctx}>{#each ctxChoices as c}<option value={c}>{c / 1024}K</option>{/each}</select></label>
@@ -556,6 +560,7 @@
           <div class="li"><span>Time to first token <small>({R.ttft_compute_bound ? 'compute-bound prefill' : 'bandwidth floor'})</small></span><b>~{ttftLabel(R.ttft_ms)} <small>±50%</small></b></div>
           <div class="li"><span>Prefill work <small>({Math.round(ctx * util).toLocaleString()} tokens)</small></span><b>{R.prefill_pflops.toFixed(2)} PFLOP</b></div>
           <div class="li"><span>Decode throughput / request</span><b>~{R.decode_tps_per_request} tok/s</b></div>
+          {#if model?.num_experts}<div class="li"><span>Expert coverage <small>(union touched by the batch)</small></span><b>{(R.expert_coverage * 100).toFixed(0)}% of {model.num_experts} · streams {fmt(R.decode_stream_gb)} GiB <small>vs {fmt(activeWeightsGb(model, effQuant))} active</small></b></div>{/if}
           <div class="li"><span>Aggregate throughput</span><b>{R.throughput_suppressed ? '—' : `~${R.throughput_tokens_per_sec.toLocaleString()} tok/s`} <small>{R.throughput_suppressed ? 'withheld' : '±40%'}</small></b></div>
           {#if R.tp > 1}<div class="li"><span>TP all-reduce <small>(bandwidth term, per decode step)</small></span><b>{R.collective_sec > 0 ? `${(R.collective_sec * 1000).toFixed(2)} ms · ${(R.collective_share * 100).toFixed(1)}% of step` : '—'}</b></div>{/if}
           <div class="li"><span>Run rate <small>({R.gpus} × {money(rate)}/GPU-hr)</small></span><b>{runHr > 0 ? `${money(runHr)}/hr` : '—'}</b></div>
@@ -785,6 +790,8 @@
         <label>Hidden size<small> (config.json)</small><input type="number" bind:value={mf.hidden_size} placeholder="8192" /></label>
         <label>Vocab size<small> (config.json)</small><input type="number" bind:value={mf.vocab_size} placeholder="128256" /></label>
         <label>FFN width / token<small> (MoE: expert × top-k)</small><input type="number" bind:value={mf.intermediate_size} placeholder="28672" /></label>
+        <label>Routed experts<small> (MoE only)</small><input type="number" bind:value={mf.num_experts} placeholder="256" /></label>
+        <label>Experts / token<small> (top-k)</small><input type="number" bind:value={mf.experts_per_token} placeholder="8" /></label>
         <label style="display:flex;align-items:center;gap:8px;margin-top:24px"><input type="checkbox" style="width:auto" bind:checked={mf.tied_embeddings} />Tied embeddings</label>
       </div>
       <div class="hint">Optional but recommended: the embedding table and lm_head stay at 16-bit through quantisation. Supplying these sizes the un-quantised tail exactly instead of a flat overhead factor — worth 10%+ of the footprint at INT4/MXFP4. <em>Not used for GGUF quants (Q4_K_M, Q8_0, IQ4_XS), whose published bytes/param already include the embedding layers.</em></div>
@@ -810,6 +817,7 @@
         <label>Latent / layer{#if !mf.mla}<small> (MLA only)</small>{/if}<input type="number" bind:value={mf.mla_latent_elems} disabled={!mf.mla} placeholder={String(DEFAULT_MLA_LATENT_ELEMS)} /></label>
       </div>
       {#if mf.mla}<div class="hint">An MLA model's per-layer KV width is <code>kv_lora_rank + qk_rope_head_dim</code> from <code>config.json</code> — the latent counterpart to a GQA model's <code>2 × KV-heads × head-dim</code>. DeepSeek, Kimi and GLM-5.2 all ship 512 + 64 = {DEFAULT_MLA_LATENT_ELEMS}, which is assumed if this is left blank; it is checkpoint geometry, not a planner constant, so a model with a different rank must state it.</div>{/if}
+      {#if errFor(mfErrors, 'experts_per_token')}<div class="ferr">{errFor(mfErrors, 'experts_per_token')}</div>{/if}
       {#if errFor(mfErrors, 'mla_latent_elems')}<div class="ferr">{errFor(mfErrors, 'mla_latent_elems')}</div>{/if}
       <label>Quantisation variants</label>
       <div class="quants">{#each QUANTS as q}<button type="button" class="qbtn" class:on={mf.quants.includes(q)} onclick={() => toggleQuant(q)}>{q}</button>{/each}</div>
@@ -947,6 +955,11 @@
     <div class="formula">Data read per step = Weight memory + (Active sequences × KV per session)</div>
     <div class="formula">Aggregate throughput (tok/s) = <span class="frac"><span class="fnum">Effective pod bandwidth</span><span class="fden">Data read per step</span></span> × Active sequences</div>
     <p class="note">Effective pod bandwidth = TP size × per-GPU bandwidth × MBU. The calculator also reports <b>time-to-first-token</b> (an indicative prefill estimate) and <b>per-request</b> tokens/s. For MoE models, only the <em>active</em> parameters are read per step.</p>
+
+    <h3 class="dh3">MoE decode reads the expert union, not one token's path</h3>
+    <p><code>active_params</code> describes the path <b>one token</b> takes. A decode step runs a whole batch at once, and every expert <em>any</em> token in it selects has to be read out of HBM — so traffic follows the <b>union</b> of their choices. With E routed experts and top-k routing, coverage is <code>1 − (1 − k/E)^B</code> for a batch of B, and the streamed weight is <code>dense + coverage × routed</code>.</p>
+    <p>The dense/routed split is solved from the catalogue's own total and active counts rather than needing a new field, and it checks out against a figure sourced independently: DeepSeek-V3 solves to a <b>16.6 B</b> dense block, next to GLM-5.2's separately-declared 16.5 B. At batch 1 the formula returns exactly the active parameters, so single-request plans and dense models are unchanged — but DeepSeek-V3 at batch 64 touches <b>87%</b> of its 256 experts and streams <b>15.8×</b> one token's parameters, taking reported throughput on 8×H200 from ~6,000 tok/s to ~1,750. The old figure was not conservative; it was describing a batch size of one and calling it throughput.</p>
+    <p class="note"><b>Uniform routing is assumed.</b> Real routers are skewed, which concentrates tokens on fewer experts and so touches fewer of them — the pessimistic direction, and the right way to be wrong in a capacity plan. Expert parallelism is not modelled either: this is the tensor-parallel picture, where every rank holds a slice of every expert.</p>
 
     <h3 class="dh3">Time to first token is a different problem</h3>
     <p>Decode is memory-bound; <b>prefill is not</b>. It runs the entire prompt through the network before emitting a token, so TTFT is bounded by arithmetic:</p>
