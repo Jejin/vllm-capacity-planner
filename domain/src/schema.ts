@@ -160,6 +160,9 @@ export const gpuSkuSchema = z.object({
   // Kernel-support architecture. Optional for backward compatibility; without it the runtime
   // verdict is `unverified` rather than assumed good.
   arch: z.enum(GPU_ARCHES).optional(),
+  // Bidirectional aggregate collective bandwidth per GPU inside a node (NVLink, Infinity
+  // Fabric, or PCIe where there is no link). Drives the tensor-parallel all-reduce cost.
+  link_gbs: z.number().positive().optional(),
   // Dense FP16/BF16 TFLOPS. Drives the compute-bound TTFT estimate; without it the engine falls
   // back to a weight-streaming floor. Omitted here, Zod stripped it on every upsert and catalog
   // import, so editing a seeded SKU silently downgraded its own TTFT to that floor.
@@ -176,6 +179,7 @@ export const sizingInputSchema = z.object({
   target_concurrency: z.number().int().positive(),
   mem_util_fraction: z.number().gt(0).max(1),
   gpus_per_node: z.number().int().positive(),
+  fabric_gbs: z.number().positive().optional(),
 });
 
 export const catalogSchema = z.object({

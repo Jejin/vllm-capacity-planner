@@ -128,6 +128,13 @@ export interface GpuSku {
   mem_gb: number;
   bw_tbs: number; // per-GPU HBM aggregate bandwidth (TB/s)
   /**
+   * Per-GPU collective bandwidth INSIDE a node, as vendors quote it: bidirectional aggregate
+   * (H100's NVLink 4 is "900 GB/s", meaning 450 each way). Cards with no NVLink carry their
+   * PCIe figure, which is where tensor parallelism gets expensive. Absent => the plan reports
+   * no collective cost, which understates it.
+   */
+  link_gbs?: number;
+  /**
    * What kernels this card can run. Drives the runtime-support verdict, which is a separate
    * question from whether the plan fits in HBM. Absent => support reports `unverified`.
    */
@@ -152,6 +159,13 @@ export interface SizingInput {
   gpus_per_node: number;
   /** vLLM --max-num-batched-tokens: the prefill chunk. Drives the activation reserve. */
   max_num_batched_tokens?: number;
+  /**
+   * Per-GPU inter-node fabric bandwidth (GB/s, bidirectional aggregate) — InfiniBand or RoCE.
+   * Only consulted when a replica spans nodes, and required to report throughput at all in
+   * that case: without it the plan would be quoting a figure that depends on hardware it has
+   * not been told about. A modern Blackwell node budgets roughly 100 GB/s per GPU.
+   */
+  fabric_gbs?: number;
 }
 
 export interface FeasibleSizing {
@@ -179,7 +193,18 @@ export interface FeasibleSizing {
   runtime_reserve_gb: number;
   /** Prefill activation component of that reserve (GiB) — scales with the batched-token chunk. */
   activation_gb: number;
-  throughput_tokens_per_sec: number; // aggregate decode throughput across the deployment, ±40%
+  throughput_tokens_per_sec: number;
+  /**
+   * Set when the throughput figure must not be shown: a node-spanning replica with no declared
+   * fabric bandwidth (§6.3). The number is still computed — it is what the plan WOULD be if the
+   * collective were free — but presenting it would be the most confident claim on the page and
+   * the least supportable.
+   */
+  throughput_suppressed: string | null;
+  /** Seconds per decode step spent in the tensor-parallel all-reduce (bandwidth term only). */
+  collective_sec: number;
+  /** That collective time as a fraction of the whole step. */
+  collective_share: number; // aggregate decode throughput across the deployment, ±40%
   decode_tps_per_request: number; // per-request decode tokens/sec (1 / step time), ±40%
   ttft_ms: number; // indicative time-to-first-token (prefill), ±50%
   /** True when TTFT is set by prefill arithmetic rather than by streaming the weights once. */

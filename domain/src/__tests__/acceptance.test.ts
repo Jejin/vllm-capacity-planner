@@ -5,7 +5,7 @@
 // and GpuSku.mem_gb. Vectors were re-pinned when the engine stopped mixing 1e9-byte GB (weights)
 // with 2^30-byte GiB (KV, capacity), which had inflated weights ~7.4% against GPU capacity.
 import { describe, it, expect } from 'vitest';
-import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, activationElemsPerToken, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, DEFAULT_INTERMEDIATE_RATIO, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
+import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, activationElemsPerToken, collectiveBytesPerStep, oneWayLinkBytesPerSec, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, DEFAULT_INTERMEDIATE_RATIO, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
 import { crossCheckVram } from '../recipes.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema, gpuSkuSchema, HF_ID_RE } from '../schema.js';
@@ -557,7 +557,13 @@ describe('§C unit consistency (GiB throughout)', () => {
     const activeGib = activeWeightsGb(m, 'FP8');
     const stepBytes = (activeGib + 10 * r.kv_per_request_gb) * GIB;
     const bytesPerSec = r.tp * g.bw_tbs * 1e12 * 0.55;
-    expect(r.step_time_ms).toBeCloseTo(Math.round((stepBytes / bytesPerSec) * 1e5) / 100, 2);
+    // The step is no longer memory alone: the per-layer all-reduce serialises with it, so the
+    // vector is memory + collective. The unit-consistency property this test exists to protect
+    // is asserted on the memory term itself, which is unchanged.
+    const memorySec = stepBytes / bytesPerSec;
+    expect(r.step_time_ms).toBeCloseTo(Math.round((memorySec + r.collective_sec) * 1e5) / 100, 2);
+    expect(r.collective_sec).toBeGreaterThan(0); // TP > 1 here, so the collective is real
+    expect(r.collective_share).toBeLessThan(0.05); // and small inside a node, at this batch
     // TTFT is no longer this quantity — weight-streaming is only its floor (see AC-52..AC-56)
     expect(r.ttft_ms).toBeGreaterThanOrEqual(Math.round(((activeGib * GIB) / bytesPerSec) * 1000));
   });
@@ -973,5 +979,66 @@ describe('deployment identity — every plan maps to a real artifact (§4.1/§9.
     // the other 32 of 45 catalogued (model, precision) pairs do resolve an artifact
     const total = models.reduce((n, m) => n + m.quants.length, 0);
     expect(total - blocked.length).toBe(32);
+  });
+});
+
+describe('tensor-parallel collective cost (§6.3)', () => {
+  const base = {
+    kv_dtype_bytes: 1, avg_context_utilisation: 0.6, mem_util_fraction: 0.9,
+    quant: 'FP8' as const, selected_ctx: 131072, target_concurrency: 64, gpus_per_node: 8,
+  };
+
+  it('AC-66 — every seeded GPU declares a collective bandwidth', () => {
+    for (const g of gpus) expect(g.link_gbs, `${g.id} has no link_gbs`).toBeGreaterThan(0);
+  });
+
+  it('AC-67 — the all-reduce volume follows the ring formula, and vanishes at TP1', () => {
+    const m = model('llama33-70b'); // 80 layers, hidden 8192
+    expect(collectiveBytesPerStep(m, 1, 32)).toBe(0); // nothing to reduce on one rank
+    // 2 all-reduces/layer x 2(N-1)/N x batch x hidden x 2 bytes
+    const tp4 = 80 * 2 * ((2 * 3) / 4) * 32 * 8192 * 2;
+    expect(collectiveBytesPerStep(m, 4, 32)).toBeCloseTo(tp4, 0);
+    // wider TP moves more per rank, but sub-linearly: 2(N-1)/N saturates at 2
+    const ratio = collectiveBytesPerStep(m, 8, 32) / collectiveBytesPerStep(m, 4, 32);
+    expect(ratio).toBeCloseTo((2 * 7) / 8 / ((2 * 3) / 4), 3);
+    expect(ratio).toBeLessThan(2);
+  });
+
+  it('AC-68 — vendor link figures are bidirectional and halved for the ring', () => {
+    expect(oneWayLinkBytesPerSec(900)).toBe(450e9); // H100 NVLink 4 quoted as "900 GB/s"
+  });
+
+  it('AC-69 — inside a node the bandwidth term is small; over PCIe it is not', () => {
+    const nvlink = computeSizing(model('dsv3'), gpu('h200'), base) as FeasibleSizing;
+    expect(nvlink.collective_share).toBeGreaterThan(0);
+    expect(nvlink.collective_share).toBeLessThan(0.1);
+    // Same shape of work on a card with no NVLink pays an order of magnitude more per byte.
+    const perByteNvlink = oneWayLinkBytesPerSec(gpu('h200').link_gbs!);
+    const perBytePcie = oneWayLinkBytesPerSec(gpu('rtx4090').link_gbs!);
+    expect(perByteNvlink / perBytePcie).toBeGreaterThan(10);
+  });
+
+  it('AC-70 — a node-spanning replica withholds throughput until the fabric is declared', () => {
+    const wide = { ...base, selected_ctx: 1_048_576, target_concurrency: 8 };
+    const blind = computeSizing(model('glm52'), gpu('h100'), wide) as FeasibleSizing;
+    expect(blind.multi_node).toBe(true);
+    expect(blind.throughput_suppressed).toMatch(/no inter-node fabric bandwidth/);
+    // memory sizing is untouched — only the throughput claim is withheld
+    expect(blind.gpus).toBeGreaterThan(0);
+    expect(blind.ttft_ms).toBeGreaterThan(0);
+
+    // told what the fabric is, it answers — and a slower fabric costs more
+    const fast = computeSizing(model('glm52'), gpu('h100'), { ...wide, fabric_gbs: 100 }) as FeasibleSizing;
+    const slow = computeSizing(model('glm52'), gpu('h100'), { ...wide, fabric_gbs: 25 }) as FeasibleSizing;
+    expect(fast.throughput_suppressed).toBeNull();
+    expect(slow.collective_share).toBeGreaterThan(fast.collective_share);
+    expect(slow.throughput_tokens_per_sec).toBeLessThan(fast.throughput_tokens_per_sec);
+  });
+
+  it('AC-71 — a single-node plan ignores the fabric figure entirely', () => {
+    const a = computeSizing(model('llama33-70b'), gpu('h200'), base) as FeasibleSizing;
+    const b = computeSizing(model('llama33-70b'), gpu('h200'), { ...base, fabric_gbs: 25 }) as FeasibleSizing;
+    expect(a.multi_node).toBe(false);
+    expect(b.collective_sec).toBe(a.collective_sec); // intra-node work rides NVLink, not the fabric
   });
 });
