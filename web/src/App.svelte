@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, topologyLayout, topologySvg, reserveFloorChunk, runtimeSupport, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, GPU_ARCHES, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, topologyLayout, topologySvg, reserveFloorChunk, runtimeSupport, kvScalePolicy, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, GPU_ARCHES, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -112,6 +112,10 @@
   const support = $derived(
     model && gpu ? runtimeSupport(model, gpu, { quant: effQuant, gpus_per_node: perNode }, R?.tp ?? 1) : null,
   );
+
+  // FP8 KV scale provenance — a quality question, not a memory or kernel one, so it is its own
+  // verdict rather than folded into either (§4.3).
+  const kvScales = $derived(model ? kvScalePolicy(model, effQuant, kvBytes) : null);
 
   // what this model's KV would cost if every layer were full-context — the comparison the
   // sliding-window banner quotes, computed exactly rather than scaled from the layer ratio
@@ -237,13 +241,13 @@
   // QUANTS comes from the domain package — a local copy silently went stale and stopped
   // offering the GGUF k-quants after they were added to the engine.
   type Err = { path: string; message: string };
-  type DeployForm = { source: '' | 'checkpoint' | 'online' | 'none'; hf_id: string; method: string };
+  type DeployForm = { source: '' | 'checkpoint' | 'online' | 'none'; hf_id: string; method: string; kv_scale_source: '' | 'checkpoint' | 'calibrated' | 'runtime' | 'none' };
   const deployForm = (d: Model['deployments']): Record<string, DeployForm> =>
-    Object.fromEntries(Object.entries(d ?? {}).map(([q, v]) => [q, { source: v!.source, hf_id: v!.hf_id ?? '', method: v!.method ?? '' }]));
+    Object.fromEntries(Object.entries(d ?? {}).map(([q, v]) => [q, { source: v!.source, hf_id: v!.hf_id ?? '', method: v!.method ?? '', kv_scale_source: v!.kv_scale_source ?? '' }]));
   /** Every selected precision needs a row to bind to, so rows are materialised whenever the
    *  quant set changes rather than lazily during render (bind: needs a real member). */
   function ensureRows<T extends { quants: string[]; deployments: Record<string, DeployForm> }>(f: T): T {
-    for (const q of f.quants) f.deployments[q] ??= { source: '', hf_id: '', method: '' };
+    for (const q of f.quants) f.deployments[q] ??= { source: '', hf_id: '', method: '', kv_scale_source: '' };
     return f;
   }
 
@@ -287,6 +291,7 @@
         source: d.source,
         ...(d.hf_id.trim() ? { hf_id: d.hf_id.trim() } : {}),
         ...(d.source === 'online' && d.method.trim() ? { method: d.method.trim() } : {}),
+        ...(d.kv_scale_source ? { kv_scale_source: d.kv_scale_source } : {}),
       };
     }
     const dep = Object.keys(deployments).length ? { deployments } : {};
@@ -460,6 +465,11 @@
               <div class="sfind">{f.detail}{#if f.alternative}<em class="alt">{f.alternative}</em>{/if}</div>
             {/each}
             <div class="ssrc">Kernel support checked against {support.source.runtime} documentation, snapshot {support.source.docs_snapshot}. Memory feasibility is a separate verdict and is unaffected.</div>
+          </div>
+        {/if}
+        {#if kvScales?.applies && kvScales.level !== 'ok'}
+          <div class="state {kvScales.level === 'warn' ? 'err' : 'warn'}">
+            <b>{kvScales.headline}.</b> {kvScales.detail}{#if kvScales.remedy}<div class="sfind">{kvScales.remedy}</div>{/if}
           </div>
         {/if}
         <div class="kpis">
@@ -799,17 +809,18 @@
       {#if errFor(mfErrors, 'quants')}<div class="ferr">{errFor(mfErrors, 'quants')}</div>{/if}
       {#if mf.quants.length}
         <label style="margin-top:12px">Deployment path per precision</label>
-        <table class="deploy"><thead><tr><th>Precision</th><th>Source</th><th>Artifact <small>(blank = base id)</small></th><th>--quantization</th></tr></thead><tbody>
+        <table class="deploy"><thead><tr><th>Precision</th><th>Source</th><th>Artifact <small>(blank = base id)</small></th><th>--quantization</th><th>KV scales</th></tr></thead><tbody>
           {#each mf.quants as q}
             <tr>
               <td><b>{q}</b></td>
               <td><select bind:value={mf.deployments[q].source}><option value="">— none known —</option><option value="none">native precision</option><option value="checkpoint">pre-quantised checkpoint</option><option value="online">online quantisation</option></select></td>
               <td><input bind:value={mf.deployments[q].hf_id} disabled={mf.deployments[q].source === '' || mf.deployments[q].source === 'none'} placeholder={mf.hf_id || 'owner/name'} /></td>
               <td><input bind:value={mf.deployments[q].method} disabled={mf.deployments[q].source !== 'online'} placeholder={mf.deployments[q].source === 'online' ? 'fp8_per_tensor' : '—'} /></td>
+              <td><select bind:value={mf.deployments[q].kv_scale_source} disabled={mf.deployments[q].source === ''}><option value="">— unknown —</option><option value="none">none (1.0 scales)</option><option value="runtime">warm-up calculated</option><option value="checkpoint">in checkpoint</option><option value="calibrated">dataset-calibrated</option></select></td>
             </tr>
           {/each}
         </tbody></table>
-        <div class="hint">A precision with <b>no known source</b> is sized but cannot be launched: the planner blocks its command and says what is missing, rather than emitting one that quietly serves a different precision. vLLM applies only <code>fp8_per_tensor</code>, <code>fp8_per_block</code> and <code>mxfp8</code> online — every 4-bit format needs a pre-quantised artifact. A <em>checkpoint</em> source must not also pass <code>--quantization</code>; the flag conflicts with the artifact's own metadata.</div>
+        <div class="hint">A precision with <b>no known source</b> is sized but cannot be launched: the planner blocks its command and says what is missing, rather than emitting one that quietly serves a different precision. vLLM applies only <code>fp8_per_tensor</code>, <code>fp8_per_block</code> and <code>mxfp8</code> online — every 4-bit format needs a pre-quantised artifact. A <em>checkpoint</em> source must not also pass <code>--quantization</code>; the flag conflicts with the artifact's own metadata. <b>KV scales</b> records whether the artifact ships <code>k_scale</code>/<code>v_scale</code> tensors — left unknown, a plan using an FP8 KV cache is warned, because vLLM's default with no scales present is to set them all to 1.0.</div>
         {#each mf.quants as q}{#if errFor(mfErrors, `deployments.${q}`)}<div class="ferr">{q}: {errFor(mfErrors, `deployments.${q}`)}</div>{/if}{#if errFor(mfErrors, `deployments.${q}.method`)}<div class="ferr">{q}: {errFor(mfErrors, `deployments.${q}.method`)}</div>{/if}{#if errFor(mfErrors, `deployments.${q}.hf_id`)}<div class="ferr">{q}: {errFor(mfErrors, `deployments.${q}.hf_id`)}</div>{/if}{/each}
       {/if}
       {#if mfErrors.find((e) => e.path === '')}<div class="ferr">{mfErrors.find((e) => e.path === '')?.message}</div>{/if}
@@ -897,6 +908,11 @@
     <div class="formula">KV per session (GiB) = <span class="frac"><span class="fnum">Bytes per token × Active tokens</span><span class="fden">1024³</span></span></div>
     <p>where <em>active tokens = context length × average utilisation</em>. The most sessions one pod can hold is then bounded by the free space from §2:</p>
     <div class="formula">Max pod concurrency = ⌊ <span class="frac"><span class="fnum">Free KV space</span><span class="fden">KV per session</span></span> ⌋</div>
+    <h3 class="dh3">An FP8 KV cache is not free</h3>
+    <p>Halving the KV cache is the single biggest lever on this page, and the planner defaults to it. What the dtype does not settle is where the K and V <b>scaling factors</b> come from — and vLLM's default is explicit: with <code>calculate_kv_scales=False</code> and no scales in the checkpoint, all quantisation scales are set to <b>1.0</b>. A unit scale is not a calibration, it is the absence of one, and nothing fails at launch to tell you.</p>
+    <p>Dataset-calibrated scales (llm-compressor) carry the highest assurance, then scales shipped in the checkpoint, then scales calculated at warm-up from a single batch of random tokens — better than unit scales, and the sample is not your traffic. <b>None</b> means vLLM uses 1.0 and the accuracy cost is unbounded. The memory arithmetic is unaffected in every case: the cache really is half the size. It is the output quality that varies, which is why this is a separate verdict from both memory fit and runtime support.</p>
+    <p class="note"><b>Every artifact in this catalogue is in the "none" row.</b> The safetensors index of all 31 — base repositories and quantised ones alike — was checked for <code>k_scale</code>, <code>v_scale</code> and the older single <code>kv_scale</code> tensor, and not one carries them; the probe was validated against two checkpoints that do. Since the planner defaults to a 1-byte KV cache, that is the <em>default</em> configuration of every model here — which is why the plan says so rather than leaving it to be discovered in an eval.</p>
+
     <h3 class="dh3">Choosing the tensor-parallel size</h3>
     <p>The obvious rule — smallest TP that holds the weights plus one request — <b>over-recommends hardware</b>. A bigger shard leaves proportionally more room for KV and packs far more sessions per replica, and what you pay for is <code>pods × TP</code>, not <code>TP</code>. Llama-3.3-70B at FP8, 128K/60%, 64 concurrent on H200: TP1 needs 16 GPUs, TP2 needs 10, TP4 and TP8 need <b>8</b>.</p>
     <p class="note">The engine evaluates every TP in the model's ladder and takes the cheapest total, breaking ties toward the <em>smaller</em> shard — same GPU count, less collective traffic. That makes this a cost/throughput objective; a latency-oriented planner would bias toward larger shards.</p>

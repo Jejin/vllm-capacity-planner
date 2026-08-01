@@ -139,8 +139,33 @@ const SEED_MODEL_GEOMETRY: Model[] = [
   { id: 'kimi-k3', name: 'Kimi K3 2.8T-A60B (MoE·MLA+KDA)', hf_id: 'moonshotai/Kimi-K3', total_params_b: 2800, active_params_b: 60, layers: 93, kv_heads: 0, head_dim: 0, mla: true, mla_latent_elems: 576, max_ctx: 1048576, tp_options: [8, 16], quants: ['MXFP4'], hidden_size: 7168, intermediate_size: 55296, vocab_size: 163840, tied_embeddings: false, full_attention_layers: 24, linear_attention_layers: 69, linear_state_bytes_per_layer: 6291456, dense_params_b: 20.8 },
 ];
 
+/**
+ * FP8 KV scale provenance, stamped once because the answer is uniform and was measured.
+ *
+ * VERIFIED 2026-08-02: the safetensors index of every artifact named in DEPLOYMENTS — all 31,
+ * base repositories and quantised ones alike — was checked for `k_scale`, `v_scale` and the
+ * older single `kv_scale` tensor. Not one carries them. The probe was validated against two
+ * checkpoints that DO (RedHatAI/Meta-Llama-3-8B-Instruct-FP8-KV; nvidia/Llama-3.1-8B-Instruct-
+ * FP8), so zero means absent rather than spelled differently.
+ *
+ * The consequence is worth stating plainly: this planner defaults to a 1-byte KV cache, so the
+ * DEFAULT plan for every catalogued model runs with vLLM's 1.0 scales unless the operator asks
+ * for something else.
+ *
+ * A variant added later must state its own source — this stamp only fills in entries whose
+ * provenance was actually checked, and `unknown` (the schema default) reads as a warning.
+ */
+function stampVerifiedScales(d: Partial<Record<Quant, DeploymentVariant>>): Partial<Record<Quant, DeploymentVariant>> {
+  return Object.fromEntries(
+    Object.entries(d).map(([q, v]) => [q, { ...v!, kv_scale_source: v!.kv_scale_source ?? 'none' }]),
+  );
+}
+
 /** The catalogue as consumed everywhere: geometry above, deployment paths attached. */
-export const SEED_MODELS: Model[] = SEED_MODEL_GEOMETRY.map((m) => ({ ...m, deployments: DEPLOYMENTS[m.id] ?? {} }));
+export const SEED_MODELS: Model[] = SEED_MODEL_GEOMETRY.map((m) => ({
+  ...m,
+  deployments: stampVerifiedScales(DEPLOYMENTS[m.id] ?? {}),
+}));
 
 // tflops_fp16: DENSE (non-sparse) FP16 tensor throughput, driving the compute-bound TTFT
 // estimate. [VERIFY] against vendor datasheets — like the bandwidths, these are indicative.

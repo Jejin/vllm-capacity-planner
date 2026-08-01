@@ -16,6 +16,7 @@ export const deploymentVariantSchema = z.object({
   hf_id: hfIdSchema.optional(),
   method: z.string().min(1).max(64).optional(),
   revision: z.string().min(1).max(64).optional(),
+  kv_scale_source: z.enum(['checkpoint', 'calibrated', 'runtime', 'none']).optional(),
 });
 
 /**

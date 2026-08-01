@@ -72,7 +72,9 @@ describe('Epic 3 — Catalog curation + RBAC (FR-2/3/4/29)', () => {
     const list = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();
     const l70 = list.models.find((m: any) => m.id === 'llama33-70b');
     expect(l70.hf_id).toBe('meta-llama/Llama-3.3-70B-Instruct');
-    expect(l70.deployments.INT4).toEqual({ source: 'checkpoint', hf_id: 'RedHatAI/Llama-3.3-70B-Instruct-quantized.w4a16' });
+    // kv_scale_source is stamped on the seeded catalogue from a verified probe, so it rides
+    // along with the rest of the deployment and must survive the write too
+    expect(l70.deployments.INT4).toEqual({ source: 'checkpoint', hf_id: 'RedHatAI/Llama-3.3-70B-Instruct-quantized.w4a16', kv_scale_source: 'none' });
     const again = await app.inject({ method: 'PUT', url: '/api/v1/models/llama33-70b', headers: admin, payload: l70 });
     expect(again.statusCode).toBe(200);
     const after = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();

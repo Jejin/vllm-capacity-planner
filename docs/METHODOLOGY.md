@@ -158,6 +158,22 @@ where *active tokens = context length × average utilisation*. The most sessions
 Max pod concurrency = floor( Free KV space / KV per session )
 ```
 
+### An FP8 KV cache is not free
+
+Halving the KV cache is the single biggest lever on this page, and the planner defaults to it. What the dtype does not settle is where the K and V **scaling factors** come from — and vLLM's default is explicit: with `calculate_kv_scales=False` and no scales in the checkpoint, all quantisation scales are set to **1.0**. A unit scale is not a calibration, it is the absence of one, and nothing fails at launch to tell you.
+
+| Scale source | Assurance | What the plan says |
+|---|---|---|
+| Dataset-calibrated (llm-compressor) | highest | scales estimated against a calibration dataset |
+| Shipped in the checkpoint | good | `k_scale`/`v_scale` tensors are present |
+| Calculated at warm-up (`calculate_kv_scales`) | lower | estimated from one batch of random tokens, then fixed — better than unit scales, and the sample is not your traffic |
+| None | **none** | vLLM uses 1.0; the cache is genuinely half the size and the accuracy cost is unbounded |
+| Unrecorded | unknown | nobody has checked, which is warned rather than assumed good |
+
+The memory arithmetic is unaffected in every row — the cache really is half the size. It is the output quality that varies, which is why this is a separate verdict from both memory fit and runtime support.
+
+**Every artifact in this catalogue is in the "none" row.** The safetensors index of all 31 — base repositories and quantised ones alike — was checked for `k_scale`, `v_scale` and the older single `kv_scale` tensor, and not one carries them. The probe was validated against two checkpoints that do. Since the planner defaults to a 1-byte KV cache, that makes it the *default* configuration of every model here, which is exactly why the plan says so rather than leaving it to be discovered in an eval.
+
 ### Choosing the tensor-parallel size
 
 The obvious rule — smallest TP that holds the weights plus one request — **over-recommends hardware.** A bigger shard leaves proportionally more room for KV and so packs far more sessions per replica, and total cost is `pods × TP`, not `TP`.
