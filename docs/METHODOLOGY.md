@@ -316,7 +316,9 @@ Integer bytes rather than floats keep the browser's live verdict and the server'
 
 ## 11. Launch command
 
-Every feasible plan emits the `vllm serve` command implied by its own numbers — TP size, `--max-model-len`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--max-num-batched-tokens` where it differs from default, and `--max-num-seqs`.
+A feasible plan fixes every value a launch needs — TP size, `--max-model-len`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--max-num-batched-tokens` where it differs from default, and `--max-num-seqs` — and the domain package turns them into the `vllm serve` command they imply.
+
+**That command is not currently rendered anywhere in the app.** The generator and its tests ship; no surface displays their output. What follows describes the rules it applies and the catalogue metadata they depend on — metadata that is validated on every write whether or not a command is ever shown.
 
 ### The artifact is not the display name
 

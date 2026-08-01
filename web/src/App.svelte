@@ -947,7 +947,8 @@
     <p class="note">Integer bytes rather than floats keep this browser's live verdict and the server's authoritative one identical at the boundary.</p>
 
     <h2 class="dh">11 · Launch command</h2>
-    <p>Every feasible plan emits the <code>vllm serve</code> command implied by its own numbers. <code>--max-num-seqs</code> is the one worth understanding: it is set to the <b>pod's</b> KV budget, not the deployment target. Left at vLLM's default the scheduler admits more sequences than the cache holds and preempts under load — which presents as a throughput problem and is really a sizing one.</p>
+    <p>A feasible plan fixes every value a launch needs, and the domain package turns them into the <code>vllm serve</code> command they imply. <b>That command is not currently rendered anywhere in this app</b> — the generator and its tests ship, but no surface displays their output. What follows describes the rules it applies and the catalogue metadata they depend on, which is validated on every write whether or not a command is ever shown.</p>
+    <p><code>--max-num-seqs</code> is the value worth understanding: it is set to the <b>pod's</b> KV budget, not the deployment target. Left at vLLM's default the scheduler admits more sequences than the cache holds and preempts under load — which presents as a throughput problem and is really a sizing one.</p>
     <p class="note">The command describes <b>one replica</b>. A plan needing <em>n</em> pods needs <em>n</em> copies behind a load balancer; conflating the two is the classic way to under-provision.</p>
 
     <h3 class="dh3">The artifact is not the display name</h3>
