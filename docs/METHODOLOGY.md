@@ -2,7 +2,7 @@
 
 As LLMs scale, infrastructure planning must move from heuristics to precise modelling. Because autoregressive decoding generates **one token at a time**, serving is inherently **memory-bound** — the bottleneck is memory *bandwidth*, not compute. This is the deterministic model the calculator uses.
 
-Fixed constants: runtime reserve **2.5 GiB**, MBU **0.55**, MLA latent **576**, tight-fit threshold **10%**.
+Fixed constants: runtime reserve **2.5 GiB**, MBU **0.55**, tight-fit threshold **10%**. Everything else is read from the model entry or the GPU SKU — including the MLA latent width, which is checkpoint geometry rather than a planner constant (§3).
 
 All memory is **GiB**; see §7 for why that matters. A flat weight overhead of ×1.02 survives only as a fallback for models with no embedding geometry (§2).
 
@@ -142,7 +142,11 @@ KV cache grows linearly with sequence length and batch size — the real limiter
 Bytes per token = 2 × layers × KV-heads × head-dim × Bytes per element
 ```
 
-The factor 2 covers Key and Value tensors. **MLA** models (DeepSeek, Kimi) compress KV into a latent instead — `layers × 576 × bytes` — materially smaller. Per request:
+The factor 2 covers Key and Value tensors. **MLA** models (DeepSeek, Kimi, GLM-5.2) compress KV into a single latent instead — `layers × latent × bytes` — materially smaller.
+
+That latent width is **the model's own geometry, not a sizing constant**: it is `kv_lora_rank + qk_rope_head_dim` from the checkpoint's `config.json`, belonging to the model in exactly the way `KV-heads × head-dim` belongs to a GQA one. A GQA model has no latent to describe, and an MLA model has no KV-heads — the two branches of the formula read different fields. Model entries carry it as `mla_latent_elems`, populated automatically on Hugging Face import. Every MLA checkpoint in the seed catalogue happens to land on DeepSeek's 512 + 64 = **576** (Kimi and GLM-5.2 inherited the shape), and that figure is the fallback for an MLA entry that does not state its own width — a default for under-specified entries, not a property of MLA.
+
+Per request:
 
 ```
 KV per session (GiB) = (Bytes per token × Active tokens) / 1024³

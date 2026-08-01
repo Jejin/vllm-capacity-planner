@@ -19,6 +19,15 @@ export interface Model {
   max_ctx: number;
   tp_options: number[];
   quants: Quant[];
+  // --- MLA latent geometry (optional; MLA models only) ---
+  // An MLA model caches ONE compressed latent per layer per token instead of a K and a V
+  // tensor, so its per-layer KV width is `kv_lora_rank + qk_rope_head_dim` from config.json.
+  // That is model geometry, not a planner constant: it belongs to the checkpoint the same way
+  // kv_heads x head_dim belongs to a GQA one, and a GQA model has no latent at all.
+  // Every MLA checkpoint currently catalogued happens to use DeepSeek's 512 + 64 = 576 (Kimi
+  // and GLM-5.2 inherited the shape), and DEFAULT_MLA_LATENT_ELEMS is that fallback when a
+  // model declares mla but not its width. Leave unset on GQA models.
+  mla_latent_elems?: number;
   // --- embedding geometry (optional; drives the un-quantised-tail weight term) ---
   // Real checkpoints keep the embedding table and lm_head at 16-bit even when the
   // transformer body is quantised. At INT4/MXFP4 that tail is a double-digit share of

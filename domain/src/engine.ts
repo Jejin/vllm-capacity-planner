@@ -66,7 +66,14 @@ const LOW_PRECISION_SPEEDUP = 2;
 /** Legacy flat overhead factor — used ONLY when a model carries no embedding geometry. */
 export const WEIGHT_OVERHEAD = 1.02;
 export const MBU = 0.55; // model bandwidth utilisation (decode roofline)
-export const MLA_ELEMS_PER_LAYER = 576; // MLA latent size per layer/token
+/**
+ * Fallback MLA latent width, per layer per token, for a model that declares `mla: true` but
+ * carries no `mla_latent_elems`. This is NOT a global sizing constant like MBU or the runtime
+ * reserve — latent width is per-model geometry (`kv_lora_rank + qk_rope_head_dim`), and GQA
+ * models have none at all. 576 is DeepSeek's 512 + 64, which Kimi and GLM-5.2 also ship, so it
+ * is the safe default for an under-specified MLA entry rather than a universal truth.
+ */
+export const DEFAULT_MLA_LATENT_ELEMS = 576;
 export const FP16_BYTES = 2; // the un-quantised tail (embeddings / lm_head) stays 16-bit
 /** A feasible plan with less than this fraction of pod HBM free is reported as "tight". */
 export const TIGHT_HEADROOM = 0.1;
@@ -176,10 +183,19 @@ export function reserveFloorChunk(model: Model, tp = 1): number | null {
   return Math.ceil(((RUNTIME_GB - CUDA_CONTEXT_GB) * GIB) / perToken);
 }
 
+/**
+ * The latent width one MLA layer caches per token — the model's own geometry, falling back to
+ * DeepSeek's 576 when the entry does not state it. Meaningless for a GQA model, which caches
+ * `2 x kv_heads x head_dim` instead; callers should gate on `model.mla`.
+ */
+export function mlaLatentElems(model: Model): number {
+  return model.mla_latent_elems ?? DEFAULT_MLA_LATENT_ELEMS;
+}
+
 /** KV bytes per token for ONE layer — GQA vs MLA (addendum §A). */
 export function kvPerLayerPerTokenBytes(model: Model, kvDtypeBytes: number): number {
   return model.mla
-    ? MLA_ELEMS_PER_LAYER * kvDtypeBytes
+    ? mlaLatentElems(model) * kvDtypeBytes
     : 2 * model.kv_heads * model.head_dim * kvDtypeBytes;
 }
 

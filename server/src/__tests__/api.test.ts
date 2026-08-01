@@ -66,6 +66,25 @@ describe('Epic 3 — Catalog curation + RBAC (FR-2/3/4/29)', () => {
     expect(after.gpus.find((g: any) => g.id === 'h200').tflops_fp16).toBe(h200.tflops_fp16);
   });
 
+  // Same class of bug as the TFLOPS one above: geometry the engine reads must survive a write.
+  it('an MLA model keeps its latent width through a write, and GQA cannot carry one', async () => {
+    const mla = { ...newModel, id: 'test-mla', mla: true, kv_heads: 0, head_dim: 0, mla_latent_elems: 640 };
+    expect((await app.inject({ method: 'POST', url: '/api/v1/models', headers: admin, payload: mla })).statusCode).toBe(201);
+    const list = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();
+    expect(list.models.find((m: any) => m.id === 'test-mla').mla_latent_elems).toBe(640);
+    // a seeded MLA entry round-trips its own figure rather than being reset to the default
+    const dsv3 = list.models.find((m: any) => m.id === 'dsv3');
+    expect(dsv3.mla_latent_elems).toBe(576);
+    const again = await app.inject({ method: 'PUT', url: '/api/v1/models/dsv3', headers: admin, payload: dsv3 });
+    expect(again.statusCode).toBe(200);
+    const after = (await app.inject({ url: '/api/v1/catalog', headers: user })).json();
+    expect(after.models.find((m: any) => m.id === 'dsv3').mla_latent_elems).toBe(576);
+    // and the field is refused on a GQA entry, where nothing would read it
+    const bad = await app.inject({ method: 'POST', url: '/api/v1/models', headers: admin, payload: { ...newModel, id: 'test-gqa-latent', mla_latent_elems: 576 } });
+    expect(bad.statusCode).toBe(422);
+    expect(bad.json().error.fields.some((f: any) => f.path === 'mla_latent_elems')).toBe(true);
+  });
+
   it('rejects a GQA model with kv_heads=0 with field-level message (FR-2 / AD-14)', async () => {
     const r = await app.inject({ method: 'POST', url: '/api/v1/models', headers: admin, payload: { ...newModel, kv_heads: 0 } });
     expect(r.statusCode).toBe(422);

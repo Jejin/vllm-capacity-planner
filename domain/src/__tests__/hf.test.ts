@@ -48,6 +48,40 @@ describe('HF config.json → §F mapping (AD-11)', () => {
     expect(mapped.vocab_size).toBe(154880);
   });
 
+  it('reads the MLA latent width out of the config rather than assuming 576', () => {
+    // kv_lora_rank alone under-counts the cache by the rope dimension that rides beside it
+    const { mapped } = hfConfigToModel('deepseek-ai/DeepSeek-V3', {
+      architectures: ['DeepseekV3ForCausalLM'], model_type: 'deepseek_v3',
+      num_hidden_layers: 61, num_attention_heads: 128, hidden_size: 7168, vocab_size: 129280,
+      kv_lora_rank: 512, qk_rope_head_dim: 64, max_position_embeddings: 131072,
+    });
+    expect(mapped.mla_latent_elems).toBe(576);
+
+    // a hypothetical wider rank must come through as itself, not as DeepSeek's number
+    const { mapped: wide } = hfConfigToModel('acme/WideLatent', {
+      architectures: ['AcmeMlaForCausalLM'], num_hidden_layers: 48, num_attention_heads: 64,
+      hidden_size: 8192, vocab_size: 128000, kv_lora_rank: 1024, qk_rope_head_dim: 128,
+      max_position_embeddings: 131072,
+    });
+    expect(wide.mla_latent_elems).toBe(1152);
+  });
+
+  it('leaves the latent unmapped when either half is missing, and on GQA models', () => {
+    // half the geometry would size the cache short; better to fall back to the documented default
+    const { mapped: half } = hfConfigToModel('acme/HalfConfig', {
+      architectures: ['DeepseekV3ForCausalLM'], num_hidden_layers: 61, num_attention_heads: 128,
+      hidden_size: 7168, vocab_size: 129280, kv_lora_rank: 512, max_position_embeddings: 131072,
+    });
+    expect(half.mla).toBe(true);
+    expect(half.mla_latent_elems).toBeUndefined();
+
+    const { mapped: gqa } = hfConfigToModel('meta-llama/Llama-3.3-70B-Instruct', {
+      num_hidden_layers: 80, num_attention_heads: 64, num_key_value_heads: 8, head_dim: 128,
+      hidden_size: 8192, vocab_size: 128256, max_position_embeddings: 131072,
+    });
+    expect(gqa.mla_latent_elems).toBeUndefined();
+  });
+
   it('does not mistake a plain GQA model for MLA', () => {
     const { detectedMla } = hfConfigToModel('zai-org/GLM-4.5', {
       architectures: ['Glm4MoeForCausalLM'], model_type: 'glm4_moe',

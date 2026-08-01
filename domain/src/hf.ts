@@ -8,13 +8,6 @@ import type { GpuSku, SizingInput, Sizing } from './types.js';
 const MLA_ARCHITECTURES = ['deepseek', 'kimi', 'mla'];
 
 /**
- * Structural MLA detection. Name matching alone misses models whose architecture string
- * doesn't say "mla" — GLM-5.2 ships as `GlmMoeDsaForCausalLM` yet is squarely MLA. The
- * reliable signal is the compressed KV projection: `kv_lora_rank` only exists on MLA models,
- * and `kv_lora_rank + qk_rope_head_dim` is the per-layer latent width (576 for DeepSeek,
- * Kimi and GLM-5.2 alike).
- */
-/**
  * Linear-attention layer count and per-layer state, for hybrid models.
  * Kimi K3 lists both sides explicitly (`full_attn_layers` / `kda_layers`); the recurrent state
  * is one [head_dim x head_dim] matrix per head, held at fp32 for numerical stability.
@@ -54,9 +47,26 @@ export function linearAttention(cfg: HfConfig, layers: number | undefined):
   return null;
 }
 
+/**
+ * Structural MLA detection. Name matching alone misses models whose architecture string
+ * doesn't say "mla" — GLM-5.2 ships as `GlmMoeDsaForCausalLM` yet is squarely MLA. The
+ * reliable signal is the compressed KV projection: `kv_lora_rank` only exists on MLA models.
+ */
 export function detectMla(cfg: HfConfig): boolean {
   const arch = [cfg.model_type ?? '', ...(cfg.architectures ?? [])].join(' ').toLowerCase();
   return MLA_ARCHITECTURES.some((a) => arch.includes(a)) || cfg.kv_lora_rank != null;
+}
+
+/**
+ * Per-layer MLA latent width: the compressed KV projection plus the RoPE positional part that
+ * is cached uncompressed alongside it. Both halves are required — `kv_lora_rank` alone would
+ * under-count the cache by the rope dimension, so a config carrying only one is left unmapped
+ * and falls back to DEFAULT_MLA_LATENT_ELEMS rather than being sized on half its geometry.
+ * DeepSeek, Kimi and GLM-5.2 all land on 512 + 64 = 576; nothing guarantees the next one will.
+ */
+export function mlaLatentWidth(cfg: HfConfig): number | undefined {
+  if (cfg.kv_lora_rank == null || cfg.qk_rope_head_dim == null) return undefined;
+  return cfg.kv_lora_rank + cfg.qk_rope_head_dim;
 }
 
 export interface HfConfig {
@@ -200,6 +210,8 @@ export function hfConfigToModel(id: string, cfg: HfConfig): HfMapResult {
     tied_embeddings: cfg.tie_word_embeddings ?? false,
     // FFN width per token per layer — what the prefill activation reserve shards
     intermediate_size: perTokenFfnWidth(cfg),
+    // latent width per layer — the MLA equivalent of kv_heads x head_dim, and unset on GQA
+    mla_latent_elems: mla ? mlaLatentWidth(cfg) : undefined,
   };
   // local/global attention — only set when the config actually declares a window, since
   // an unset pair means "treat every layer as full-context"
