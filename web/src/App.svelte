@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, serveCommand, topologyLayout, topologySvg, reserveFloorChunk, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, topologyLayout, topologySvg, reserveFloorChunk, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -107,21 +107,6 @@
       : '',
   );
 
-  // launch command for ONE replica of the current plan
-  let cmdDocker = $state(false);
-  let cmdCopied = $state(false);
-  /** Catalogue entries carry display names; only use one as a serve id if it looks like one. */
-  // The artifact comes from the catalogue entry's deployment for the selected precision. It used
-  // to come from regex-testing whether the DISPLAY NAME looked like a repo id, which no seeded
-  // model's name does — so every command served a display name.
-  const serveCmd = $derived(
-    R && model ? serveCommand(model, sizingInput, R, { docker: cmdDocker }) : null,
-  );
-  async function copyCmd() {
-    if (!serveCmd || serveCmd.blocked) return;
-    try { await navigator.clipboard.writeText(serveCmd.command); cmdCopied = true; setTimeout(() => (cmdCopied = false), 1600); }
-    catch { notice = 'Clipboard unavailable — select the command and copy manually.'; }
-  }
   // what this model's KV would cost if every layer were full-context — the comparison the
   // sliding-window banner quotes, computed exactly rather than scaled from the layer ratio
   const kvNominalGb = $derived(
@@ -539,27 +524,6 @@
           <div class="li"><span>Monthly <small>(730 h)</small></span><b>{runHr > 0 ? `${money(runHr * 730)}/mo` : '—'}</b></div>
           <div class="li"><span>Cost per million tokens <small>(at the throughput above)</small></span><b>{perMtok > 0 ? money(perMtok) : '—'}</b></div>
         </div>
-
-        {#if serveCmd}
-          <div class="panel">
-            <h2>Launch command
-              {#if serveCmd.artifact}<small>· {serveCmd.artifact.hf_id} · {serveCmd.artifact.source === 'online' ? `online ${serveCmd.artifact.method}` : serveCmd.artifact.source === 'checkpoint' ? `${effQuant} checkpoint` : 'native precision'}</small>{/if}
-              {#if !serveCmd.blocked}
-                <span style="float:right;display:flex;gap:6px">
-                  <button class="btn ghost" onclick={() => (cmdDocker = !cmdDocker)}>{cmdDocker ? 'plain' : 'docker'}</button>
-                  <button class="btn" onclick={copyCmd}>{cmdCopied ? 'copied' : 'copy'}</button>
-                </span>
-              {/if}
-            </h2>
-            {#if serveCmd.blocked}
-              <div class="state warn"><b>No launch command for this precision.</b> {serveCmd.blocked}</div>
-              <p class="tot">The memory plan above still stands — this is a gap in the <em>deployment</em> path, not the sizing. A command is withheld rather than approximated because one that silently launched a different precision would OOM against arithmetic that was correct for a deployment nobody ran.</p>
-            {:else}
-              <pre class="cmd">{serveCmd.command}</pre>
-              <ul class="cmdnotes">{#each serveCmd.notes as n}<li>{n}</li>{/each}</ul>
-            {/if}
-          </div>
-        {/if}
 
         <div class="panel">
           <h2>Concurrency rubric — pick a target, see the cost &amp; throughput</h2>
@@ -983,7 +947,8 @@
     <p class="note">Integer bytes rather than floats keep this browser's live verdict and the server's authoritative one identical at the boundary.</p>
 
     <h2 class="dh">11 · Launch command</h2>
-    <p>Every feasible plan emits the <code>vllm serve</code> command implied by its own numbers. <code>--max-num-seqs</code> is the one worth understanding: it is set to the <b>pod's</b> KV budget, not the deployment target. Left at vLLM's default the scheduler admits more sequences than the cache holds and preempts under load — which presents as a throughput problem and is really a sizing one.</p>
+    <p>A feasible plan fixes every value a launch needs, and the domain package turns them into the <code>vllm serve</code> command they imply. <b>That command is not currently rendered anywhere in this app</b> — the generator and its tests ship, but no surface displays their output. What follows describes the rules it applies and the catalogue metadata they depend on, which is validated on every write whether or not a command is ever shown.</p>
+    <p><code>--max-num-seqs</code> is the value worth understanding: it is set to the <b>pod's</b> KV budget, not the deployment target. Left at vLLM's default the scheduler admits more sequences than the cache holds and preempts under load — which presents as a throughput problem and is really a sizing one.</p>
     <p class="note">The command describes <b>one replica</b>. A plan needing <em>n</em> pods needs <em>n</em> copies behind a load balancer; conflating the two is the classic way to under-provision.</p>
 
     <h3 class="dh3">The artifact is not the display name</h3>
@@ -1059,9 +1024,6 @@
   .kpi .verdict{font-size:9.5px;color:var(--brandink);margin-top:2px;font-weight:700}.kpi .verdict.t{color:var(--warn)}
   .tightv{color:var(--warn)}
   .hint{font-size:11px;color:var(--ink3);line-height:1.5;margin:-2px 0 10px}
-  .cmd{font-family:'IBM Plex Mono',monospace;font-size:11.5px;line-height:1.6;background:var(--wash);border:1px solid var(--line);border-radius:6px;padding:12px 14px;overflow-x:auto;white-space:pre;margin:0;color:var(--ink)}
-  .cmdnotes{margin:10px 0 0;padding-left:18px;font-size:11.5px;color:var(--ink2);line-height:1.6}
-  .cmdnotes li{margin-bottom:4px}
   .hbm{display:flex;gap:10px;align-items:flex-end;padding:6px 2px 0;overflow-x:auto}
   .gpu{display:flex;flex-direction:column;align-items:center;min-width:52px}
   .stack{width:44px;height:168px;border:1.5px solid var(--ink);border-radius:3px;display:flex;flex-direction:column-reverse;overflow:hidden;background:repeating-linear-gradient(0deg,var(--surface2),var(--surface2) 9px,var(--line2) 9px,var(--line2) 10px)}
