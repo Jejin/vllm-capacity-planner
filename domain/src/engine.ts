@@ -333,13 +333,63 @@ export function weightsGb(model: Model, quant: Quant): number {
   return paramBytesToGib(body, QB[quant]) + paramBytesToGib(tail, FP16_BYTES);
 }
 
-/** GiB streamed from HBM per decode step: active body at `quant` + the 16-bit output head. */
-export function activeWeightsGb(model: Model, quant: Quant): number {
-  if (WHOLE_FILE_QUANTS.has(quant)) return paramBytesToGib(model.active_params_b, QB[quant]);
+/** GiB streamed from HBM for `paramsB` billion parameters: body at `quant` + 16-bit output head. */
+function streamedGb(model: Model, quant: Quant, paramsB: number): number {
+  if (WHOLE_FILE_QUANTS.has(quant)) return paramBytesToGib(paramsB, QB[quant]);
   const head = outputHeadParamsB(model);
-  if (head === 0) return paramBytesToGib(model.active_params_b * WEIGHT_OVERHEAD, QB[quant]);
-  const body = Math.max(0, model.active_params_b - head);
+  if (head === 0) return paramBytesToGib(paramsB * WEIGHT_OVERHEAD, QB[quant]);
+  const body = Math.max(0, paramsB - head);
   return paramBytesToGib(body, QB[quant]) + paramBytesToGib(head, FP16_BYTES);
+}
+
+/** GiB streamed per decode step for ONE token: active body at `quant` + the 16-bit output head. */
+export function activeWeightsGb(model: Model, quant: Quant): number {
+  return streamedGb(model, quant, model.active_params_b);
+}
+
+/**
+ * Fraction of the routed experts a batch touches in one decode step.
+ *
+ * Active parameters describe ONE token's path. A decode step runs a whole batch at once, and
+ * every expert any token in it selects must be read from HBM — so the traffic is set by the
+ * UNION of their choices, not by one token's share. With E experts and top-k routing, a token
+ * misses a given expert with probability (1 - k/E), so a batch of B misses it with (1 - k/E)^B.
+ *
+ * Uniform routing is assumed. Real routers are skewed, which concentrates tokens on fewer
+ * experts and touches FEWER of them — so this is the pessimistic direction, and the honest one
+ * to be wrong in for a capacity plan.
+ */
+export function expertCoverage(model: Model, batchTokens: number): number {
+  const experts = model.num_experts;
+  const perToken = model.experts_per_token;
+  if (!experts || !perToken || batchTokens <= 0) return 1;
+  const miss = Math.max(0, 1 - perToken / experts);
+  return 1 - Math.pow(miss, batchTokens);
+}
+
+/**
+ * Billions of parameters a decode step actually streams at this batch size.
+ *
+ * The dense/routed split is solved from the catalogue's own numbers rather than requiring a new
+ * field: with total T, active A and per-token share f = k/E,
+ *   A = D + f.X  and  T = D + X   =>   X = (T - A)/(1 - f),  D = T - X
+ * At batch 1 this returns exactly `active_params_b`, so a dense model and a single-request plan
+ * are unchanged; as the batch grows it converges on the whole checkpoint.
+ */
+export function decodeReadParamsB(model: Model, batchTokens: number): number {
+  const experts = model.num_experts;
+  const perToken = model.experts_per_token;
+  if (!experts || !perToken) return model.active_params_b; // dense: one token reads it all
+  const share = perToken / experts;
+  if (share >= 1) return model.total_params_b;
+  const routed = (model.total_params_b - model.active_params_b) / (1 - share);
+  const dense = model.total_params_b - routed;
+  return Math.min(model.total_params_b, dense + expertCoverage(model, batchTokens) * routed);
+}
+
+/** GiB streamed from HBM per decode step for a batch of `batchTokens` sequences. */
+export function decodeStreamGb(model: Model, quant: Quant, batchTokens: number): number {
+  return streamedGb(model, quant, decodeReadParamsB(model, batchTokens));
 }
 
 /**
@@ -473,8 +523,13 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     concurrency_per_pod,
     Math.ceil(target_concurrency / pods),
   );
+  // MoE decode reads the UNION of the experts the batch selects, which is far more than one
+  // token's active parameters once the batch is more than a handful of requests. Dense models
+  // and batch-1 plans are unchanged: decodeStreamGb reduces to activeWeightsGb there.
+  const decode_stream_gb = decodeStreamGb(model, quant, active_per_replica);
+  const expert_coverage = expertCoverage(model, active_per_replica);
   const pod_bytes_per_sec = tp * gpu.bw_tbs * TBS_TO_BYTES_PER_SEC * MBU;
-  const step_bytes = (active_gib + active_per_replica * kv_per_request_gb) * GIB;
+  const step_bytes = (decode_stream_gb + active_per_replica * kv_per_request_gb) * GIB;
   const memory_sec = step_bytes / pod_bytes_per_sec;
 
   // Tensor parallelism is not free bandwidth. The old roofline read `tp x HBM bandwidth` and
@@ -543,6 +598,8 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     throughput_suppressed,
     collective_sec,
     collective_share,
+    decode_stream_gb,
+    expert_coverage,
     decode_tps_per_request,
     ttft_ms,
     ttft_compute_bound,

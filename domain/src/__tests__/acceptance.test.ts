@@ -5,7 +5,7 @@
 // and GpuSku.mem_gb. Vectors were re-pinned when the engine stopped mixing 1e9-byte GB (weights)
 // with 2^30-byte GiB (KV, capacity), which had inflated weights ~7.4% against GPU capacity.
 import { describe, it, expect } from 'vitest';
-import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, activationElemsPerToken, collectiveBytesPerStep, oneWayLinkBytesPerSec, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, DEFAULT_INTERMEDIATE_RATIO, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
+import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, activationElemsPerToken, collectiveBytesPerStep, oneWayLinkBytesPerSec, expertCoverage, decodeReadParamsB, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, DEFAULT_INTERMEDIATE_RATIO, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
 import { crossCheckVram } from '../recipes.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema, gpuSkuSchema, HF_ID_RE } from '../schema.js';
@@ -1040,5 +1040,66 @@ describe('tensor-parallel collective cost (§6.3)', () => {
     const b = computeSizing(model('llama33-70b'), gpu('h200'), { ...base, fabric_gbs: 25 }) as FeasibleSizing;
     expect(a.multi_node).toBe(false);
     expect(b.collective_sec).toBe(a.collective_sec); // intra-node work rides NVLink, not the fabric
+  });
+});
+
+describe('MoE decode reads the expert union, not one token’s path (§6.2)', () => {
+  const base = {
+    kv_dtype_bytes: 1, avg_context_utilisation: 0.6, mem_util_fraction: 0.9,
+    quant: 'FP8' as const, selected_ctx: 131072, gpus_per_node: 8,
+  };
+
+  it('AC-72 — every MoE entry declares its routing, and dense entries declare none', () => {
+    for (const m of models) {
+      const moe = m.active_params_b < m.total_params_b * 0.95;
+      if (moe) {
+        expect(m.num_experts, `${m.id} looks MoE but has no num_experts`).toBeGreaterThan(0);
+        expect(m.experts_per_token!).toBeLessThanOrEqual(m.num_experts!);
+      } else {
+        expect(m.num_experts, `${m.id} is dense but declares experts`).toBeUndefined();
+      }
+      expect(modelSchema.safeParse(m).success).toBe(true);
+    }
+  });
+
+  it('AC-73 — coverage is k/E at batch 1 and saturates as the batch grows', () => {
+    const m = model('dsv3'); // 256 experts, top-8
+    expect(expertCoverage(m, 1)).toBeCloseTo(8 / 256, 6);
+    expect(expertCoverage(m, 64)).toBeCloseTo(1 - (1 - 8 / 256) ** 64, 6);
+    expect(expertCoverage(m, 64)).toBeGreaterThan(0.85);
+    expect(expertCoverage(m, 10_000)).toBeCloseTo(1, 6);
+    // dense models have no routing to cover
+    expect(expertCoverage(model('llama33-70b'), 64)).toBe(1);
+  });
+
+  it('AC-74 — at batch 1 the model is exactly what it was before', () => {
+    // The whole change has to be inert for a single request: that is the only regime where
+    // "active parameters" was ever the right answer.
+    for (const m of models) {
+      expect(decodeReadParamsB(m, 1)).toBeCloseTo(m.active_params_b, 6);
+    }
+  });
+
+  it('AC-75 — a batch of 64 on DeepSeek-V3 streams ~16x one token’s parameters', () => {
+    const m = model('dsv3'); // 671 B total, 37 B active
+    const read = decodeReadParamsB(m, 64);
+    // solved split: X = (671-37)/(1-8/256) = 654.4 routed, D = 16.6 dense+shared — which lands
+    // within a whisker of GLM-5.2's independently declared 16.5 B dense block
+    expect(read).toBeGreaterThan(560);
+    expect(read).toBeLessThan(620);
+    expect(read / m.active_params_b).toBeGreaterThan(15);
+    // and it can never exceed the checkpoint
+    expect(decodeReadParamsB(m, 1e6)).toBeLessThanOrEqual(m.total_params_b);
+  });
+
+  it('AC-76 — modelling it cuts reported MoE throughput several-fold; dense is untouched', () => {
+    const moe = computeSizing(model('dsv3'), gpu('h200'), { ...base, target_concurrency: 64 }) as FeasibleSizing;
+    expect(moe.expert_coverage).toBeGreaterThan(0.8);
+    expect(moe.decode_stream_gb).toBeGreaterThan(10 * activeWeightsGb(model('dsv3'), 'FP8'));
+
+    // a dense model streams its active weights whatever the batch, so nothing moved for it
+    const dense = computeSizing(model('llama33-70b'), gpu('h200'), { ...base, target_concurrency: 64 }) as FeasibleSizing;
+    expect(dense.expert_coverage).toBe(1);
+    expect(dense.decode_stream_gb).toBeCloseTo(activeWeightsGb(model('llama33-70b'), 'FP8'), 6);
   });
 });
