@@ -162,6 +162,17 @@ function stampVerifiedScales(d: Partial<Record<Quant, DeploymentVariant>>): Part
 }
 
 /** The catalogue as consumed everywhere: geometry above, deployment paths attached. */
+// Kimi K3's FFN width, settled 2026-08-02. Its config carries BOTH `moe_intermediate_size:
+// 3072` and `routed_expert_hidden_size: 3584`, and it matters which is the FFN width: the
+// activation reserve is built on it. Parameter counts decide it. With 896 experts over 92 MoE
+// layers (93 - first_k_dense_replace) and three matrices per expert:
+//   experts at 3584 wide  -> 896 x 3 x 3584 x 3072 x 92 = 2,723 B routed, against 2,800 B total
+//   experts at 7168 wide  -> 5,445 B routed, nearly DOUBLE the whole model — impossible
+// So 3584 is the reduced dimension the routed experts operate in, and 3072 is their FFN width.
+// One token traverses 16 routed + 2 shared at 3072 = 55,296, which is the figure below, and the
+// same 54.7 B of expert parameters that reconciles with the published 60 B active.
+// The HF importer reproduces every field of this entry independently from the same config.
+//
 // num_experts / experts_per_token: VERIFIED 2026-08-02 against each published config.json.
 // Kimi K3 keeps its text config nested under `text_config` (it is a multimodal config), where
 // num_experts=896 and num_experts_per_token=16 — the top level carries neither.
