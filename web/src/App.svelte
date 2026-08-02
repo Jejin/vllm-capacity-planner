@@ -584,7 +584,7 @@
               </tr>
             {/each}
           </tbody></table>
-          <p class="tot">Per-request decode rate falls as concurrency rises (more requests share the pod's bandwidth); total throughput and GPU count rise. Throughput ±40%, TTFT ±50% — indicative, validate against benchmarks.</p>
+          <p class="tot">Per-request decode rate falls as concurrency rises (more requests share the pod's bandwidth); total throughput and GPU count rise. Throughput ±40%, TTFT ±50% where given — indicative, validate against benchmarks. A <code>—</code> means the figure is withheld, not zero.</p>
         </div>
 
         {#if fleetCheck()}
@@ -954,9 +954,11 @@
 
     <h2 class="dh">4 · Decode roofline throughput</h2>
     <p>For every token generated, the weights and active KV cache must be read from memory to the compute cores — so generation speed is bounded by achievable memory bandwidth (with a Memory-Bandwidth-Utilisation penalty, here 55%).</p>
-    <div class="formula">Data read per step = Weight memory + (Active sequences × KV per session)</div>
-    <div class="formula">Aggregate throughput (tok/s) = <span class="frac"><span class="fnum">Effective pod bandwidth</span><span class="fden">Data read per step</span></span> × Active sequences</div>
-    <p class="note">Effective pod bandwidth = TP size × per-GPU bandwidth × MBU. The calculator also reports <b>time-to-first-token</b> (an indicative prefill estimate) and <b>per-request</b> tokens/s. For MoE models, only the <em>active</em> parameters are read per step.</p>
+    <div class="formula">Data read per step = Weights streamed + (Active sequences × KV per session)</div>
+    <div class="formula">Step time = <span class="frac"><span class="fnum">Data read per step</span><span class="fden">Effective pod bandwidth</span></span> + <span class="frac"><span class="fnum">all-reduce bytes</span><span class="fden">link GB/s ÷ 2</span></span></div>
+    <div class="formula">Aggregate throughput (tok/s) = <span class="frac"><span class="fnum">Active sequences</span><span class="fden">Step time</span></span> × replicas</div>
+    <p class="note">Effective pod bandwidth = TP size × per-GPU bandwidth × MBU. The <b>collective</b> term is the half the roofline originally left out — <code>TP × bandwidth</code> alone assumes the per-layer all-reduce is instantaneous (§3). <b>Weights streamed</b> is not total weights (only the output head streams every step), and for an MoE model it is not the <em>active</em> parameters either — a step reads every expert the batch touches, which is the section below.</p>
+    <p class="note"><b>Neither figure is always reported.</b> Throughput and TTFT read <code>—</code> when a replica spans nodes with no declared fabric, or when the precision has no native kernel on the card (§6). Memory sizing is unaffected in both cases — it is only the compute-derived numbers that stop describing the deployment being planned.</p>
 
     <h3 class="dh3">MoE decode reads the expert union, not one token's path</h3>
     <p><code>active_params</code> describes the path <b>one token</b> takes. A decode step runs a whole batch at once, and every expert <em>any</em> token in it selects has to be read out of HBM — so traffic follows the <b>union</b> of their choices. With E routed experts and top-k routing, coverage is <code>1 − (1 − k/E)^B</code> for a batch of B, and the streamed weight is <code>dense + coverage × routed</code>.</p>
@@ -977,9 +979,11 @@
       <div class="step"><div class="sh">2 · Weights &amp; free cache</div>Tail = 2×128,256×8,192 = 2.10 B @ fp16<br>(68.5 + 4.2) × 10⁹ B ÷ 2³⁰ ≈ <b>67.7 GiB</b><br>Free KV = 248.8 − 67.7 = <b>181.1 GiB</b></div>
       <div class="step"><div class="sh">3 · KV per session</div>Per token = 2×80×8×128×1 = 163,840 B (0.156 MiB)<br>Active = 131,072 × 0.60 = 78,643 tok<br>Session KV ≈ <b>12.0 GiB</b></div>
       <div class="step"><div class="sh">4 · Concurrency</div>⌊181.1 ÷ 12.0⌋ = <b>15 sessions/pod</b><br>15 ≥ 10 target → <b>1 pod (2 GPUs)</b></div>
-      <div class="step"><div class="sh">5 · Throughput</div>Data/step ≈ (66.7 + 10×12) × 2³⁰ ≈ 201×10⁹ B<br>Bandwidth = 2×4.8×10¹² × 0.55 ≈ 5.28×10¹² B/s<br>≈ 38.1 ms/step → <b>≈ 262 tok/s</b></div>
+      <div class="step"><div class="sh">5 · Throughput</div>Data/step ≈ (66.7 + 10×12) × 2³⁰ ≈ 201×10⁹ B<br>Bandwidth = 2×4.8×10¹² × 0.55 ≈ 5.28×10¹² B/s<br>38.0 ms memory + 0.06 ms collective → <b>≈ 263 tok/s</b></div>
       <div class="step"><div class="sh">6 · Headroom</div>(248.8 − 67.7 − 12.0) ÷ 248.8 = <b>68%</b><br>68% ≥ 10% → <b>fits, not tight</b></div>
     </div>
+
+    <p class="note">The collective is <b>0.2% of the step</b> here, and that is the point rather than a footnote: at TP2 with a batch of 10 the all-reduce is nothing, while the same model at TP16 across nodes cannot be quoted at all. One roofline, two very different regimes — which is why the term is computed rather than assumed either way.</p>
 
     <h2 class="dh">6 · Fits · tight · infeasible</h2>
     <p>A plan is <b>infeasible</b> when weights plus <em>one</em> request's KV can't fit even at the largest permitted TP size. Between that and a comfortable fit sits a band worth naming:</p>
@@ -999,13 +1003,13 @@
 
     <h2 class="dh">8 · Concurrency rubric</h2>
     <p>The rubric re-runs the <b>entire</b> sizing at each target concurrency — it is not a scaling of one result. TP selection depends on the target, so the cheapest shard width at 1 session is rarely the cheapest at 256. A row can change TP, pods and the tight verdict all at once, which a linear extrapolation would hide.</p>
-    <p class="note">Per-request decode rate falls as concurrency rises (more sessions share the pod's bandwidth) while aggregate throughput and GPU count rise.</p>
+    <p class="note">Per-request decode rate falls as concurrency rises (more sessions share the pod's bandwidth) while aggregate throughput and GPU count rise. Rows whose TTFT or throughput is withheld show <code>—</code> in those columns and a GPU count in the rest — a row can be perfectly sized and still decline to quote a speed.</p>
 
     <h2 class="dh">9 · Cost model</h2>
     <p>Rental-rate arithmetic on an admin-set <code>$/GPU-hour</code> per SKU. Nothing is amortised; power, networking and storage are out of scope.</p>
     <div class="formula">Run rate ($/hr) = Σ<sub>SKU</sub> ( committed GPUs × $/GPU-hour ) · month = ×730 · year = ×8760</div>
     <div class="formula">$ per million tokens = <span class="frac"><span class="fnum">GPUs × $/GPU-hour × 1,000,000</span><span class="fden">tokens/sec × 3600</span></span></div>
-    <p class="note">The per-million figure inherits the throughput estimate's ±40% band — a comparison tool between configurations, not a budget line. A config that halves GPU count but also halves throughput costs the same per token.</p>
+    <p class="note">The per-million figure inherits the throughput estimate's ±40% band — a comparison tool between configurations, not a budget line. A config that halves GPU count but also halves throughput costs the same per token. <b>It is withheld whenever throughput is:</b> dividing by a number the page refuses to show would reintroduce it through the back door. Run rate and monthly figures are unaffected — they depend on GPU count and rental rate, neither of which is in doubt.</p>
     <p class="note">The same arithmetic runs on a single deployment, so the sizing view reports its own run rate, monthly figure and cost per million tokens without waiting for the plan to be added to a cluster.</p>
 
     <h2 class="dh">10 · Fleet reconciliation and the capacity gate</h2>
@@ -1033,6 +1037,8 @@
       <tr><td>recipes.vllm.ai</td><td>parameter counts, context length, shipped quantisations, TP sizes</td></tr>
     </tbody></table>
     <p class="note">The second set is precisely what a <code>config.json</code> never carries. A recipe has no authority over geometry and is not allowed to set it. Recipes also publish a <code>vram_minimum_gb</code> per variant, shown beside our own estimate on import — their floor covers weights + KV + overhead, so a ratio near <b>0.85</b> is healthy and above 1.00 means one of the two is wrong.</p>
+    <p class="note">Two further sources turn a memory estimate into a deployment: <b>the artifact itself</b> (which repository carries each precision, and whether it ships K/V scales) and <b>vendor + vLLM documentation</b> (GPU architecture, link bandwidth, which kernels exist where). None of it is inferred from naming — repository ids were resolved against the Hugging Face API, <code>quantization_config</code> read to confirm which base repos are natively quantised, K/V scale provenance checked in each safetensors index, and the kernel matrix cites vLLM's own docs with the date they were read.</p>
+    <p class="note"><b>Multimodal configs nest their language model.</b> <code>KimiK3ForConditionalGeneration</code> carries a vision tower at the top level and everything sizing cares about under <code>text_config</code>. Read from the top level the importer mapped six fields out of a dozen and still reported partial success — a form that looks mostly filled in is worse than one that obviously failed. It now unwraps <code>text_config</code> (or <code>llm_config</code>), but only when that block carries <code>num_hidden_layers</code>, so a vision tower with its own <code>hidden_size</code> is not mistaken for the model.</p>
 
     <h2 class="dh">Frequently asked</h2>
     <div class="faq">
