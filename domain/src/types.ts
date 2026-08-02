@@ -214,6 +214,10 @@ export interface FeasibleSizing {
   decode_stream_gb: number;
   /** Fraction of routed experts the batch touches. 1 for dense models. */
   expert_coverage: number;
+  /** Seconds of the TTFT spent in the prefill all-reduce (bandwidth term). */
+  prefill_collective_sec: number;
+  /** Set when TTFT must not be shown — a node-spanning replica with no declared fabric. */
+  ttft_suppressed: string | null;
   /** Seconds per decode step spent in the tensor-parallel all-reduce (bandwidth term only). */
   collective_sec: number;
   /** That collective time as a fraction of the whole step. */

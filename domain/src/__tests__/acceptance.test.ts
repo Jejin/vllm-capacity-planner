@@ -5,7 +5,7 @@
 // and GpuSku.mem_gb. Vectors were re-pinned when the engine stopped mixing 1e9-byte GB (weights)
 // with 2^30-byte GiB (KV, capacity), which had inflated weights ~7.4% against GPU capacity.
 import { describe, it, expect } from 'vitest';
-import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, activationElemsPerToken, collectiveBytesPerStep, oneWayLinkBytesPerSec, expertCoverage, decodeReadParamsB, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, DEFAULT_INTERMEDIATE_RATIO, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
+import { computeSizing, weightsGb, activeWeightsGb, unquantisedParamsB, paramBytesToGib, kvPerTokenBytes, kvPerRequestBytes, layerSplit, runtimeReserveGib, reserveFloorChunk, activationElemsPerToken, collectiveBytes, oneWayLinkBytesPerSec, expertCoverage, decodeReadParamsB, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, DEFAULT_INTERMEDIATE_RATIO, prefillFlops, GIB, QB, FP16_BYTES, TIGHT_HEADROOM, WEIGHT_OVERHEAD, RUNTIME_GB, DEFAULT_BATCHED_TOKENS } from '../engine.js';
 import { crossCheckVram } from '../recipes.js';
 import { seedCatalog } from '../seed.js';
 import { modelSchema, gpuSkuSchema, HF_ID_RE } from '../schema.js';
@@ -267,14 +267,46 @@ describe('§C time to first token (prefill)', () => {
     const g = { ...gpu('h200'), tflops_fp16: undefined };
     const r = computeSizing(model('llama33-70b'), g, base) as FeasibleSizing;
     expect(r.ttft_compute_bound).toBe(false);
-    expect(r.ttft_ms).toBeLessThan(100); // the old, wrong answer — but now flagged as a floor
+    // The floor is weight-streaming PLUS the prefill all-reduce: the collective happens whether
+    // or not we know the card's FLOPS, so it is not part of what the flag is hedging.
+    expect(r.ttft_ms).toBeGreaterThan(r.prefill_collective_sec * 1000);
+    expect(r.ttft_ms - r.prefill_collective_sec * 1000).toBeLessThan(100); // the streaming term alone
   });
 
-  it('AC-57 — more GPUs prefill proportionally faster', () => {
-    const narrow = computeSizing({ ...model('llama33-70b'), tp_options: [2] }, gpu('h200'), base) as FeasibleSizing;
-    const wide = computeSizing({ ...model('llama33-70b'), tp_options: [8] }, gpu('h200'), base) as FeasibleSizing;
-    expect(wide.ttft_ms).toBeLessThan(narrow.ttft_ms);
-    expect(narrow.ttft_ms / wide.ttft_ms).toBeCloseTo(4, 0); // TP2 -> TP8
+  it('AC-57 — more GPUs prefill faster, but SUB-linearly: the collective grows with TP', () => {
+    // This vector used to assert exactly 4x from TP2 to TP8, which was the ideal-scaling
+    // assumption rather than a measurement. Compute does divide by TP; the all-reduce does not.
+    // The ring factor 2(N-1)/N rises 1.00 -> 1.75 across that range, so the collective term
+    // grows from 458 ms to 802 ms even as the compute term falls, and 4x becomes ~3.5x.
+    const at = (tp: number) => computeSizing({ ...model('llama33-70b'), tp_options: [tp] }, gpu('h200'), base) as FeasibleSizing;
+    const narrow = at(2), wide = at(8);
+    expect(wide.ttft_ms).toBeLessThan(narrow.ttft_ms); // wider is still faster
+    const ratio = narrow.ttft_ms / wide.ttft_ms;
+    expect(ratio).toBeGreaterThan(3);
+    expect(ratio).toBeLessThan(4); // strictly short of ideal, and that gap IS the collective
+    expect(wide.prefill_collective_sec).toBeGreaterThan(narrow.prefill_collective_sec);
+  });
+
+  it('AC-77 — TTFT is withheld across nodes for the same reason throughput is', () => {
+    const wide = {
+      quant: 'FP8' as const, kv_dtype_bytes: 1, selected_ctx: 1_048_576, avg_context_utilisation: 0.6,
+      target_concurrency: 8, mem_util_fraction: 0.9, gpus_per_node: 8,
+    };
+    const blind = computeSizing(model('glm52'), gpu('h100'), wide) as FeasibleSizing;
+    expect(blind.multi_node).toBe(true);
+    expect(blind.ttft_suppressed).toMatch(/Prefill all-reduces on every layer/);
+    expect(blind.throughput_suppressed).toBeTruthy(); // both, or the page contradicts itself
+
+    // told the fabric, both come back — and prefill dominates: 2.26 TB of all-reduce at 50 GB/s
+    // is 90 s, against a 64 s TTFT that had been leaving it out entirely
+    const told = computeSizing(model('glm52'), gpu('h100'), { ...wide, fabric_gbs: 50 }) as FeasibleSizing;
+    expect(told.ttft_suppressed).toBeNull();
+    expect(told.prefill_collective_sec).toBeGreaterThan(60);
+    expect(told.ttft_ms / 1000).toBeGreaterThan(told.prefill_collective_sec);
+
+    // a single-node plan is unaffected by the fabric figure
+    const oneNode = computeSizing(model('llama33-70b'), gpu('h200'), { ...wide, selected_ctx: 131072 }) as FeasibleSizing;
+    expect(oneNode.ttft_suppressed).toBeNull();
   });
 });
 
@@ -994,12 +1026,12 @@ describe('tensor-parallel collective cost (§6.3)', () => {
 
   it('AC-67 — the all-reduce volume follows the ring formula, and vanishes at TP1', () => {
     const m = model('llama33-70b'); // 80 layers, hidden 8192
-    expect(collectiveBytesPerStep(m, 1, 32)).toBe(0); // nothing to reduce on one rank
+    expect(collectiveBytes(m, 1, 32)).toBe(0); // nothing to reduce on one rank
     // 2 all-reduces/layer x 2(N-1)/N x batch x hidden x 2 bytes
     const tp4 = 80 * 2 * ((2 * 3) / 4) * 32 * 8192 * 2;
-    expect(collectiveBytesPerStep(m, 4, 32)).toBeCloseTo(tp4, 0);
+    expect(collectiveBytes(m, 4, 32)).toBeCloseTo(tp4, 0);
     // wider TP moves more per rank, but sub-linearly: 2(N-1)/N saturates at 2
-    const ratio = collectiveBytesPerStep(m, 8, 32) / collectiveBytesPerStep(m, 4, 32);
+    const ratio = collectiveBytes(m, 8, 32) / collectiveBytes(m, 4, 32);
     expect(ratio).toBeCloseTo((2 * 7) / 8 / ((2 * 3) / 4), 3);
     expect(ratio).toBeLessThan(2);
   });
