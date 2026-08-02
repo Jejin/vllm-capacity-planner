@@ -69,6 +69,89 @@ function checkNumbering(headings, label, errors) {
   });
 }
 
+/**
+ * Values the prose quotes that the ENGINE owns. Headings matching is not enough: every stale
+ * block this check ever missed sat under a heading that matched perfectly. If a constant moves
+ * in the engine and the prose still quotes the old number, that is drift the reader cannot see.
+ *
+ * Each entry finds the constant's NAME in the prose and requires its current value to appear
+ * near it. Deliberately fuzzy about phrasing — the two surfaces word things differently — and
+ * strict about the number.
+ */
+/**
+ * Read the constants out of the engine SOURCE, not its build.
+ *
+ * The first version imported `domain/dist`, passed locally against a stale build, and failed in
+ * CI where nothing had run `tsc` — vitest reads `src`. A docs lint that only works after a
+ * build is a docs lint that runs in the wrong places, so this parses the declarations directly
+ * and has no ordering dependency at all.
+ */
+function engineConstants() {
+  const src = readFileSync(join(root, 'domain/src/engine.ts'), 'utf8');
+  const out = {};
+  const re = /^export const ([A-Z][A-Z0-9_]*)\s*(?::\s*[^=]+)?=\s*([\d.]+);/gm;
+  let m;
+  while ((m = re.exec(src)) !== null) out[m[1]] = Number(m[2]);
+  return out;
+}
+const K = engineConstants();
+for (const need of ['RUNTIME_GB', 'CUDA_CONTEXT_GB', 'MBU', 'PREFILL_MFU', 'TIGHT_HEADROOM', 'DEFAULT_MLA_LATENT_ELEMS', 'DEFAULT_BATCHED_TOKENS', 'ALL_REDUCES_PER_LAYER']) {
+  if (K[need] === undefined) {
+    console.error(`methodology-parity: could not read ${need} from domain/src/engine.ts — did the declaration style change?`);
+    process.exit(1);
+  }
+}
+
+const CONSTANTS = [
+  { name: /runtime reserve/gi, value: String(K.RUNTIME_GB), label: 'RUNTIME_GB' },
+  { name: /CUDA context/gi, value: String(K.CUDA_CONTEXT_GB), label: 'CUDA_CONTEXT_GB' },
+  { name: /\bMBU\b/g, value: String(K.MBU), label: 'MBU' },
+  { name: /prefill MFU/gi, value: String(K.PREFILL_MFU), label: 'PREFILL_MFU' },
+  { name: /tight-fit threshold/gi, value: `${K.TIGHT_HEADROOM * 100}%`, label: 'TIGHT_HEADROOM' },
+  { name: /512 \+ 64/g, value: String(K.DEFAULT_MLA_LATENT_ELEMS), label: 'DEFAULT_MLA_LATENT_ELEMS' },
+  { name: /vLLM's own default chunk|vLLM's default chunk/gi, value: String(K.DEFAULT_BATCHED_TOKENS), label: 'DEFAULT_BATCHED_TOKENS' },
+  { name: /all-reduces? (?:on|per|twice per) (?:every |each )?layer/gi, value: String(K.ALL_REDUCES_PER_LAYER), label: 'ALL_REDUCES_PER_LAYER', valueAliases: ['two', 'twice'] },
+];
+const WINDOW = 220;
+
+/**
+ * Claims that were true once and are not any more.
+ *
+ * The MoE contradiction is why this exists: "for MoE models only the active parameters are
+ * read" sat directly above the section explaining that a decode step reads the whole expert
+ * union, and every heading-based check passed. A retired claim is cheap to record at the moment
+ * it stops being true, and impossible to notice six sections away.
+ */
+const RETIRED = [
+  { re: /only the (?:<em>)?active(?:<\/em>)? parameters are read/i, why: 'MoE decode reads the expert union at batch > 1 (§4)' },
+  { re: /falls back to the catalogue (?:model )?name/i, why: 'the launch command refuses to serve a display name (§11)' },
+  { re: /MLA latent \*?\*?576/i, why: 'MLA latent width is per-model geometry, not a fixed constant (§3)' },
+  { re: /TTFT (?:are|is) unaffected/i, why: 'prefill all-reduces too, so TTFT is withheld across nodes with throughput (§3)' },
+  { re: /the throughput and TTFT figures here are optimistic/i, why: 'those figures are withheld on a fallback kernel, not shown as optimistic (§6)' },
+];
+
+function checkProse(src, label, errors) {
+  for (const c of CONSTANTS) {
+    c.name.lastIndex = 0;
+    const windows = [];
+    let m;
+    while ((m = c.name.exec(src)) !== null) {
+      windows.push(src.slice(Math.max(0, m.index - WINDOW), m.index + WINDOW));
+    }
+    if (windows.length === 0) continue; // the prose does not mention it; not this check's business
+    const wanted = [c.value, ...(c.valueAliases ?? [])];
+    if (!windows.some((w) => wanted.some((v) => w.includes(v)))) {
+      errors.push(
+        `${label}: mentions ${c.label} but never its current value "${c.value}" nearby — ` +
+        'the engine moved and the prose did not',
+      );
+    }
+  }
+  for (const r of RETIRED) {
+    if (r.re.test(src)) errors.push(`${label}: retired claim still present — ${r.why}`);
+  }
+}
+
 const doc = docHeadings(readFileSync(join(root, DOC), 'utf8'));
 const app = appHeadings(readFileSync(join(root, APP), 'utf8'));
 const errors = [];
@@ -105,11 +188,26 @@ for (let i = 0; i < Math.min(docOrder.length, appOrder.length); i++) {
 checkNumbering(doc, DOC, errors);
 checkNumbering(app, APP, errors);
 
+checkProse(readFileSync(join(root, DOC), 'utf8'), DOC, errors);
+// Only the Methodology tab's markup — a `<script>` comment mentioning a constant is not a
+// claim to the reader, and the first run of this check tripped on exactly that.
+const appSrc = readFileSync(join(root, APP), 'utf8');
+const tabStart = appSrc.indexOf("tab === 'methodology'");
+if (tabStart < 0) {
+  errors.push(`${APP}: could not locate the methodology tab — did the markup change?`);
+} else {
+  checkProse(appSrc.slice(tabStart), `${APP} (methodology tab)`, errors);
+}
+
 if (errors.length) {
   console.error('Methodology parity check FAILED:\n');
   for (const e of errors) console.error(`  • ${e}`);
-  console.error(`\n${DOC} and the in-app Methodology tab must document the same sections in the same order.`);
+  console.error(`\n${DOC} and the in-app Methodology tab must document the same sections in the same order,`);
+  console.error('and must not quote constants the engine has moved or claims it has retired.');
   process.exit(1);
 }
 
-console.log(`Methodology parity OK — ${doc.length} headings in ${DOC}, ${app.length} in the app tab, same order.`);
+console.log(
+  `Methodology parity OK — ${doc.length} headings in ${DOC}, ${app.length} in the app tab, same order; ` +
+  `${CONSTANTS.length} engine constants and ${RETIRED.length} retired claims checked in both.`,
+);
