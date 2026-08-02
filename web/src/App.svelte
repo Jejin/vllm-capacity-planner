@@ -43,7 +43,18 @@
   // asks for >8192 for throughput, and throughput is what this planner sizes for. Starting here
   // makes the emitted serve command carry the flag explicitly rather than imply 2048.
   let batchTokens = $state(8192);
-  let fabricGbs = $state('' as number | ''); // --max-num-batched-tokens; drives the activation reserve
+  let fabricGbs = $state('' as number | '');
+  // Workload shape (§7). All four are needed before the split means anything, so a partial
+  // entry falls back to context utilisation rather than half-applying.
+  let wP50 = $state('' as number | ''), wP95 = $state('' as number | '');
+  let oP50 = $state('' as number | ''), oP95 = $state('' as number | '');
+  const workload = $derived(
+    wP50 !== '' && wP95 !== '' && +wP95 >= +wP50
+      ? { prompt_p50: +wP50, prompt_p95: +wP95, output_p50: +(oP50 || 0), output_p95: +(oP95 || 0) }
+      : undefined,
+  );
+  // Sustained duty cycle: a plan that serves eight hours a day does not cost 730 hours a month.
+  let duty = $state(1); // --max-num-batched-tokens; drives the activation reserve
   const model = $derived<Model>(catalog.models.find((m: Model) => m.id === modelId) ?? catalog.models[0]);
   const gpu = $derived<GpuSku>(catalog.gpus.find((g: GpuSku) => g.id === gpuId) ?? catalog.gpus[0]);
   const ctxChoices = $derived(CTXS.filter((c) => c <= (model?.max_ctx ?? 0)));
@@ -57,6 +68,7 @@
     max_num_batched_tokens: batchTokens,
     fabric_gbs: fabricGbs !== '' ? +fabricGbs : undefined,
   measured: parsedProfile.profile ?? undefined,
+  workload,
   });
   const result = $derived(computeSizing(model, gpu, sizingInput));
   const R = $derived(result.ok ? (result as FeasibleSizing) : null);
@@ -67,11 +79,15 @@
   const rate = $derived(gpu?.price_per_gpu_hour ?? 0);
   const runHr = $derived(R && rate > 0 ? R.gpus * rate : 0);
   /** $ per million output tokens — the figure that compares plans across SKUs, not just GPUs. */
+  const dutyHrsMo = $derived(730 * duty);
   const perMtok = $derived(
     R && runHr > 0 && !R.throughput_suppressed && R.throughput_tokens_per_sec > 0
       ? (runHr * 1e6) / (R.throughput_tokens_per_sec * 3600)
       : 0,
   );
+  // The per-token figure divides by a throughput carrying a ±40% band, so it is a range rather
+  // than a point — a slower real throughput costs MORE per token, hence the inverted divisors.
+  const perMtokRange = $derived(perMtok > 0 ? { lo: perMtok / 1.4, hi: perMtok / 0.6 } : null);
   /** TTFT spans milliseconds to tens of seconds; show whichever unit is readable. */
   const ttftLabel = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
 
@@ -461,6 +477,11 @@
         <label>GPU SKU<select bind:value={gpuId}>{#each catalog.gpus as g}<option value={g.id}>{g.name}</option>{/each}</select></label></div>
       <div class="row"><label>GPU mem-util<input type="number" min="0.1" max="1" step="0.05" bind:value={memUtil} /></label>
         <label>GPUs / node<input type="number" bind:value={perNode} /></label></div>
+      <div class="row"><label>Prompt P50<small> (tokens)</small><input type="number" min="1" step="100" bind:value={wP50} placeholder="use context util" /></label>
+        <label>Prompt P95<small> (tokens)</small><input type="number" min="1" step="100" bind:value={wP95} placeholder="use context util" /></label></div>
+      <div class="row"><label>Output P50<small> (tokens)</small><input type="number" min="0" step="50" bind:value={oP50} /></label>
+        <label>Output P95<small> (tokens)</small><input type="number" min="0" step="50" bind:value={oP95} /></label></div>
+      {#if workload}<div class="hint">KV is sized at <b>P95</b> ({(workload.prompt_p95 + workload.output_p95).toLocaleString()} tokens — the cache must hold the long requests) and TTFT is timed at <b>P50</b> ({workload.prompt_p50.toLocaleString()} tokens — latency should describe the typical one). Leave the prompt fields blank to size both from context utilisation instead.</div>{/if}
       <div class="row"><label>Fabric GB/s<small> (per GPU, inter-node)</small><input type="number" min="1" step="1" bind:value={fabricGbs} placeholder="only used when a replica spans nodes" /></label></div>
       <div class="row"><label>Prefill chunk<small> (--max-num-batched-tokens)</small><input type="number" min="256" step="256" bind:value={batchTokens} /></label>
         <label>Runtime reserve<small> (derived)</small><input type="text" value={R ? `${R.runtime_reserve_gb.toFixed(2)} GiB` : '—'} disabled /></label></div>
@@ -562,7 +583,7 @@
           <h2>Breakdown</h2>
           <div class="li"><span>Weights ({effQuant})</span><b>{fmt(R.weights_gb)} GiB</b></div>
           <div class="li"><span>KV per token ({kvBytes === 1 ? 'FP8' : 'FP16'}{#if R.kv_windowed}, effective{/if})</span><b>{(R.kv_per_token_gb * 1024).toFixed(3)} MiB</b></div>
-          <div class="li"><span>KV per request ({ctx / 1024}K × {Math.round(util * 100)}%)</span><b>{fmt(R.kv_per_request_gb)} GiB</b></div>
+          <div class="li"><span>KV per request <small>({workload ? `P95 · ${R.kv_tokens.toLocaleString()} tokens` : `${ctx / 1024}K × ${Math.round(util * 100)}%`})</small></span><b>{fmt(R.kv_per_request_gb)} GiB</b></div>
           <div class="li"><span>Concurrency per pod</span><b>{R.concurrency_per_pod} req</b></div>
           <div class="li"><span>Pods → GPUs → nodes ({perNode}/node)</span><b>{R.pods} → {R.gpus} → {R.nodes}</b></div>
           <div class="li"><span>Runtime reserve / GPU <small>(context {R.runtime_reserve_gb > 2.5 ? '+ prefill activations' : ''})</small></span><b>{fmt(R.runtime_reserve_gb, 2)} GiB{#if R.activation_gb > 0.05}<small> · {fmt(R.activation_gb, 2)} act</small>{/if}</b></div>
@@ -570,14 +591,16 @@
           <div class="li"><span>Pod headroom <small>(free after weights + 1 request)</small></span><b class:tightv={R.tight}>{(R.headroom_fraction * 100).toFixed(1)}%</b></div>
           <div class="li"><span>Time to first token <small>({R.ttft_compute_bound ? 'compute-bound prefill' : 'bandwidth floor'})</small></span><b>{R.ttft_suppressed ? '—' : `~${ttftLabel(R.ttft_ms)}`} <small>{R.ttft_suppressed ? 'withheld' : '±50%'}</small></b></div>
           {#if R.tp > 1 && !R.ttft_suppressed}<div class="li"><span>Prefill all-reduce <small>(same collective, whole prompt)</small></span><b>{R.prefill_collective_sec > 0 ? `${R.prefill_collective_sec.toFixed(2)} s · ${((R.prefill_collective_sec * 1000 / R.ttft_ms) * 100).toFixed(0)}% of TTFT` : '—'}</b></div>{/if}
-          <div class="li"><span>Prefill work <small>({Math.round(ctx * util).toLocaleString()} tokens)</small></span><b>{R.prefill_pflops.toFixed(2)} PFLOP</b></div>
+          <div class="li"><span>Prefill work <small>({R.prefill_tokens.toLocaleString()} tokens{workload ? ' · P50' : ''})</small></span><b>{R.prefill_pflops.toFixed(2)} PFLOP</b></div>
           <div class="li"><span>Decode throughput / request</span><b>{R.throughput_suppressed ? '—' : `~${R.decode_tps_per_request} tok/s`}</b></div>
           {#if model?.num_experts}<div class="li"><span>Expert coverage <small>(union touched by the batch)</small></span><b>{(R.expert_coverage * 100).toFixed(0)}% of {model.num_experts} · streams {fmt(R.decode_stream_gb)} GiB <small>vs {fmt(activeWeightsGb(model, effQuant))} active</small></b></div>{/if}
           <div class="li"><span>Aggregate throughput</span><b>{R.throughput_suppressed ? '—' : `~${R.throughput_tokens_per_sec.toLocaleString()} tok/s`} <small>{R.throughput_suppressed ? 'withheld' : '±40%'}</small></b></div>
           {#if R.tp > 1}<div class="li"><span>TP all-reduce <small>(bandwidth term, per decode step)</small></span><b>{R.collective_sec > 0 ? `${(R.collective_sec * 1000).toFixed(2)} ms · ${(R.collective_share * 100).toFixed(1)}% of step` : '—'}</b></div>{/if}
           <div class="li"><span>Run rate <small>({R.gpus} × {money(rate)}/GPU-hr)</small></span><b>{runHr > 0 ? `${money(runHr)}/hr` : '—'}</b></div>
-          <div class="li"><span>Monthly <small>(730 h)</small></span><b>{runHr > 0 ? `${money(runHr * 730)}/mo` : '—'}</b></div>
-          <div class="li"><span>Cost per million tokens <small>(at the throughput above)</small></span><b>{perMtok > 0 ? money(perMtok) : '—'}</b></div>
+          <div class="li"><span>Monthly <small>({dutyHrsMo.toFixed(0)} h at {(duty * 100).toFixed(0)}% duty)</small></span><b>{runHr > 0 ? `${money(runHr * dutyHrsMo)}/mo` : '—'}</b></div>
+          <div class="li"><span>Cost per million tokens <small>(range from the ±40% throughput band)</small></span><b>{perMtokRange ? `${money(perMtokRange.lo)} – ${money(perMtokRange.hi)}` : '—'}</b></div>
+          <div class="li"><span>Sustained duty cycle <small>(fraction of the month actually serving)</small></span><b><input class="duty" type="number" min="0.01" max="1" step="0.05" bind:value={duty} /></b></div>
+          <div class="li"><span>Not included <small>(GPU rental only)</small></span><b class="excl">host · storage · network · load balancer · orchestration · observability · N+1 redundancy</b></div>
         </div>
 
         <div class="panel">
@@ -977,6 +1000,11 @@
     <p>Three rules make that safe. <b>The estimate is preserved and the variance shown</b> — the panel says whether the heuristic was conservative or optimistic and by how much, which is the only way anyone finds out this model is wrong for their hardware. <b>The two are never blended</b>: an average of a measurement and a guess is neither, and hides which one moved. <b>A profile from a different shape is refused, not scaled</b> — a measurement at TP8 says nothing about TP2, one on an H100 says nothing about an H200, and one claiming more KV than the device has is not from the same run.</p>
     <p class="note"><b>What a profile does not do is calibrate speed.</b> It measures memory. Throughput and TTFT still come from the roofline, so importing one does not promote them out of the <code>estimated</code> tier — reaching <code>measured</code> there needs a benchmark, which is a different artifact than this one.</p>
 
+    <h3 class="dh3">Workload shape: one figure cannot do two jobs</h3>
+    <p><code>avg_context_utilisation</code> is asked to serve two questions that pull in opposite directions. <b>Memory must cover the long requests</b> or the server OOMs on the tail; <b>latency should describe the typical one</b> or every number reads like a worst case. A single average splits the difference and is wrong for both.</p>
+    <p>Given a measured distribution they separate: KV per request is sized at <b>prompt P95 + output P95</b>, and TTFT is timed at <b>prompt P50</b>. A workload with a long tail and a short median — 2K typical, 120K at P95 — reports <em>more</em> memory per session and a <em>faster</em> first token than the flat assumption, which is the shape real traffic usually has. The single-figure form stays the default, so nothing re-sizes for anyone who has not measured their traffic.</p>
+    <p class="note"><b>Not modelled:</b> arrival rate, queueing and percentile SLOs — those need a queueing model rather than a roofline, and this tool sizes a steady-state batch rather than predicting P95 latency under load. Prefix-cache hit rate is likewise absent; it would raise real throughput, which is one of the named assumptions behind the figure (§4).</p>
+
     <h3 class="dh3">Choosing the tensor-parallel size</h3>
     <p>The obvious rule — smallest TP that holds the weights plus one request — <b>over-recommends hardware</b>. A bigger shard leaves proportionally more room for KV and packs far more sessions per replica, and what you pay for is <code>pods × TP</code>, not <code>TP</code>. Llama-3.3-70B at FP8, 128K/60%, 64 concurrent on H200: TP1 needs 16 GPUs, TP2 needs 10, TP4 and TP8 need <b>8</b>.</p>
     <p class="note">The engine evaluates every TP in the model's ladder and takes the cheapest total, breaking ties toward the <em>smaller</em> shard — same GPU count, less collective traffic. That makes this a cost/throughput objective; a latency-oriented planner would bias toward larger shards.</p>
@@ -1063,6 +1091,7 @@
     <p>Rental-rate arithmetic on an admin-set <code>$/GPU-hour</code> per SKU. Nothing is amortised; power, networking and storage are out of scope.</p>
     <div class="formula">Run rate ($/hr) = Σ<sub>SKU</sub> ( committed GPUs × $/GPU-hour ) · month = ×730 · year = ×8760</div>
     <div class="formula">$ per million tokens = <span class="frac"><span class="fnum">GPUs × $/GPU-hour × 1,000,000</span><span class="fden">tokens/sec × 3600</span></span></div>
+    <p class="note"><b>Duty cycle</b> is the fraction of the month the plan actually serves — a deployment running eight hours a day does not cost 730 hours. It defaults to 1 because continuous is the conservative reading, not because it is the common one. <b>What the rental rate excludes</b>, stated rather than assumed: host CPU and RAM, storage, network egress, load balancers, orchestration, observability, and any N+1 redundancy. This is GPU rental arithmetic and nothing else.</p>
     <p class="note">The per-million figure inherits the throughput estimate's ±40% band — a comparison tool between configurations, not a budget line. A config that halves GPU count but also halves throughput costs the same per token. <b>It is withheld whenever throughput is:</b> dividing by a number the page refuses to show would reintroduce it through the back door. Run rate and monthly figures are unaffected — they depend on GPU count and rental rate, neither of which is in doubt.</p>
     <p class="note">The same arithmetic runs on a single deployment, so the sizing view reports its own run rate, monthly figure and cost per million tokens without waiting for the plan to be added to a cluster.</p>
 
@@ -1150,6 +1179,8 @@
   .vb.degraded i,.vb.warnv i,.vb.unverified i{background:var(--warn)}
   .vb.unsupported i{background:var(--err)}
   .vb.unverified{border-style:dashed}
+  .duty{width:80px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12px;padding:2px 6px}
+  .excl{font-weight:400;font-size:11px;color:var(--ink3);max-width:52%;text-align:right;line-height:1.5}
   .prof{width:100%;font-family:'IBM Plex Mono',monospace;font-size:11px;line-height:1.5;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);resize:vertical}
   .state.ok{background:var(--wash);border-color:var(--brand);color:var(--brandink)}
   .assum{margin:14px 0 4px;font-size:12px;display:flex;align-items:center;gap:8px}
