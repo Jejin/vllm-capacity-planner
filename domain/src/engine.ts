@@ -436,7 +436,15 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   } = input;
 
   const weights_gb = weightsGb(model, quant);
-  const active_tokens = selected_ctx * avg_context_utilisation;
+  // Workload shape (§7). One "average utilisation" figure has to serve two jobs it cannot both
+  // do: memory must cover the LONG requests or the server OOMs, while latency should describe
+  // the TYPICAL one or every number reads like a worst case. Given a distribution the two
+  // separate — KV is sized at P95 and prefill is timed at P50 — and the single-figure form is
+  // kept as the default so nothing re-sizes for callers who have not measured their traffic.
+  const w = input.workload;
+  const kv_tokens = w ? w.prompt_p95 + w.output_p95 : selected_ctx * avg_context_utilisation;
+  const prefill_tokens = w ? w.prompt_p50 : selected_ctx * avg_context_utilisation;
+  const active_tokens = kv_tokens;
   const kv_per_request_gb = kvPerRequestBytes(model, kv_dtype_bytes, active_tokens) / GIB;
   // Reported per-token rate is the EFFECTIVE average, so kv_per_token × active_tokens always
   // reconciles with kv_per_request. For an all-full-attention model it equals the nominal rate;
@@ -589,7 +597,7 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   // before emitting a token. Sizing it as "stream the weights once" — the decode bound — under-
   // states a 78k-token prefill by three orders of magnitude. The weight-streaming time survives
   // only as a floor, for the short prompts where it genuinely dominates.
-  const prefill_flops = prefillFlops(model, active_tokens);
+  const prefill_flops = prefillFlops(model, prefill_tokens);
   const weight_stream_sec = (active_gib * GIB) / pod_bytes_per_sec;
   let ttft_sec = weight_stream_sec;
   let ttft_compute_bound = false;
@@ -605,7 +613,7 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   // assumed the same collective was free was the inconsistency this closes: at a realistic
   // 50 GB/s the prefill collective for a 1M-context TP16 plan exceeds the entire TTFT it was
   // being left out of.
-  const prefill_collective_bytes = collectiveBytes(model, tp, active_tokens);
+  const prefill_collective_bytes = collectiveBytes(model, tp, prefill_tokens);
   const prefill_collective_sec = prefill_collective_bytes > 0 && link_gbs
     ? prefill_collective_bytes / oneWayLinkBytesPerSec(link_gbs)
     : 0;
@@ -626,6 +634,8 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     usable_gb,
     free_gb: effective_free_gb,
     measured,
+    kv_tokens,
+    prefill_tokens,
     concurrency_per_pod,
     pods,
     gpus,
