@@ -1,3 +1,5 @@
+import type { MeasuredProfile, MeasuredReconciliation } from './measured.js';
+export type { MeasuredProfile, MeasuredReconciliation } from './measured.js';
 // Canonical domain types — addendum §F field names (AD-13). No framework imports (AD-1).
 
 // GPU-served formats first, then the GGUF family (llama.cpp / Ollama; vLLM's GGUF support is
@@ -175,6 +177,12 @@ export interface SizingInput {
    * not been told about. A modern Blackwell node budgets roughly 100 GB/s per GPU.
    */
   fabric_gbs?: number;
+  /**
+   * A vLLM startup profile for this exact shape. Where it applies, its KV figure REPLACES the
+   * estimate rather than adjusting it (§5.1) — see `measured` on the result for the estimate it
+   * displaced and by how much.
+   */
+  measured?: MeasuredProfile;
 }
 
 export interface FeasibleSizing {
@@ -210,6 +218,8 @@ export interface FeasibleSizing {
    * the least supportable.
    */
   throughput_suppressed: string | null;
+  /** Whether a measured profile displaced the KV estimate, and by how much. */
+  measured: MeasuredReconciliation;
   /** GiB of weights actually streamed per decode step at this batch size (MoE: the expert union). */
   decode_stream_gb: number;
   /** Fraction of routed experts the batch touches. 1 for dense models. */

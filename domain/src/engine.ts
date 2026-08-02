@@ -12,6 +12,7 @@
 //   roofline converts memory to bytes rather than mixing the two scales.
 
 import { isNonNativeKernel } from './compat.js';
+import { reconcileMeasured } from './measured.js';
 import type {
   Model,
   GpuSku,
@@ -508,7 +509,13 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     };
   }
 
-  const concurrency_per_pod = Math.max(1, Math.floor(free_gb / kv_per_request_gb));
+  // A measured profile replaces the estimate outright where it applies — it is a measurement of
+  // the thing the estimate approximates (§5.1). The estimate is preserved on the result and the
+  // variance reported; the two are never averaged, because an average of a measurement and a
+  // guess is neither and hides which one moved.
+  const measured = reconcileMeasured(input.measured, gpu, tp, free_gb);
+  const effective_free_gb = measured.status === 'applied' ? measured.measured_free_gb! : free_gb;
+  const concurrency_per_pod = Math.max(1, Math.floor(effective_free_gb / kv_per_request_gb));
   const pods = Math.ceil(Math.max(1, target_concurrency) / concurrency_per_pod);
   const gpus = pods * tp;
   const nodes = Math.ceil(gpus / gpus_per_node);
@@ -617,7 +624,8 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     kv_per_token_gb,
     kv_per_request_gb,
     usable_gb,
-    free_gb,
+    free_gb: effective_free_gb,
+    measured,
     concurrency_per_pod,
     pods,
     gpus,
