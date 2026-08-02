@@ -445,6 +445,24 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   const kv_tokens = w ? w.prompt_p95 + w.output_p95 : selected_ctx * avg_context_utilisation;
   const prefill_tokens = w ? w.prompt_p50 : selected_ctx * avg_context_utilisation;
   const active_tokens = kv_tokens;
+
+  // A P95 request longer than the served context is not a big plan, it is an impossible one:
+  // `selected_ctx` becomes --max-model-len, and vLLM rejects anything past it at request time.
+  // Without this the planner sized a 5M-token workload on a 128K model into 512 GPUs and
+  // reported it as feasible. The single-figure path cannot trip this (utilisation is <= 1), so
+  // the guard exists precisely for the distribution the workload form introduced.
+  if (kv_tokens > selected_ctx) {
+    return {
+      ok: false,
+      reason:
+        `The P95 request is ${Math.round(kv_tokens).toLocaleString()} tokens (prompt + output), longer than the ` +
+        `${selected_ctx.toLocaleString()}-token context this plan serves. vLLM would reject those requests rather ` +
+        `than run them, so sizing for them describes a deployment that cannot exist — raise max context ` +
+        `${selected_ctx < model.max_ctx ? `(this model supports ${model.max_ctx.toLocaleString()})` : 'beyond what this model supports, which it cannot'}, or size against a shorter P95.`,
+      weights_gb: weightsGb(model, quant),
+      kv_per_request_gb: kvPerRequestBytes(model, kv_dtype_bytes, kv_tokens) / GIB,
+    };
+  }
   const kv_per_request_gb = kvPerRequestBytes(model, kv_dtype_bytes, active_tokens) / GIB;
   // Reported per-token rate is the EFFECTIVE average, so kv_per_token × active_tokens always
   // reconciles with kv_per_request. For an all-full-attention model it equals the nominal rate;
