@@ -190,6 +190,21 @@ Three rules make that safe:
 
 **What a profile does not do is calibrate speed.** It measures memory. Throughput and TTFT still come from the roofline, and a startup profile says nothing about tokens per second — which is why importing one does not promote the performance figures out of the `estimated` tier (§4, *What a figure rests on*). Reaching `measured` there needs a benchmark, which is a different artifact than this one.
 
+### Workload shape: one figure cannot do two jobs
+
+`avg_context_utilisation` is asked to serve two questions that pull in opposite directions. **Memory must cover the long requests** or the server OOMs on the tail; **latency should describe the typical one** or every number reads like a worst case. A single average splits the difference and is wrong for both.
+
+Given a measured distribution the two separate:
+
+```
+KV per request  sized at   prompt P95 + output P95      (the cache holds the tail)
+TTFT            timed at   prompt P50                    (the typical first token)
+```
+
+A workload with a long tail and a short median — 2K typical prompt, 120K at P95 — therefore reports *more* memory per session and a *faster* first token than the flat assumption, which is the shape real traffic usually has. The single-figure form stays the default, so nothing re-sizes for anyone who has not measured their traffic.
+
+**Not modelled:** arrival rate, queueing and percentile SLOs. Those need a queueing model rather than a roofline, and the honest position is that this tool sizes a steady-state batch rather than predicting P95 latency under load. Prefix-cache hit rate is likewise absent — it would raise real throughput, which is one of the named assumptions behind the figure (§4).
+
 ### Choosing the tensor-parallel size
 
 The obvious rule — smallest TP that holds the weights plus one request — **over-recommends hardware.** A bigger shard leaves proportionally more room for KV and so packs far more sessions per replica, and total cost is `pods × TP`, not `TP`.
@@ -426,10 +441,16 @@ Costs are rental-rate arithmetic on an admin-set `$/GPU-hour` per SKU. Nothing i
 
 ```
 Run rate ($/hr) = Σ over SKUs ( committed GPUs × $/GPU-hour )
-$/month  = $/hr × 730          $/year = $/hr × 8760
+$/month  = $/hr × 730 × duty cycle        $/year = $/hr × 8760 × duty cycle
 
 $ per million tokens = ( GPUs × $/GPU-hour × 1,000,000 ) / ( tokens/sec × 3600 )
 ```
+
+**Duty cycle** is the fraction of the month the plan actually serves. A deployment running eight hours a day does not cost 730 hours, and a reserved-capacity plan that idles overnight is a different budget from one that does not. It defaults to 1 — continuous — because that is the conservative reading, not because it is the common one.
+
+**The per-token figure is a range, not a point.** It divides by a throughput carrying a ±40% band, so it is reported as a span. A slower real throughput costs *more* per token, which is why the range is wider on the expensive side.
+
+**What the rental rate excludes**, stated rather than assumed: host CPU and RAM, storage, network egress, load balancers, orchestration, observability, and any N+1 redundancy. This is GPU rental arithmetic and nothing else.
 
 The per-million-token figure inherits the throughput estimate's ±40% band, so treat it as a comparison tool between configurations rather than a budget line. A configuration that halves GPU count but also halves throughput costs the same per token.
 

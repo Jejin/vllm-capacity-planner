@@ -190,6 +190,12 @@ export const sizingInputSchema = z.object({
   mem_util_fraction: z.number().gt(0).max(1),
   gpus_per_node: z.number().int().positive(),
   fabric_gbs: z.number().positive().optional(),
+  workload: z.object({
+    prompt_p50: z.number().positive(),
+    prompt_p95: z.number().positive(),
+    output_p50: z.number().nonnegative(),
+    output_p95: z.number().nonnegative(),
+  }).optional(),
 });
 
 export const catalogSchema = z.object({

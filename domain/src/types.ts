@@ -178,6 +178,18 @@ export interface SizingInput {
    */
   fabric_gbs?: number;
   /**
+   * Measured traffic shape, in tokens. Supplying it separates two questions a single
+   * "average utilisation" figure cannot answer at once: memory is sized at P95 (the cache has
+   * to hold the long requests) and prefill is timed at P50 (latency should describe the typical
+   * one). Absent, `avg_context_utilisation` drives both, as before.
+   */
+  workload?: {
+    prompt_p50: number;
+    prompt_p95: number;
+    output_p50: number;
+    output_p95: number;
+  };
+  /**
    * A vLLM startup profile for this exact shape. Where it applies, its KV figure REPLACES the
    * estimate rather than adjusting it (§5.1) — see `measured` on the result for the estimate it
    * displaced and by how much.
@@ -218,6 +230,10 @@ export interface FeasibleSizing {
    * the least supportable.
    */
   throughput_suppressed: string | null;
+  /** Tokens the KV cache is sized to hold per request (P95 when a workload is given). */
+  kv_tokens: number;
+  /** Tokens the TTFT figure describes prefilling (P50 when a workload is given). */
+  prefill_tokens: number;
   /** Whether a measured profile displaced the KV estimate, and by how much. */
   measured: MeasuredReconciliation;
   /** GiB of weights actually streamed per decode step at this batch size (MoE: the expert union). */
