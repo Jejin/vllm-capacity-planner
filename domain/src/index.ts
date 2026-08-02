@@ -10,5 +10,6 @@ export * from './serve.js';
 export * from './compat.js';
 export * from './kvscale.js';
 export * from './confidence.js';
+export * from './measured.js';
 export * from './topology.js';
 export * from './reconcile.js';

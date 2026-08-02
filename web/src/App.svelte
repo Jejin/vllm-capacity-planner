@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, activeWeightsGb, topologyLayout, topologySvg, reserveFloorChunk, runtimeSupport, kvScalePolicy, throughputConfidence, ttftConfidence, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, GPU_ARCHES, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, activeWeightsGb, topologyLayout, topologySvg, reserveFloorChunk, runtimeSupport, kvScalePolicy, throughputConfidence, ttftConfidence, parseProfile, varianceLabel, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, GPU_ARCHES, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -56,6 +56,7 @@
     avg_context_utilisation: util, target_concurrency: conc, mem_util_fraction: memUtil, gpus_per_node: perNode,
     max_num_batched_tokens: batchTokens,
     fabric_gbs: fabricGbs !== '' ? +fabricGbs : undefined,
+  measured: parsedProfile.profile ?? undefined,
   });
   const result = $derived(computeSizing(model, gpu, sizingInput));
   const R = $derived(result.ok ? (result as FeasibleSizing) : null);
@@ -114,6 +115,10 @@
   const support = $derived(
     model && gpu ? runtimeSupport(model, gpu, { quant: effQuant, gpus_per_node: perNode }, R?.tp ?? 1) : null,
   );
+
+  // Measured vLLM profile (§5.1) — pasted, parsed, and authoritative for KV where it matches.
+  let profileText = $state('');
+  const parsedProfile = $derived(parseProfile(profileText));
 
   // Per-plan confidence: which assumptions this configuration actually rests on, and which way
   // each one biases the figure. Not a static caption (§6.1).
@@ -492,7 +497,7 @@
           <div class="kpi" class:tight={R.tight}><div class="v">{R.gpus}</div><div class="l">GPUs</div><div class="verdict" class:t={R.tight}>{R.tight ? `Tight · ${(R.headroom_fraction * 100).toFixed(1)}% free` : `Fits · ${(R.headroom_fraction * 100).toFixed(0)}% free`}</div></div>
           <div class="kpi n"><div class="v">{R.nodes}<small> × {perNode} GPU</small></div><div class="l">Nodes</div>{#if R.multi_node}<div class="cav">a replica spans nodes</div>{/if}</div>
           <div class="kpi p"><div class="v">{R.pods}<small> × TP{R.tp}</small></div><div class="l">Pods</div></div>
-          <div class="kpi a"><div class="v">{fmt(kvAlloc)}<small> GiB</small></div><div class="l">KV cache</div></div>
+          <div class="kpi a"><div class="v">{fmt(kvAlloc)}<small> GiB</small></div><div class="l">KV cache</div>{#if R.measured.status === 'applied'}<div class="cav" style="color:var(--ok,#5a9e2f)">measured · vLLM profile</div>{/if}</div>
           <div class="kpi g"><div class="v">{R.throughput_suppressed ? '—' : `~${R.throughput_tokens_per_sec.toLocaleString()}`}</div><div class="l">Tokens/s</div><div class="cav">{R.throughput_suppressed ? 'withheld · see below' : `${tpConf?.band} · ${tpConf?.tier} · ${tpConf?.assumptions.length} assumptions`}</div></div>
           <div class="kpi t"><div class="v">{R.ttft_suppressed ? '—' : ttftLabel(R.ttft_ms)}</div><div class="l">Time to first token</div><div class="cav">{R.ttft_suppressed ? 'withheld · see below' : `${ttConf?.band} · ${R.ttft_compute_bound ? 'compute-bound' : 'bandwidth floor'}`}</div></div>
           <div class="kpi c"><div class="v">{runHr > 0 ? money(runHr) : '—'}<small>/hr</small></div><div class="l">Run rate</div>{#if runHr > 0}<div class="note">{money(runHr * 730)}/mo · {money(rate)}/GPU-hr</div>{/if}</div>
@@ -573,6 +578,22 @@
           <div class="li"><span>Run rate <small>({R.gpus} × {money(rate)}/GPU-hr)</small></span><b>{runHr > 0 ? `${money(runHr)}/hr` : '—'}</b></div>
           <div class="li"><span>Monthly <small>(730 h)</small></span><b>{runHr > 0 ? `${money(runHr * 730)}/mo` : '—'}</b></div>
           <div class="li"><span>Cost per million tokens <small>(at the throughput above)</small></span><b>{perMtok > 0 ? money(perMtok) : '—'}</b></div>
+        </div>
+
+        <div class="panel">
+          <h2>Measured vLLM profile <small>· optional · replaces the KV estimate</small></h2>
+          <p class="tot">Everything above is a heuristic standing in for a number vLLM already knows. Paste its startup log — or a profile object — and the measured KV capacity becomes authoritative for concurrency. The estimate is kept beside it and the difference shown; the two are never averaged.</p>
+          <textarea class="prof" rows="3" bind:value={profileText} placeholder="INFO ... gpu_worker.py] Available KV cache memory: 45.67 GiB"></textarea>
+          {#if parsedProfile.error}
+            <div class="state warn"><b>Could not read that.</b> {parsedProfile.error}</div>
+          {:else if R.measured.status === 'mismatch'}
+            <div class="state warn"><b>Profile does not describe this plan.</b> {R.measured.reason} Nothing has been applied — a measurement of another shape is not conservative or optimistic, it is unrelated.</div>
+          {:else if R.measured.status === 'applied'}
+            <!-- green means "the estimate held", not merely "the paste parsed": an estimate that
+                 was optimistic means the plan had claimed concurrency the hardware does not have -->
+            <div class="state {(R.measured.variance ?? 0) < -0.1 ? 'err' : (R.measured.variance ?? 0) > 0.1 ? 'warn' : 'ok'}"><b>Measured KV capacity applied.</b> {fmt(R.measured.measured_free_gb ?? 0)} GiB per replica, against an estimated {fmt(R.measured.estimated_free_gb)} GiB — {varianceLabel(R.measured)}. Concurrency, pods and GPU count above follow the measurement.</div>
+          {/if}
+          <p class="tot">This calibrates <b>memory</b>. Throughput and TTFT still come from the roofline — a startup profile says nothing about tokens per second, and treating it as though it did would be the overclaim this panel exists to avoid.</p>
         </div>
 
         {#if tpConf && ttConf && (tpConf.assumptions.length || ttConf.assumptions.length)}
@@ -951,6 +972,11 @@
     <p>Dataset-calibrated scales (llm-compressor) carry the highest assurance, then scales shipped in the checkpoint, then scales calculated at warm-up from a single batch of random tokens — better than unit scales, and the sample is not your traffic. <b>None</b> means vLLM uses 1.0 and the accuracy cost is unbounded. The memory arithmetic is unaffected in every case: the cache really is half the size. It is the output quality that varies, which is why this is a separate verdict from both memory fit and runtime support.</p>
     <p class="note"><b>Every artifact in this catalogue is in the "none" row.</b> The safetensors index of all 31 — base repositories and quantised ones alike — was checked for <code>k_scale</code>, <code>v_scale</code> and the older single <code>kv_scale</code> tensor, and not one carries them; the probe was validated against two checkpoints that do. Since the planner defaults to a 1-byte KV cache, that is the <em>default</em> configuration of every model here — which is why the plan says so rather than leaving it to be discovered in an eval.</p>
 
+    <h3 class="dh3">Measured mode: when vLLM has already answered</h3>
+    <p>Everything above is a heuristic standing in for a number the runtime already knows. vLLM profiles itself at startup and reports exactly how much KV cache it ended up with, so where that figure exists, estimating it is a choice rather than a necessity. Paste the startup log — <code>Available KV cache memory: N GiB</code> — or a profile object, and <b>the measured figure becomes authoritative for concurrency</b>. Pods, GPU count and cost follow from it.</p>
+    <p>Three rules make that safe. <b>The estimate is preserved and the variance shown</b> — the panel says whether the heuristic was conservative or optimistic and by how much, which is the only way anyone finds out this model is wrong for their hardware. <b>The two are never blended</b>: an average of a measurement and a guess is neither, and hides which one moved. <b>A profile from a different shape is refused, not scaled</b> — a measurement at TP8 says nothing about TP2, one on an H100 says nothing about an H200, and one claiming more KV than the device has is not from the same run.</p>
+    <p class="note"><b>What a profile does not do is calibrate speed.</b> It measures memory. Throughput and TTFT still come from the roofline, so importing one does not promote them out of the <code>estimated</code> tier — reaching <code>measured</code> there needs a benchmark, which is a different artifact than this one.</p>
+
     <h3 class="dh3">Choosing the tensor-parallel size</h3>
     <p>The obvious rule — smallest TP that holds the weights plus one request — <b>over-recommends hardware</b>. A bigger shard leaves proportionally more room for KV and packs far more sessions per replica, and what you pay for is <code>pods × TP</code>, not <code>TP</code>. Llama-3.3-70B at FP8, 128K/60%, 64 concurrent on H200: TP1 needs 16 GPUs, TP2 needs 10, TP4 and TP8 need <b>8</b>.</p>
     <p class="note">The engine evaluates every TP in the model's ladder and takes the cheapest total, breaking ties toward the <em>smaller</em> shard — same GPU count, less collective traffic. That makes this a cost/throughput objective; a latency-oriented planner would bias toward larger shards.</p>
@@ -1124,6 +1150,8 @@
   .vb.degraded i,.vb.warnv i,.vb.unverified i{background:var(--warn)}
   .vb.unsupported i{background:var(--err)}
   .vb.unverified{border-style:dashed}
+  .prof{width:100%;font-family:'IBM Plex Mono',monospace;font-size:11px;line-height:1.5;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);resize:vertical}
+  .state.ok{background:var(--wash);border-color:var(--brand);color:var(--brandink)}
   .assum{margin:14px 0 4px;font-size:12px;display:flex;align-items:center;gap:8px}
   .assum .band{font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--ink3);border:1px solid var(--line);border-radius:999px;padding:2px 8px}
   .bias{font-size:11px;white-space:nowrap}
