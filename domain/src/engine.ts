@@ -11,6 +11,7 @@
 //   Bandwidth (`GpuSku.bw_tbs`) is DECIMAL TB/s (1e12 B/s) as vendors quote it, so the
 //   roofline converts memory to bytes rather than mixing the two scales.
 
+import { isNonNativeKernel } from './compat.js';
 import type {
   Model,
   GpuSku,
@@ -552,12 +553,26 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   // §6.3: a replica spanning nodes rides a fabric this plan knows nothing about unless it is
   // told. Reporting a number that assumes the collective is free would be the most confident
   // and least defensible figure on the page, so it is withheld instead.
-  const throughput_suppressed =
+  // Performance figures are withheld for two independent reasons, and either is sufficient.
+  // Both leave memory sizing untouched — it is only the compute-derived numbers that stop
+  // describing anything real.
+  const fabricUnknown =
     multi_node && !input.fabric_gbs
       ? `TP ${tp} spans ${Math.ceil(tp / gpus_per_node)} nodes and no inter-node fabric bandwidth was given. ` +
         'Every layer all-reduces across that fabric, so throughput here depends on hardware this plan ' +
         'has not been told about — supply the per-GPU fabric bandwidth to get a figure.'
       : null;
+  // The roofline assumes native kernels: bandwidth x MBU for decode, FLOPS x MFU for prefill.
+  // On a weight-only fallback neither holds — activations stay 16-bit and the low-precision
+  // tensor cores are never reached — so the figures would describe a deployment that is not
+  // the one being planned.
+  const fallback = isNonNativeKernel(model, gpu, quant);
+  const nonNative = fallback
+    ? `${quant} has no native kernel on ${gpu.name}. ${fallback.detail} The throughput and TTFT ` +
+      'model assumes native kernels, so no figure is given for this combination.'
+    : null;
+  const suppressed = [fabricUnknown, nonNative].filter(Boolean).join(' ') || null;
+  const throughput_suppressed = suppressed;
   const throughput_tokens_per_sec = Math.round(
     (pods * active_per_replica) / step_time_sec,
   );
@@ -589,11 +604,11 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     : 0;
   ttft_sec += prefill_collective_sec;
   const ttft_ms = Math.round(ttft_sec * 1000);
-  const ttft_suppressed =
-    multi_node && !input.fabric_gbs
-      ? `Prefill all-reduces on every layer across the same undeclared fabric — ${(prefill_collective_bytes / 1e12).toFixed(2)} TB of it ` +
-        'for this prompt, against 0.03 GB per decode step. TTFT is withheld for the same reason as throughput.'
-      : null;
+  const ttft_suppressed = fabricUnknown
+    ? `Prefill all-reduces on every layer across the same undeclared fabric — ${(prefill_collective_bytes / 1e12).toFixed(2)} TB of it ` +
+      'for this prompt, against 0.03 GB per decode step. TTFT is withheld for the same reason as throughput.' +
+      (nonNative ? ` ${nonNative}` : '')
+    : nonNative;
 
   const result: FeasibleSizing = {
     ok: true,

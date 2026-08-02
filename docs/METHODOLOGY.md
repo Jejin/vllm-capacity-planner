@@ -336,6 +336,10 @@ The verdict has three levels rather than two, because vLLM rarely refuses a form
 
 Collapsing the middle row into "supported" is what this tool did before; collapsing it into "unsupported" would be equally wrong, since the plan does run and its memory arithmetic is unaffected.
 
+**A fallback kernel withholds the performance figures.** The roofline assumes native kernels — `bandwidth × MBU` for decode, `FLOPS × MFU` for prefill. On a weight-only path neither holds: activations stay 16-bit and the low-precision tensor cores are never reached, so a throughput or TTFT number would describe a deployment other than the one being planned. Those read `—`; memory fit, GPU count and the KV plan are unchanged. That covers 98 of the catalogue's 628 feasible (model, GPU, precision) combinations — FP8 on Ampere, INT4 on AMD, MXFP4 before Hopper, NVFP4 before Blackwell.
+
+GGUF is the deliberate exception. It is reported as degraded for a different reason — a different *runtime*, not a fallback kernel — and llama.cpp decode is still bandwidth-bound, so `bandwidth × MBU` remains roughly applicable. What is tuned for vLLM there is the overhead model, which moves the memory plan rather than the throughput arithmetic. Withholding those 82 combinations' figures would be suppressing them for the wrong reason.
+
 Topology is part of the same verdict. A replica wider than a node needs a Ray cluster and puts every layer's all-reduce on the inter-node fabric; a tensor-parallel group on consumer cards runs that collective over PCIe with no NVLink. Both are marked as running-but-not-as-modelled for the same reason: the throughput roofline assumes the collective is not the bottleneck.
 
 **Unknown is reported, not assumed.** vLLM's own support matrix stops at Hopper for several formats, so INT4 on Blackwell is genuinely unrecorded — the plan says so rather than guessing in either direction. Failing closed on *unknown* would block the whole catalogue the moment a GPU generation is added, which turns a safety property into a reason to delete the check. Failing closed on *known-incompatible* is the useful half, and that is what the table does.
