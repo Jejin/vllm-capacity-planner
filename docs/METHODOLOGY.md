@@ -174,6 +174,22 @@ The memory arithmetic is unaffected in every row — the cache really is half th
 
 **Every artifact in this catalogue is in the "none" row.** The safetensors index of all 31 — base repositories and quantised ones alike — was checked for `k_scale`, `v_scale` and the older single `kv_scale` tensor, and not one carries them. The probe was validated against two checkpoints that do. Since the planner defaults to a 1-byte KV cache, that makes it the *default* configuration of every model here, which is exactly why the plan says so rather than leaving it to be discovered in an eval.
 
+### Measured mode: when vLLM has already answered
+
+Everything above is a heuristic standing in for a number the runtime already knows. vLLM profiles itself at startup and reports exactly how much KV cache it ended up with, so where that figure exists, estimating it is a choice rather than a necessity.
+
+Paste the startup log — `Available KV cache memory: N GiB` — or a profile object, and **the measured figure becomes authoritative for concurrency**. Pods, GPU count and cost follow from it.
+
+Three rules make that safe:
+
+**The estimate is preserved, and the variance is shown.** Not as a footnote: the panel says whether the heuristic was conservative or optimistic and by how much, which is the only way anyone would find out that this model is wrong for their hardware.
+
+**The two are never blended.** An average of a measurement and a guess is neither, and it hides which one moved.
+
+**A profile from a different shape is refused, not scaled.** A measurement taken at TP8 says nothing about TP2, and one taken on an H100 says nothing about an H200 — KV capacity per GPU does not carry across either. The panel names the field that disagreed rather than quietly adjusting. A profile claiming more KV than the device has is rejected the same way: those figures are not from the same run.
+
+**What a profile does not do is calibrate speed.** It measures memory. Throughput and TTFT still come from the roofline, and a startup profile says nothing about tokens per second — which is why importing one does not promote the performance figures out of the `estimated` tier (§4, *What a figure rests on*). Reaching `measured` there needs a benchmark, which is a different artifact than this one.
+
 ### Choosing the tensor-parallel size
 
 The obvious rule — smallest TP that holds the weights plus one request — **over-recommends hardware.** A bigger shard leaves proportionally more room for KV and so packs far more sessions per replica, and total cost is `pods × TP`, not `TP`.
