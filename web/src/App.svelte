@@ -254,7 +254,8 @@
   function delPool(i: number) { fleet.splice(i, 1); activeConfig = null; }
   function delDeployment(i: number) { plan.splice(i, 1); }
 
-  async function refreshConfigs() { const r = await fetch('/api/v1/configs', { headers: authH }); if (r.ok) configs = await r.json(); }
+  // guarded like loadCatalog: an unreachable API is the normal case here, not an exception
+  async function refreshConfigs() { try { const r = await fetch('/api/v1/configs', { headers: authH }); if (r.ok) configs = await r.json(); } catch {} }
   let saveName = $state('');
   async function saveConfig() {
     if (!saveName) return;
