@@ -83,7 +83,7 @@ const QUANT_RULES: Partial<Record<Quant, Partial<Record<GpuArch, Rule>>>> = {
       detail:
         'FP8 W8A8 needs compute capability 8.9 or newer. On Ampere the weights load at FP8 but run ' +
         'weight-only (W8A16) through Marlin kernels, so the memory saving is real and the compute ' +
-        'speed-up is not — the throughput and TTFT figures here are optimistic.',
+        'speed-up is not. Throughput and TTFT are withheld rather than estimated against kernels this plan will not use.',
       alternative: 'An Ada, Hopper or Blackwell card gets native FP8; INT8 runs natively on Ampere.',
     },
     ada: { level: 'supported', detail: 'Native FP8 W8A8 (compute capability 8.9).' },
@@ -122,12 +122,12 @@ const QUANT_RULES: Partial<Record<Quant, Partial<Record<GpuArch, Rule>>>> = {
     'blackwell-consumer': { level: 'supported', detail: 'Native MX support on Blackwell.' },
     ampere: {
       level: 'degraded',
-      detail: 'No native MX path before Hopper — MXFP4 runs weight-only through Marlin, so the compute estimate is optimistic.',
+      detail: 'No native MX path before Hopper — MXFP4 runs weight-only through Marlin, so throughput and TTFT are withheld rather than estimated against kernels this plan will not use.',
       alternative: 'Hopper or Blackwell for native MXFP4; INT4 runs natively here.',
     },
     ada: {
       level: 'degraded',
-      detail: 'No native MX path before Hopper — MXFP4 runs weight-only through Marlin, so the compute estimate is optimistic.',
+      detail: 'No native MX path before Hopper — MXFP4 runs weight-only through Marlin, so throughput and TTFT are withheld rather than estimated against kernels this plan will not use.',
       alternative: 'Hopper or Blackwell for native MXFP4; INT4 runs natively here.',
     },
     cdna3: {
@@ -146,7 +146,7 @@ function NVFP4_FALLBACK(arch: string): Rule {
     detail:
       `${arch} has no native FP4 GEMM kernel, so vLLM falls back to weight-only (W4A16) execution ` +
       'via Marlin and logs a warning. The weights really are 4-bit — the memory plan holds — but ' +
-      'activations stay 16-bit, so the throughput and TTFT figures here are optimistic.',
+      'activations stay 16-bit, so throughput and TTFT are withheld rather than estimated against kernels this plan will not use.',
     alternative: 'A Blackwell card runs NVFP4 on native tensor cores.',
   };
 }
@@ -167,6 +167,52 @@ const GGUF_QUANTS: ReadonlySet<Quant> = new Set<Quant>(['Q8_0', 'Q4_K_M', 'IQ4_X
 const CONSUMER_ARCHES: ReadonlySet<GpuArch> = new Set<GpuArch>(['blackwell-consumer']);
 
 /**
+ * The format-vs-architecture half of the verdict, on its own.
+ *
+ * Split out because the sizing engine needs it and must not take a dependency on topology
+ * reasoning it already does itself. This is the half that says whether the KERNELS are native,
+ * which is what decides whether the roofline's assumptions hold at all.
+ */
+export function quantKernelSupport(model: Model, gpu: GpuSku, quant: Quant): SupportFinding[] {
+  const arch = gpu.arch;
+  if (!arch) {
+    return [{
+      level: 'unverified',
+      detail: `${gpu.name} has no architecture recorded, so no kernel support can be checked for ${quant}.`,
+      alternative: 'Set the architecture on this GPU SKU in the catalogue.',
+    }];
+  }
+  if (GGUF_QUANTS.has(quant)) return [{ ...GGUF_RULE }];
+  const rule = QUANT_RULES[quant]?.[arch];
+  if (rule) return [{ ...rule }];
+  if (quant === 'FP16') return [];
+  return [{
+    level: 'unverified',
+    detail: `vLLM's published support matrix does not cover ${quant} on ${arch}. It may work; it has not been checked.`,
+  }];
+}
+
+/**
+ * True when the plan would run on a fallback KERNEL rather than a native one — the condition
+ * under which the roofline stops describing what will happen. A weight-only Marlin path keeps
+ * the memory plan intact and invalidates every compute-derived figure, because activations stay
+ * 16-bit and the low-precision tensor cores are never reached.
+ *
+ * GGUF is deliberately excluded even though it is also reported as degraded. Its problem is a
+ * different RUNTIME, not a fallback kernel: llama.cpp decode is still bandwidth-bound, so
+ * `bandwidth x MBU` remains roughly applicable, and what is tuned for vLLM here is the overhead
+ * model — which affects the memory plan, not the throughput arithmetic. Withholding those
+ * figures would suppress 82 of the catalogue's combinations for the wrong reason.
+ */
+export function isNonNativeKernel(model: Model, gpu: GpuSku, quant: Quant): SupportFinding | null {
+  if (GGUF_QUANTS.has(quant)) return null;
+  const f = quantKernelSupport(model, gpu, quant).find(
+    (x) => x.level === 'degraded' || x.level === 'unsupported',
+  );
+  return f ?? null;
+}
+
+/**
  * Whether the planned deployment has a runtime path, and how good it is.
  *
  * Memory feasibility is computed separately and is NOT consulted here: a plan can fit perfectly
@@ -182,24 +228,7 @@ export function runtimeSupport(
   const arch = gpu.arch;
 
   // --- format × architecture ---
-  if (!arch) {
-    findings.push({
-      level: 'unverified',
-      detail: `${gpu.name} has no architecture recorded, so no kernel support can be checked for ${input.quant}.`,
-      alternative: 'Set the architecture on this GPU SKU in the catalogue.',
-    });
-  } else if (GGUF_QUANTS.has(input.quant)) {
-    findings.push({ ...GGUF_RULE });
-  } else {
-    const rule = QUANT_RULES[input.quant]?.[arch];
-    if (rule) findings.push({ ...rule });
-    else if (input.quant !== 'FP16') {
-      findings.push({
-        level: 'unverified',
-        detail: `vLLM's published support matrix does not cover ${input.quant} on ${arch}. It may work; it has not been checked.`,
-      });
-    }
-  }
+  findings.push(...quantKernelSupport(model, gpu, input.quant));
 
   // --- topology ---
   // A replica wider than a node is a different runtime shape, not just a bigger one.

@@ -11,6 +11,7 @@
 //   Bandwidth (`GpuSku.bw_tbs`) is DECIMAL TB/s (1e12 B/s) as vendors quote it, so the
 //   roofline converts memory to bytes rather than mixing the two scales.
 
+import { isNonNativeKernel } from './compat.js';
 import type {
   Model,
   GpuSku,
@@ -193,7 +194,12 @@ export function mlaLatentElems(model: Model): number {
 }
 
 /**
- * Bytes each GPU pushes through the interconnect for ONE decode step of tensor-parallel work.
+ * Bytes each GPU pushes through the interconnect for one forward pass over `tokens` tokens.
+ *
+ * The same call serves both phases, because it is the same collective: a decode step passes the
+ * batch size, prefill passes the whole prompt. That difference is four orders of magnitude —
+ * a 629k-token prefill at TP16 moves 2.26 TB where its decode step moves 28.8 MB — which is why
+ * prefill is BANDWIDTH-bound on the interconnect while decode is latency-bound on it.
  *
  * Megatron-style TP all-reduces twice per layer — after the attention output projection and
  * after the FFN down projection — and each all-reduce covers the activation tensor for every
@@ -205,10 +211,10 @@ export function mlaLatentElems(model: Model): number {
  * cost — so the figure here is a FLOOR on what the interconnect costs, not an estimate of it.
  * Modelling the latency term needs a per-fabric constant this catalogue does not carry.
  */
-export function collectiveBytesPerStep(model: Model, tp: number, batchTokens: number): number {
+export function collectiveBytes(model: Model, tp: number, tokens: number): number {
   const hidden = model.hidden_size;
   if (!hidden || tp <= 1) return 0;
-  const perAllReduce = batchTokens * hidden * ACT_DTYPE_BYTES;
+  const perAllReduce = tokens * hidden * ACT_DTYPE_BYTES;
   const ringFactor = (2 * (tp - 1)) / tp;
   return model.layers * ALL_REDUCES_PER_LAYER * ringFactor * perAllReduce;
 }
@@ -536,7 +542,7 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   // stopped there, which assumes the per-layer all-reduce is instantaneous — true of no
   // interconnect, and least true of the ones that need it most (PCIe, and anything crossing a
   // node). The collective serialises with the layer it follows, so it adds to the step.
-  const collective_bytes = collectiveBytesPerStep(model, tp, active_per_replica);
+  const collective_bytes = collectiveBytes(model, tp, active_per_replica);
   const link_gbs = multi_node ? input.fabric_gbs : gpu.link_gbs;
   const collective_sec = collective_bytes > 0 && link_gbs
     ? collective_bytes / oneWayLinkBytesPerSec(link_gbs)
@@ -547,12 +553,26 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
   // §6.3: a replica spanning nodes rides a fabric this plan knows nothing about unless it is
   // told. Reporting a number that assumes the collective is free would be the most confident
   // and least defensible figure on the page, so it is withheld instead.
-  const throughput_suppressed =
+  // Performance figures are withheld for two independent reasons, and either is sufficient.
+  // Both leave memory sizing untouched — it is only the compute-derived numbers that stop
+  // describing anything real.
+  const fabricUnknown =
     multi_node && !input.fabric_gbs
       ? `TP ${tp} spans ${Math.ceil(tp / gpus_per_node)} nodes and no inter-node fabric bandwidth was given. ` +
         'Every layer all-reduces across that fabric, so throughput here depends on hardware this plan ' +
         'has not been told about — supply the per-GPU fabric bandwidth to get a figure.'
       : null;
+  // The roofline assumes native kernels: bandwidth x MBU for decode, FLOPS x MFU for prefill.
+  // On a weight-only fallback neither holds — activations stay 16-bit and the low-precision
+  // tensor cores are never reached — so the figures would describe a deployment that is not
+  // the one being planned.
+  const fallback = isNonNativeKernel(model, gpu, quant);
+  const nonNative = fallback
+    ? `${quant} has no native kernel on ${gpu.name}. ${fallback.detail} The throughput and TTFT ` +
+      'model assumes native kernels, so no figure is given for this combination.'
+    : null;
+  const suppressed = [fabricUnknown, nonNative].filter(Boolean).join(' ') || null;
+  const throughput_suppressed = suppressed;
   const throughput_tokens_per_sec = Math.round(
     (pods * active_per_replica) / step_time_sec,
   );
@@ -573,7 +593,22 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     ttft_compute_bound = compute_sec > weight_stream_sec;
     ttft_sec = Math.max(compute_sec, weight_stream_sec);
   }
+  // Prefill all-reduces on every layer too, over the WHOLE prompt rather than a decode batch.
+  // Withholding decode throughput for an unknown fabric while still printing a TTFT that
+  // assumed the same collective was free was the inconsistency this closes: at a realistic
+  // 50 GB/s the prefill collective for a 1M-context TP16 plan exceeds the entire TTFT it was
+  // being left out of.
+  const prefill_collective_bytes = collectiveBytes(model, tp, active_tokens);
+  const prefill_collective_sec = prefill_collective_bytes > 0 && link_gbs
+    ? prefill_collective_bytes / oneWayLinkBytesPerSec(link_gbs)
+    : 0;
+  ttft_sec += prefill_collective_sec;
   const ttft_ms = Math.round(ttft_sec * 1000);
+  const ttft_suppressed = fabricUnknown
+    ? `Prefill all-reduces on every layer across the same undeclared fabric — ${(prefill_collective_bytes / 1e12).toFixed(2)} TB of it ` +
+      'for this prompt, against 0.03 GB per decode step. TTFT is withheld for the same reason as throughput.' +
+      (nonNative ? ` ${nonNative}` : '')
+    : nonNative;
 
   const result: FeasibleSizing = {
     ok: true,
@@ -600,6 +635,8 @@ export function computeSizing(model: Model, gpu: GpuSku, input: SizingInput): Si
     collective_share,
     decode_stream_gb,
     expert_coverage,
+    prefill_collective_sec,
+    ttft_suppressed,
     decode_tps_per_request,
     ttft_ms,
     ttft_compute_bound,

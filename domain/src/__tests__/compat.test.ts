@@ -97,3 +97,46 @@ describe('runtime support verdict', () => {
     expect(COMPAT_SOURCE.urls.length).toBeGreaterThan(0);
   });
 });
+
+describe('non-native kernels withhold performance figures', () => {
+  const at = (mid: string, gid: string, q: any) => computeSizing(M(mid), G(gid), {
+    quant: q, kv_dtype_bytes: 1, selected_ctx: 131072, avg_context_utilisation: 0.6,
+    target_concurrency: 64, mem_util_fraction: 0.9, gpus_per_node: 8,
+  }) as FeasibleSizing;
+
+  it('a weight-only fallback withholds throughput and TTFT, keeping the memory plan', () => {
+    // The reviewer's case: MXFP4 on A100 reported "Runs, but not as modelled" beside
+    // 1,644 tok/s and a 4.2 s TTFT. The roofline assumes native kernels; this path has none.
+    const r = at('gptoss-120b', 'a100s', 'MXFP4');
+    expect(r.ok).toBe(true);
+    expect(r.throughput_suppressed).toMatch(/no native kernel/);
+    expect(r.ttft_suppressed).toMatch(/no native kernel/);
+    // memory feasibility is untouched — that is the whole point of splitting the verdicts
+    expect(r.gpus).toBeGreaterThan(0);
+    expect(r.kv_per_request_gb).toBeGreaterThan(0);
+    expect(r.concurrency_per_pod).toBeGreaterThan(0);
+  });
+
+  it('native paths keep their figures', () => {
+    const r = at('gptoss-120b', 'h200', 'MXFP4');
+    expect(r.throughput_suppressed).toBeNull();
+    expect(r.ttft_suppressed).toBeNull();
+    expect(r.throughput_tokens_per_sec).toBeGreaterThan(0);
+  });
+
+  it('an unsupported format withholds them too', () => {
+    const r = at('qwen3-32b', 'mi300x', 'INT4'); // AWQ/GPTQ have no AMD path at all
+    expect(r.throughput_suppressed).toMatch(/no native kernel/);
+  });
+
+  it('GGUF keeps its figures — a different runtime is not a fallback kernel', () => {
+    // llama.cpp decode is still bandwidth-bound, so bandwidth x MBU remains roughly
+    // applicable; what is tuned for vLLM here is the overhead model, which affects the
+    // MEMORY plan rather than the throughput arithmetic.
+    const r = at('llama33-70b', 'h200', 'Q4_K_M');
+    expect(r.throughput_suppressed).toBeNull();
+    expect(r.throughput_tokens_per_sec).toBeGreaterThan(0);
+    // ...and it still reports the runtime caveat, just not by deleting the numbers
+    expect(runtimeSupport(M('llama33-70b'), G('h200'), { quant: 'Q4_K_M', gpus_per_node: 8 }, r.tp).level).toBe('degraded');
+  });
+});
