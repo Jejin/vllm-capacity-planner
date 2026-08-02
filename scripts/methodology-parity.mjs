@@ -9,11 +9,6 @@
 // mode that actually occurred.
 
 import { readFileSync } from 'node:fs';
-import {
-  RUNTIME_GB, CUDA_CONTEXT_GB, MBU, PREFILL_MFU, TIGHT_HEADROOM,
-  DEFAULT_MLA_LATENT_ELEMS, DEFAULT_BATCHED_TOKENS, DEFAULT_INTERMEDIATE_RATIO,
-  ALL_REDUCES_PER_LAYER,
-} from '../domain/dist/index.js';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -83,15 +78,39 @@ function checkNumbering(headings, label, errors) {
  * near it. Deliberately fuzzy about phrasing — the two surfaces word things differently — and
  * strict about the number.
  */
+/**
+ * Read the constants out of the engine SOURCE, not its build.
+ *
+ * The first version imported `domain/dist`, passed locally against a stale build, and failed in
+ * CI where nothing had run `tsc` — vitest reads `src`. A docs lint that only works after a
+ * build is a docs lint that runs in the wrong places, so this parses the declarations directly
+ * and has no ordering dependency at all.
+ */
+function engineConstants() {
+  const src = readFileSync(join(root, 'domain/src/engine.ts'), 'utf8');
+  const out = {};
+  const re = /^export const ([A-Z][A-Z0-9_]*)\s*(?::\s*[^=]+)?=\s*([\d.]+);/gm;
+  let m;
+  while ((m = re.exec(src)) !== null) out[m[1]] = Number(m[2]);
+  return out;
+}
+const K = engineConstants();
+for (const need of ['RUNTIME_GB', 'CUDA_CONTEXT_GB', 'MBU', 'PREFILL_MFU', 'TIGHT_HEADROOM', 'DEFAULT_MLA_LATENT_ELEMS', 'DEFAULT_BATCHED_TOKENS', 'ALL_REDUCES_PER_LAYER']) {
+  if (K[need] === undefined) {
+    console.error(`methodology-parity: could not read ${need} from domain/src/engine.ts — did the declaration style change?`);
+    process.exit(1);
+  }
+}
+
 const CONSTANTS = [
-  { name: /runtime reserve/gi, value: String(RUNTIME_GB), label: 'RUNTIME_GB' },
-  { name: /CUDA context/gi, value: String(CUDA_CONTEXT_GB), label: 'CUDA_CONTEXT_GB' },
-  { name: /\bMBU\b/g, value: String(MBU), label: 'MBU' },
-  { name: /prefill MFU/gi, value: String(PREFILL_MFU), label: 'PREFILL_MFU' },
-  { name: /tight-fit threshold/gi, value: `${TIGHT_HEADROOM * 100}%`, label: 'TIGHT_HEADROOM' },
-  { name: /512 \+ 64/g, value: String(DEFAULT_MLA_LATENT_ELEMS), label: 'DEFAULT_MLA_LATENT_ELEMS' },
-  { name: /vLLM's own default chunk|vLLM's default chunk/gi, value: String(DEFAULT_BATCHED_TOKENS), label: 'DEFAULT_BATCHED_TOKENS' },
-  { name: /all-reduces? (?:on|per|twice per) (?:every |each )?layer/gi, value: String(ALL_REDUCES_PER_LAYER), label: 'ALL_REDUCES_PER_LAYER', valueAliases: ['two', 'twice'] },
+  { name: /runtime reserve/gi, value: String(K.RUNTIME_GB), label: 'RUNTIME_GB' },
+  { name: /CUDA context/gi, value: String(K.CUDA_CONTEXT_GB), label: 'CUDA_CONTEXT_GB' },
+  { name: /\bMBU\b/g, value: String(K.MBU), label: 'MBU' },
+  { name: /prefill MFU/gi, value: String(K.PREFILL_MFU), label: 'PREFILL_MFU' },
+  { name: /tight-fit threshold/gi, value: `${K.TIGHT_HEADROOM * 100}%`, label: 'TIGHT_HEADROOM' },
+  { name: /512 \+ 64/g, value: String(K.DEFAULT_MLA_LATENT_ELEMS), label: 'DEFAULT_MLA_LATENT_ELEMS' },
+  { name: /vLLM's own default chunk|vLLM's default chunk/gi, value: String(K.DEFAULT_BATCHED_TOKENS), label: 'DEFAULT_BATCHED_TOKENS' },
+  { name: /all-reduces? (?:on|per|twice per) (?:every |each )?layer/gi, value: String(K.ALL_REDUCES_PER_LAYER), label: 'ALL_REDUCES_PER_LAYER', valueAliases: ['two', 'twice'] },
 ];
 const WINDOW = 220;
 
