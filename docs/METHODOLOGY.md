@@ -245,12 +245,20 @@ Vendors spell this incompatibly, and the importer handles each. Kimi K3 nests a 
 For every token generated, the weights and active KV cache are read from memory to the compute cores — so generation speed is bounded by achievable bandwidth (with an MBU penalty).
 
 ```
-Data read per step (bytes) = (Active weights + Active sequences × KV per session) × 2³⁰
+Data read per step (bytes) = (Weights streamed + Active sequences × KV per session) × 2³⁰
 Effective pod bandwidth    = TP size × per-GPU TB/s × 10¹² × MBU
-Aggregate throughput       = (Effective pod bandwidth / Data read per step) × Active sequences
+
+Step time                  = Data read per step / Effective pod bandwidth      (memory)
+                           + all-reduce bytes / (link GB/s ÷ 2)                (collective)
+
+Aggregate throughput       = Active sequences / Step time × replicas
 ```
 
-Note the explicit `× 2³⁰`: memory here is GiB but bandwidth is decimal, so both sides go to raw bytes before dividing. **Active weights** is not the same as total weights — only the output head streams every step; the embedding table is a per-token gather. For MoE models only the *active* parameters are read.
+Note the explicit `× 2³⁰`: memory here is GiB but bandwidth is decimal, so both sides go to raw bytes before dividing. **Weights streamed** is not the same as total weights — only the output head streams every step; the embedding table is a per-token gather. For an MoE model it is not the *active* parameters either: a decode step reads every expert the batch touches, which is the subsection below.
+
+The collective term is the other half the roofline originally left out — `TP × bandwidth` alone assumes the per-layer all-reduce is instantaneous (§3, *What crossing a node boundary costs*).
+
+**Neither figure is always reported.** Throughput and TTFT are withheld — shown as `—` — when a replica spans nodes with no declared fabric, or when the precision has no native kernel on the card (§6, *Memory fit is not runtime support*). Memory sizing is unaffected in both cases; it is only the compute-derived numbers that stop describing the deployment being planned.
 
 ### MoE decode reads the expert union, not one token's path
 
@@ -287,7 +295,10 @@ prefill FLOPs = 2 × active params × tokens                     (dense matmuls,
                              + linear × tokens )
 
 TTFT = max( prefill FLOPs / (TP × TFLOPS × speedup × MFU) , weight-streaming time )
+     + prefill all-reduce bytes / (link GB/s ÷ 2)
 ```
+
+That last term is the same collective as decode's, over the whole prompt instead of a batch — four orders of magnitude more traffic, and the reason TTFT is withheld across nodes alongside throughput (§3).
 
 The attention term is not a correction — it is usually the larger half. Llama-3.3-70B prefilling 78,643 tokens spends **16.2 PFLOPs on attention against 11.1 on the matmuls**. Long-context TTFT is an attention problem, which is why the layer regimes matter here as much as they do for KV: a sliding-window layer costs `tokens × window` rather than `tokens²`, making GPT-OSS-120B's prefill **38% cheaper** than the same shape withfull attention.
 
@@ -308,7 +319,9 @@ TP is not assumed — it is selected. At this concurrency TP1 needs 3 GPUs, TP2 
 | KV per session | 131,072 × 0.60 = 78,643 active tokens × 0.156 MiB | **≈ 12.0 GiB** |
 | Concurrency | floor(181.1 / 12.0) = 15 ≥ 10 target | **1 pod (2 GPUs)** |
 | Pod headroom | (248.8 − 67.7 − 12.0) / 248.8 = 68% ≥ 10% | **fits (not tight)** |
-| Throughput | data/step ≈ (66.7 + 10×12) × 2³⁰ ≈ 201×10⁹ B; bw = 2 × 4.8×10¹² × 0.55 ≈ 5.28×10¹² B/s → 38.1 ms/step | **≈ 262 tok/s** |
+| Throughput | data/step ≈ (66.7 + 10×12) × 2³⁰ ≈ 201×10⁹ B; bw = 2 × 4.8×10¹² × 0.55 ≈ 5.28×10¹² B/s → 38.0 ms memory + 0.06 ms collective | **≈ 263 tok/s** |
+
+The collective is **0.2% of the step** here, and that is the point rather than a footnote: at TP2 with a batch of 10 the all-reduce is nothing, while the same model at TP16 across nodes cannot be quoted at all. One roofline, two very different regimes — which is why the term is computed rather than assumed either way.
 
 ## 6. Fits / tight / infeasible
 
@@ -362,7 +375,7 @@ Bandwidth is the deliberate exception: `bw_tbs` is decimal TB/s (10¹² B/s) as 
 
 The rubric re-runs the **entire** sizing at each target concurrency — it is not a scaling of one result. That matters because TP selection depends on the target: the cheapest shard width at 1 concurrent session is rarely the cheapest at 256. A rubric row can therefore change TP, pods and the tight verdict all at once, which a linear extrapolation would hide.
 
-Per-request decode rate falls as concurrency rises (more sessions share the pod's bandwidth) while aggregate throughput and GPU count rise.
+Per-request decode rate falls as concurrency rises (more sessions share the pod's bandwidth) while aggregate throughput and GPU count rise. Rows whose TTFT or throughput is withheld show `—` in those columns and a GPU count in the rest — a row can be perfectly sized and still decline to quote a speed.
 
 ## 9. Cost model
 
@@ -376,6 +389,8 @@ $ per million tokens = ( GPUs × $/GPU-hour × 1,000,000 ) / ( tokens/sec × 360
 ```
 
 The per-million-token figure inherits the throughput estimate's ±40% band, so treat it as a comparison tool between configurations rather than a budget line. A configuration that halves GPU count but also halves throughput costs the same per token.
+
+**It is withheld whenever throughput is.** Dividing by a number the page refuses to show would reintroduce it through the back door — so a plan whose throughput reads `—` reads `—` for cost per million tokens too, in the sizing view and in the fleet economics table. The run rate and monthly figures are unaffected: they depend on GPU count and rental rate, neither of which is in doubt.
 
 The same arithmetic runs on a single deployment, so the sizing view reports its own run rate, monthly figure and cost per million tokens without waiting for the plan to be added to a cluster.
 
@@ -427,10 +442,16 @@ Model geometry is not guessed. Two sources, deliberately separated by what each 
 
 | source | supplies |
 |---|---|
-| Hugging Face `config.json` | layers, attention geometry, embedding sizes, sliding-window and linear-attention splits |
+| Hugging Face `config.json` | layers, attention geometry, MLA latent width, MoE routing, embedding sizes, FFN width, sliding-window and linear-attention splits |
 | [recipes.vllm.ai](https://recipes.vllm.ai) | parameter counts, context length, shipped quantisations, TP sizes |
+| the artifact itself | which repository carries each precision, and whether it ships K/V scales |
+| vendor + vLLM documentation | GPU architecture, link bandwidth, which kernels exist where |
 
 The second set is precisely what a `config.json` never carries, and what the importer would otherwise leave for an admin to type. A recipe has no authority over geometry and is not allowed to set it.
+
+The third and fourth are what turn a memory estimate into a deployment. An entry carries `hf_id` and a per-precision deployment path (§11); a GPU SKU carries `arch` and `link_gbs` alongside its capacity and bandwidth. None of it is inferred from naming: repository ids were resolved against the Hugging Face API, `quantization_config` was read to confirm which base repos are natively quantised, K/V scale provenance was checked in each safetensors index, and the kernel matrix cites vLLM's own documentation with the date it was read.
+
+**Multimodal configs nest their language model.** `KimiK3ForConditionalGeneration` carries a vision tower at the top level and everything sizing cares about under `text_config`. Read from the top level the importer mapped six fields out of a dozen and still reported partial success — a form that looks mostly filled in is worse than one that obviously failed. The importer now unwraps `text_config` (or `llm_config`), but only when that block is the one carrying `num_hidden_layers`, so a vision tower with a `hidden_size` of its own is not mistaken for the model.
 
 Recipes also publish a `vram_minimum_gb` per variant, which the import panel shows beside our own weight estimate. Their floor covers weights + KV + overhead, so a ratio near **0.85** is healthy; above 1.00 means one of the two figures is wrong. Across the 20 catalogue models checked against published recipes the median is 0.85, with one outlier flagged in the notes below.
 
@@ -438,7 +459,7 @@ Recipes also publish a `vram_minimum_gb` per variant, which the import panel sho
 
 **TTFT was wrong until it was measured against arithmetic.** It was originally modelled as the time to stream the active weights once — which is the *decode* bound. For a 78,643-token prefill that produced **7 ms** where the compute-bound figure is **~8.6 seconds**, a factor of 1,200. The lesson generalises: a bound borrowed from the wrong phase is worse than no estimate, because it carries a plausible error bar.
 
-Outputs are first-order roofline estimates (throughput ±40%, TTFT ±50%). Real numbers depend on kernels, batching, prefix caching and speculative decoding — treat them as planning figures and validate against benchmarks before procurement.
+Outputs are first-order roofline estimates (throughput ±40%, TTFT ±50%) **where they are given at all**. Real numbers depend on kernels, batching, prefix caching and speculative decoding — treat them as planning figures and validate against benchmarks before procurement. The band is uniform, which is its own limitation: it does not yet widen for a node-spanning replica, a fallback kernel or an uncalibrated cache. Where those apply the figure is withheld rather than banded, which is the blunt version of the same idea.
 
 **Catalog geometry is sourced, not guessed.** Every seeded model's layer count, attention geometry and embedding sizes are taken from its published `config.json`. Three findings came out of that pass worth recording: GPT-OSS's 128-token window applies to exactly half its layers (18/36 and 12/24), and **GLM-5.2 is an MLA model, not GQA** — it ships as `GlmMoeDsaForCausalLM` with `kv_lora_rank: 512` + `qk_rope_head_dim: 64`, the same 576-element latent per layer DeepSeek uses. Sizing it as GQA 8×128 overstated its KV cache by ~3.6×, which is the difference between 8 GPUs and 24 for a 64-user deployment. And Kimi K3 keeps a token cache on only 24 of its 93 layers (§3, *Linear & recurrent layers*).
 
