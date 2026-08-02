@@ -1,7 +1,7 @@
 <script lang="ts">
   // vLLM Capacity Planner SPA. Sizing engine runs client-side (AD-1/AD-2); catalog,
   // reconciliation and saved configs go through the server API. Fleet+plan are session state.
-  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, activeWeightsGb, topologyLayout, topologySvg, reserveFloorChunk, runtimeSupport, kvScalePolicy, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, GPU_ARCHES, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
+  import { computeSizing, concurrencySweep, seedCatalog, kvPerTokenBytes, weightsGb, activeWeightsGb, topologyLayout, topologySvg, reserveFloorChunk, runtimeSupport, kvScalePolicy, throughputConfidence, ttftConfidence, mlaLatentElems, DEFAULT_MLA_LATENT_ELEMS, RUNTIME_GB, QUANTS, GPU_ARCHES, type Model, type GpuSku, type FeasibleSizing } from '@vcp/domain';
 
   type Ident = { sub: string; role: 'admin' | 'user' };
   let ident = $state<Ident>({ sub: 'u-rana', role: 'user' });
@@ -114,6 +114,12 @@
   const support = $derived(
     model && gpu ? runtimeSupport(model, gpu, { quant: effQuant, gpus_per_node: perNode }, R?.tp ?? 1) : null,
   );
+
+  // Per-plan confidence: which assumptions this configuration actually rests on, and which way
+  // each one biases the figure. Not a static caption (§6.1).
+  const batchPerReplica = $derived(R ? Math.min(R.concurrency_per_pod, Math.ceil(conc / R.pods)) : 0);
+  const tpConf = $derived(model && gpu && R ? throughputConfidence(model, gpu, sizingInput, R, batchPerReplica) : null);
+  const ttConf = $derived(model && gpu && R ? ttftConfidence(model, gpu, sizingInput, R) : null);
 
   // FP8 KV scale provenance — a quality question, not a memory or kernel one, so it is its own
   // verdict rather than folded into either (§4.3).
@@ -487,8 +493,8 @@
           <div class="kpi n"><div class="v">{R.nodes}<small> × {perNode} GPU</small></div><div class="l">Nodes</div>{#if R.multi_node}<div class="cav">a replica spans nodes</div>{/if}</div>
           <div class="kpi p"><div class="v">{R.pods}<small> × TP{R.tp}</small></div><div class="l">Pods</div></div>
           <div class="kpi a"><div class="v">{fmt(kvAlloc)}<small> GiB</small></div><div class="l">KV cache</div></div>
-          <div class="kpi g"><div class="v">{R.throughput_suppressed ? '—' : `~${R.throughput_tokens_per_sec.toLocaleString()}`}</div><div class="l">Tokens/s</div><div class="cav">{R.throughput_suppressed ? 'withheld · see below' : '±40% · not a commitment'}</div></div>
-          <div class="kpi t"><div class="v">{R.ttft_suppressed ? '—' : ttftLabel(R.ttft_ms)}</div><div class="l">Time to first token</div><div class="cav">{R.ttft_suppressed ? 'withheld · see below' : `±50% · ${R.ttft_compute_bound ? 'compute-bound' : 'bandwidth floor'}`}</div></div>
+          <div class="kpi g"><div class="v">{R.throughput_suppressed ? '—' : `~${R.throughput_tokens_per_sec.toLocaleString()}`}</div><div class="l">Tokens/s</div><div class="cav">{R.throughput_suppressed ? 'withheld · see below' : `${tpConf?.band} · ${tpConf?.tier} · ${tpConf?.assumptions.length} assumptions`}</div></div>
+          <div class="kpi t"><div class="v">{R.ttft_suppressed ? '—' : ttftLabel(R.ttft_ms)}</div><div class="l">Time to first token</div><div class="cav">{R.ttft_suppressed ? 'withheld · see below' : `${ttConf?.band} · ${R.ttft_compute_bound ? 'compute-bound' : 'bandwidth floor'}`}</div></div>
           <div class="kpi c"><div class="v">{runHr > 0 ? money(runHr) : '—'}<small>/hr</small></div><div class="l">Run rate</div>{#if runHr > 0}<div class="note">{money(runHr * 730)}/mo · {money(rate)}/GPU-hr</div>{/if}</div>
         </div>
 
@@ -568,6 +574,22 @@
           <div class="li"><span>Monthly <small>(730 h)</small></span><b>{runHr > 0 ? `${money(runHr * 730)}/mo` : '—'}</b></div>
           <div class="li"><span>Cost per million tokens <small>(at the throughput above)</small></span><b>{perMtok > 0 ? money(perMtok) : '—'}</b></div>
         </div>
+
+        {#if tpConf && ttConf && (tpConf.assumptions.length || ttConf.assumptions.length)}
+          <div class="panel">
+            <h2>What these figures rest on <small>· {tpConf.tier === 'withheld' && ttConf.tier === 'withheld' ? 'both withheld' : tpConf.tier}</small></h2>
+            <p class="tot">{tpConf.tier === 'withheld' ? ttConf.basis : tpConf.basis}</p>
+            {#each [['Throughput', tpConf], ['Time to first token', ttConf]] as [what, c]}
+              {#if c.assumptions.length}
+                <div class="assum"><b>{what}</b> <span class="band">{c.band}</span></div>
+                {#each c.assumptions as a}
+                  <div class="li"><span>{a.label} <small>{a.detail}</small></span><b class="bias {a.bias === 'reads high' ? 'hi' : a.bias === 'reads low' ? 'lo' : ''}">{a.bias === 'unknown' ? 'direction unknown' : `figure ${a.bias}`}</b></div>
+                {/each}
+              {/if}
+            {/each}
+            <p class="tot">"Figure reads high" means the real number is likely lower than shown, and vice versa. These are the effects the model knowingly omits — each is stated rather than folded into a wider band, because a band width would be invented and a direction is not.</p>
+          </div>
+        {/if}
 
         <div class="panel">
           <h2>Concurrency rubric — pick a target, see the cost &amp; throughput</h2>
@@ -972,6 +994,12 @@
     <p>The attention term is not a correction — it is usually the larger half. Llama-3.3-70B prefilling 78,643 tokens spends <b>16.2 PFLOPs on attention against 11.1 on the matmuls</b>. Long-context TTFT is an attention problem, which is why the layer regimes matter here as much as for KV: a sliding-window layer costs <code>tokens × window</code> rather than <code>tokens²</code>, making GPT-OSS-120B's prefill <b>38% cheaper</b> than the same shape with full attention.</p>
     <p class="note">Prefill MFU is taken as 0.4. Sub-16-bit formats get a 2× tensor-core speedup, capped there even for 4-bit — Blackwell does better, but the catalog does not track GPU generation and under-promising TTFT is the safe direction. A SKU with no FLOPS figure falls back to the weight-streaming floor and is labelled as such rather than presented as a prefill estimate.</p>
 
+    <h3 class="dh3">What a figure rests on</h3>
+    <p>Every performance number carries a tier and, more usefully, the <b>named assumptions that apply to that specific plan</b>. <b>Measured</b> means a benchmark for this model, artifact, GPU, TP width and workload; <b>calibrated</b> means the roofline adjusted against an adjacent measured configuration; <b>estimated</b> means the analytical model alone; <b>withheld</b> means no native kernel, or a fabric the plan has not been told about.</p>
+    <p>Only the last two are reachable today. The first two need benchmark evidence this planner cannot yet import, and they are named because that is the destination — not to imply anything currently earns them. Every figure shown is <code>estimated</code>, and the panel says so rather than letting the label read like a grade.</p>
+    <p>What is <em>not</em> done is widening the band per factor. Turning ±40% into ±55% because a model is MoE would be a fabricated number wearing the costume of rigour. The band stays as published and the assumptions become explicit and per-plan, each with the <b>direction</b> it biases the figure — derivable without inventing a magnitude. <b>Uniform expert routing</b> makes the figure read low (real routers are skewed, so fewer experts are touched); <b>unmodelled collective latency</b> makes it read high (the per-launch cost is real and uncounted); <b>no prefix cache or speculative decoding</b> reads low; the <b>2× low-precision cap</b> reads high; <b>one prompt, no queue</b> reads low.</p>
+    <p class="note">"Reads high" means the real number is likely below what is shown. Each of these is an effect the model knowingly omits — stating them individually is more use than folding them into a band nobody can decompose.</p>
+
     <h2 class="dh">5 · Worked example — Llama 3.3 70B</h2>
     <p>Host Llama 3.3 70B Instruct at FP8 · 10 concurrent sessions · 128K context at 60% utilisation · on 2× H200 (TP2). <span class="note-i">Reproduce it on the Sizing tab.</span></p>
     <div class="steps2">
@@ -1096,6 +1124,11 @@
   .vb.degraded i,.vb.warnv i,.vb.unverified i{background:var(--warn)}
   .vb.unsupported i{background:var(--err)}
   .vb.unverified{border-style:dashed}
+  .assum{margin:14px 0 4px;font-size:12px;display:flex;align-items:center;gap:8px}
+  .assum .band{font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--ink3);border:1px solid var(--line);border-radius:999px;padding:2px 8px}
+  .bias{font-size:11px;white-space:nowrap}
+  .bias.hi{color:var(--warn)}
+  .bias.lo{color:var(--ink3)}
   .sfind{margin-top:6px;font-weight:400}
   .sfind .alt{display:block;margin-top:3px;opacity:.85}
   .ssrc{margin-top:8px;font-size:11px;color:var(--ink3);font-weight:400}
