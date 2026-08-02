@@ -304,6 +304,33 @@ The attention term is not a correction — it is usually the larger half. Llama-
 
 Prefill MFU is taken as 0.4 — a large dense GEMM reaches far better utilisation than decode, but nowhere near peak. Sub-16-bit formats get a 2× tensor-core speedup, capped there even for 4-bit: Blackwell does better, but the catalog does not track GPU generation and under-promising TTFT is the safe direction. A SKU with no `tflops_fp16` falls back to the weight-streaming floor, and the result is flagged as such rather than presented as a prefill estimate.
 
+### What a figure rests on
+
+Every performance number carries a tier and, more usefully, the **named assumptions that apply to that specific plan**:
+
+| Tier | Meaning |
+|---|---|
+| **Measured** | a benchmark for this model, artifact, GPU, TP width and workload |
+| **Calibrated** | roofline adjusted against an adjacent measured configuration |
+| **Estimated** | analytical model only |
+| **Withheld** | no native kernel, or a fabric the plan has not been told about |
+
+Only the last two are reachable today. The first two need benchmark evidence this planner cannot yet import, and they are listed because that is the destination — not to imply anything currently earns them. Every figure that is shown is `estimated`, and the panel says so in as many words rather than letting the label read like a grade.
+
+What is *not* done here is widening the band per factor. Turning ±40% into ±55% because a model is MoE would be a fabricated number wearing the costume of rigour. The band stays as published, and the assumptions behind it become explicit and per-plan — with the **direction** each one biases the figure, which is derivable without inventing a magnitude:
+
+| Assumption | Applies when | Figure |
+|---|---|---|
+| MBU 0.55 / prefill MFU 0.4 | always | direction unknown |
+| uniform expert routing | MoE, partial coverage | **reads low** — real routers are skewed, so fewer experts are touched |
+| collective latency unmodelled | TP > 1 | **reads high** — the per-launch cost is real and uncounted |
+| no prefix cache or speculative decoding | always | **reads low** — both raise real throughput where they apply |
+| low-precision speedup capped at 2× | sub-16-bit prefill | **reads high** — Blackwell exceeds the cap |
+| one prompt, no queue | always (TTFT) | **reads low** — concurrent prefills queue behind each other |
+| weight-streaming floor | SKU has no TFLOPS figure | **reads low** — a decode bound borrowed for a compute phase |
+
+"Reads high" means the real number is likely below what is shown. Each of these is an effect the model knowingly omits; stating them individually is more use than folding them into a band nobody can decompose.
+
 ## 5. Worked example — Llama 3.3 70B
 
 Host Llama 3.3 70B Instruct at FP8, 10 concurrent sessions, 128K context at 60% utilisation, on H200s at vLLM's default prefill chunk.
