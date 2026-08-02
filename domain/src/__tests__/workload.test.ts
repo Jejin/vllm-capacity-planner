@@ -54,3 +54,39 @@ describe('workload distribution', () => {
     expect(shaped.ttft_ms).toBe(flat.ttft_ms);
   });
 });
+
+describe('a workload longer than the served context', () => {
+  // Found by sweeping the catalogue, not by a unit test: a 5M-token P95 on a 128K model sized
+  // into 512 GPUs and reported feasible. `selected_ctx` becomes --max-model-len, so vLLM would
+  // reject those requests rather than serve them.
+  it('is infeasible, and says which number to change', () => {
+    const r = computeSizing(M('llama33-70b'), G('h200'), {
+      ...base, workload: { prompt_p50: 2_000, prompt_p95: 400_000, output_p50: 100, output_p95: 1_000 },
+    });
+    expect(r.ok).toBe(false);
+    expect((r as any).reason).toMatch(/401,000 tokens/);
+    expect((r as any).reason).toMatch(/131,072-token context/);
+    // the model's own ceiling is named, so "raise max context" is actionable or ruled out
+    expect((r as any).reason).toMatch(/this model supports 131,072|cannot/);
+    // the figures that ARE knowable still come back
+    expect((r as any).weights_gb).toBeGreaterThan(0);
+    expect((r as any).kv_per_request_gb).toBeGreaterThan(0);
+  });
+
+  it('exactly at the served context is fine', () => {
+    const r = computeSizing(M('llama33-70b'), G('h200'), {
+      ...base, workload: { prompt_p50: 1_000, prompt_p95: 131_072, output_p50: 0, output_p95: 0 },
+    }) as FeasibleSizing;
+    expect(r.ok).toBe(true);
+    expect(r.kv_tokens).toBe(131_072);
+  });
+
+  it('the single-figure path cannot trip the guard', () => {
+    // utilisation is capped at 1, so ctx x util <= ctx always — the guard exists for the
+    // distribution form, which has no such ceiling
+    for (const util of [0.1, 0.6, 1]) {
+      const r = computeSizing(M('llama33-70b'), G('h200'), { ...base, avg_context_utilisation: util });
+      expect(r.ok).toBe(true);
+    }
+  });
+});
